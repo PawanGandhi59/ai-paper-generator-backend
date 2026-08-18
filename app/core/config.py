@@ -32,12 +32,14 @@ class Settings(BaseSettings):
     DOCUMENT_PROCESSING_STALE_MINUTES: int = 15
 
     GEMINI_API_KEY: str = ""
-    GEMINI_GENERATION_MODEL: str = "gemini-3.1-flash-image"
+    GEMINI_GENERATION_MODEL: str = "gemini-3.5-flash-lite"
     GEMINI_EMBEDDING_MODEL: str = "gemini-embedding-2"
     EMBEDDING_DIMENSION: int = 768
 
     RAG_RATE_LIMIT_REQUESTS: int = 10
     RAG_RATE_LIMIT_WINDOW_SECONDS: int = 60
+
+    RAG_RELEVANCE_THRESHOLD: float = 0.45
 
     model_config = SettingsConfigDict(
         env_file=".env",

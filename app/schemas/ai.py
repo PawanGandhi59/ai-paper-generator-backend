@@ -24,15 +24,16 @@ class SourceReference(BaseModel):
 
 class VisualItem(BaseModel):
     id: str = Field(..., description="Unique visual identifier e.g. visual_1")
-    type: Literal["diagram", "chart", "image"] = Field(..., description="Visual classification: diagram, chart, or image")
-    format: Literal["mermaid", "json", "url"] = Field(..., description="Format identifier: mermaid, json, or url")
+    type: Literal["diagram", "chart"] = Field(..., description="Visual classification: diagram or chart")
+    format: Literal["svg"] = Field("svg", description="Format identifier: svg")
     title: str = Field(..., description="Short descriptive header for the visual artifact")
-    content: str = Field(..., description="Mermaid code, chart JSON dataset, or authenticated image URL")
+    content: str = Field(..., description="Rendered SVG string")
     caption: Optional[str] = Field(None, description="Educational explanation connecting visual to answer")
 
 
 class AIQueryResponse(BaseModel):
     answer: str = Field(..., description="Textual explanation and step-by-step educational answer")
-    visuals: List[VisualItem] = Field(default_factory=list, description="Structured visual artifacts (diagrams, charts, images)")
+    visuals: List[VisualItem] = Field(default_factory=list, description="Structured rendered SVG visual artifacts")
     model_used: str = Field(..., description="Gemini model identifier used for generation")
     sources: List[SourceReference] = Field(..., description="Retrieved vector document citations")
+
