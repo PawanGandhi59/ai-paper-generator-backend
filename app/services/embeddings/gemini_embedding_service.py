@@ -26,12 +26,19 @@ def generate_deterministic_mock_vector(text: str, dimension: int = 768) -> List[
     return [v / magnitude for v in values]
 
 
+try:
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+except ImportError:
+    GoogleGenerativeAIEmbeddings = None
+
+
 class GeminiEmbeddingService(EmbeddingService):
     def __init__(self, api_key: Optional[str] = None, model_name: Optional[str] = None):
-        self.api_key = api_key or settings.GEMINI_API_KEY
+        self.api_key = api_key if api_key is not None else settings.GEMINI_API_KEY
         self.model_name = model_name or settings.GEMINI_EMBEDDING_MODEL
         self.dimension = settings.EMBEDDING_DIMENSION
         self.client = None
+        self.lc_embeddings = None
         self._init_client()
 
     def _init_client(self):
@@ -40,10 +47,15 @@ class GeminiEmbeddingService(EmbeddingService):
             return
 
         try:
+            if GoogleGenerativeAIEmbeddings:
+                self.lc_embeddings = GoogleGenerativeAIEmbeddings(
+                    model=self.model_name,
+                    google_api_key=self.api_key,
+                    output_dimensionality=self.dimension,
+                )
             self.client = genai.Client(api_key=self.api_key)
         except Exception as exc:
-            logger.error(f"Failed to initialize Gemini SDK client: {exc}")
-            # Raise exception if real API key is provided but initialization fails
+            logger.error(f"Failed to initialize Gemini SDK/LangChain client: {exc}")
             raise RuntimeError(f"Failed to initialize Gemini Client: {exc}")
 
     def generate_embedding(self, text: str) -> List[float]:
@@ -58,23 +70,25 @@ class GeminiEmbeddingService(EmbeddingService):
             return []
 
         # Mock mode when API key is missing
-        if not self.api_key or not self.client:
+        if not self.api_key or (not self.client and not self.lc_embeddings):
             return [generate_deterministic_mock_vector(t, self.dimension) for t in texts]
 
-        # Real API mode when GEMINI_API_KEY is present
+        # Real API mode via LangChain / Gemini SDK
         try:
-            # Format contents array for google.genai batch embed
-            contents = [{"parts": [{"text": t if t and t.strip() else "empty text"}]} for t in texts]
-            res = self.client.models.embed_content(
-                model=self.model_name,
-                contents=contents,
-                config=types.EmbedContentConfig(output_dimensionality=self.dimension),
-            )
+            clean_texts = [t if t and t.strip() else "empty text" for t in texts]
 
-            if not res or not hasattr(res, "embeddings") or not res.embeddings:
-                raise RuntimeError("Gemini embedding API returned empty response.")
-
-            embeddings = [emb.values for emb in res.embeddings]
+            if self.lc_embeddings:
+                embeddings = self.lc_embeddings.embed_documents(clean_texts)
+            else:
+                contents = [{"parts": [{"text": t}]} for t in clean_texts]
+                res = self.client.models.embed_content(
+                    model=self.model_name,
+                    contents=contents,
+                    config=types.EmbedContentConfig(output_dimensionality=self.dimension),
+                )
+                if not res or not hasattr(res, "embeddings") or not res.embeddings:
+                    raise RuntimeError("Gemini embedding API returned empty response.")
+                embeddings = [emb.values for emb in res.embeddings]
 
             # Validate batch count and dimensions
             if len(embeddings) != len(texts):
@@ -92,5 +106,4 @@ class GeminiEmbeddingService(EmbeddingService):
 
         except Exception as exc:
             logger.error(f"Gemini embedding API error: {str(exc)}")
-            # Do NOT swallow exception in real mode! Re-raise for Celery retries.
             raise RuntimeError(f"Gemini embedding API failure: {str(exc)}")

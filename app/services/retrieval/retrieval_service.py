@@ -82,3 +82,49 @@ class RetrievalService:
             })
 
         return retrieved_chunks
+
+    def retrieve_as_langchain_documents(
+        self,
+        current_user_id: UUID,
+        workspace_id: UUID,
+        query: str,
+        subject_id: Optional[UUID] = None,
+        book_id: Optional[UUID] = None,
+        chapter_id: Optional[UUID] = None,
+        document_id: Optional[UUID] = None,
+        top_k: int = 5,
+    ) -> List[Any]:
+        """
+        Retrieve chunks with strict multi-tenant authorization and return as LangChain Document instances.
+        """
+        chunks = self.retrieve_context(
+            current_user_id=current_user_id,
+            workspace_id=workspace_id,
+            query=query,
+            subject_id=subject_id,
+            book_id=book_id,
+            chapter_id=chapter_id,
+            document_id=document_id,
+            top_k=top_k,
+        )
+        try:
+            from langchain_core.documents import Document as LCDocument
+
+            return [
+                LCDocument(
+                    page_content=c["content"],
+                    metadata={
+                        "chunk_id": c["chunk_id"],
+                        "document_id": c["document_id"],
+                        "page_number": c["page_number"],
+                        "chapter_id": c["chapter_id"],
+                        "book_id": c["book_id"],
+                        "subject_id": c["subject_id"],
+                        "workspace_id": c["workspace_id"],
+                        "distance": c["distance"],
+                    },
+                )
+                for c in chunks
+            ]
+        except ImportError:
+            return chunks

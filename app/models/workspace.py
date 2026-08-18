@@ -28,3 +28,4 @@ class Workspace(Base):
 
     owner: Mapped["User"] = relationship("User", back_populates="workspaces")
     subjects: Mapped[List["Subject"]] = relationship("Subject", back_populates="workspace", cascade="all, delete-orphan")
+    generated_visuals = relationship("GeneratedVisual", back_populates="workspace", cascade="all, delete-orphan")

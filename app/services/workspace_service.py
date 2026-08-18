@@ -112,6 +112,12 @@ class WorkspaceService:
     # Chapter operations
     def create_chapter(self, book_id: UUID, current_user_id: UUID, chapter_number: int, name: str) -> Chapter:
         book = self.get_book(book_id, current_user_id)
+        existing = self.repo.get_chapter_by_book_and_number(book.id, chapter_number)
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Chapter number {chapter_number} already exists in this book.",
+            )
         return self.repo.create_chapter(book_id=book.id, chapter_number=chapter_number, name=name)
 
     def list_chapters(self, book_id: UUID, current_user_id: UUID) -> List[Chapter]:
@@ -119,7 +125,7 @@ class WorkspaceService:
         return self.repo.get_chapters_by_book(book.id)
 
     def get_chapter(self, chapter_id: UUID, current_user_id: UUID) -> Chapter:
-        chapter = self.repo.get_chapter_id(chapter_id) if hasattr(self.repo, 'get_chapter_id') else self.repo.get_chapter_by_id(chapter_id)
+        chapter = self.repo.get_chapter_by_id(chapter_id)
         if not chapter:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -137,6 +143,13 @@ class WorkspaceService:
         name: Optional[str] = None,
     ) -> Chapter:
         chapter = self.get_chapter(chapter_id, current_user_id)
+        if chapter_number is not None and chapter_number != chapter.chapter_number:
+            existing = self.repo.get_chapter_by_book_and_number(chapter.book_id, chapter_number)
+            if existing:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Chapter number {chapter_number} already exists in this book.",
+                )
         return self.repo.update_chapter(chapter, chapter_number=chapter_number, name=name)
 
     def delete_chapter(self, chapter_id: UUID, current_user_id: UUID) -> None:
