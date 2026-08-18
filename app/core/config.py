@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     DOCUMENT_PROCESSING_STALE_MINUTES: int = 15
 
     GEMINI_API_KEY: str = ""
-    GEMINI_GENERATION_MODEL: str = "gemini-3.6-flash"
+    GEMINI_GENERATION_MODEL: str = "gemini-3.1-flash-image"
     GEMINI_EMBEDDING_MODEL: str = "gemini-embedding-2"
     EMBEDDING_DIMENSION: int = 768
 

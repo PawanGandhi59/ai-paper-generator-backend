@@ -88,3 +88,52 @@ def test_full_workspace_hierarchy_and_ownership():
     # User 1 deletes chapter
     del_ch = client.delete(f"/api/v1/chapters/{ch1_id}", headers=h1)
     assert del_ch.status_code == 204
+
+
+def test_chapter_number_validation_and_duplicate_prevention():
+    uid = uuid4().hex[:8]
+    user = client.post("/api/v1/auth/register", json={"name": "Dup User", "email": f"dup_{uid}@example.com", "password": "password123"}).json()
+    headers = {"Authorization": f"Bearer {user['access_token']}"}
+
+    ws = client.post("/api/v1/workspaces", json={"name": "Math WS"}, headers=headers).json()
+    subj = client.post(f"/api/v1/workspaces/{ws['id']}/subjects", json={"name": "Algebra"}, headers=headers).json()
+    book = client.post(f"/api/v1/subjects/{subj['id']}/books", json={"name": "Linear Algebra"}, headers=headers).json()
+
+    # 1. Missing chapter_number returns 422 Unprocessable Entity (Field Required)
+    missing_ch = client.post(f"/api/v1/books/{book['id']}/chapters", json={"name": "Poems"}, headers=headers)
+    assert missing_ch.status_code == 422
+
+    # 2. Create Chapter 1 -> 201 Created
+    ch1 = client.post(
+        f"/api/v1/books/{book['id']}/chapters",
+        json={"chapter_number": 1, "name": "Matrices"},
+        headers=headers,
+    )
+    assert ch1.status_code == 201
+    assert ch1.json()["chapter_number"] == 1
+
+    # 3. Create Duplicate Chapter 1 -> 400 Bad Request
+    dup_ch = client.post(
+        f"/api/v1/books/{book['id']}/chapters",
+        json={"chapter_number": 1, "name": "Vectors"},
+        headers=headers,
+    )
+    assert dup_ch.status_code == 400
+    assert "already exists in this book" in dup_ch.json()["detail"]
+
+    # 4. Create Chapter 2 -> 201 Created
+    ch2 = client.post(
+        f"/api/v1/books/{book['id']}/chapters",
+        json={"chapter_number": 2, "name": "Vectors"},
+        headers=headers,
+    )
+    assert ch2.status_code == 201
+
+    # 5. Patch Chapter 2 to Chapter 1 -> 400 Bad Request (duplicate conflict)
+    patch_dup = client.patch(
+        f"/api/v1/chapters/{ch2.json()['id']}",
+        json={"chapter_number": 1},
+        headers=headers,
+    )
+    assert patch_dup.status_code == 400
+    assert "already exists in this book" in patch_dup.json()["detail"]

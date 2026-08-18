@@ -22,6 +22,7 @@ def create_chapter(
 ) -> ChapterResponse:
     """
     Create a new chapter under a book.
+    If chapter_number is omitted, it automatically increments based on existing chapters.
     """
     service = WorkspaceService(db)
     chapter = service.create_chapter(

@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -22,7 +22,17 @@ class SourceReference(BaseModel):
     distance: float
 
 
+class VisualItem(BaseModel):
+    id: str = Field(..., description="Unique visual identifier e.g. visual_1")
+    type: Literal["diagram", "chart", "image"] = Field(..., description="Visual classification: diagram, chart, or image")
+    format: Literal["mermaid", "json", "url"] = Field(..., description="Format identifier: mermaid, json, or url")
+    title: str = Field(..., description="Short descriptive header for the visual artifact")
+    content: str = Field(..., description="Mermaid code, chart JSON dataset, or authenticated image URL")
+    caption: Optional[str] = Field(None, description="Educational explanation connecting visual to answer")
+
+
 class AIQueryResponse(BaseModel):
-    answer: str
-    model_used: str
-    sources: List[SourceReference]
+    answer: str = Field(..., description="Textual explanation and step-by-step educational answer")
+    visuals: List[VisualItem] = Field(default_factory=list, description="Structured visual artifacts (diagrams, charts, images)")
+    model_used: str = Field(..., description="Gemini model identifier used for generation")
+    sources: List[SourceReference] = Field(..., description="Retrieved vector document citations")

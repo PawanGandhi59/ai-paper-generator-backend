@@ -1,7 +1,7 @@
 from typing import List, Optional
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.book import Book
@@ -106,6 +106,10 @@ class WorkspaceRepository:
 
     def get_chapter_by_id(self, chapter_id: UUID) -> Optional[Chapter]:
         return self.db.get(Chapter, chapter_id)
+
+    def get_chapter_by_book_and_number(self, book_id: UUID, chapter_number: int) -> Optional[Chapter]:
+        stmt = select(Chapter).where(Chapter.book_id == book_id, Chapter.chapter_number == chapter_number)
+        return self.db.execute(stmt).scalar_one_or_none()
 
     def get_chapters_by_book(self, book_id: UUID) -> List[Chapter]:
         stmt = select(Chapter).where(Chapter.book_id == book_id).order_by(Chapter.chapter_number.asc())

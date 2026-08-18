@@ -51,3 +51,4 @@ htmlcov/
 # Database / Docker persistent data
 *.sqlite3
 postgres_data/
+storage/
