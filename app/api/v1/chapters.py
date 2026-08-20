@@ -30,6 +30,8 @@ def create_chapter(
         current_user_id=current_user.id,
         chapter_number=data.chapter_number,
         name=data.name,
+        start_page=data.start_page,
+        end_page=data.end_page,
     )
     return ChapterResponse.model_validate(chapter)
 
@@ -78,6 +80,8 @@ def update_chapter(
         current_user_id=current_user.id,
         chapter_number=data.chapter_number,
         name=data.name,
+        start_page=data.start_page,
+        end_page=data.end_page,
     )
     return ChapterResponse.model_validate(chapter)
 

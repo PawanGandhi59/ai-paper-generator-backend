@@ -110,7 +110,15 @@ class WorkspaceService:
         self.repo.delete_book(book)
 
     # Chapter operations
-    def create_chapter(self, book_id: UUID, current_user_id: UUID, chapter_number: int, name: str) -> Chapter:
+    def create_chapter(
+        self,
+        book_id: UUID,
+        current_user_id: UUID,
+        chapter_number: int,
+        name: str,
+        start_page: Optional[int] = None,
+        end_page: Optional[int] = None,
+    ) -> Chapter:
         book = self.get_book(book_id, current_user_id)
         existing = self.repo.get_chapter_by_book_and_number(book.id, chapter_number)
         if existing:
@@ -118,7 +126,27 @@ class WorkspaceService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Chapter number {chapter_number} already exists in this book.",
             )
-        return self.repo.create_chapter(book_id=book.id, chapter_number=chapter_number, name=name)
+        if start_page is not None and end_page is not None and start_page > end_page:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="start_page must be less than or equal to end_page.",
+            )
+
+        ch = self.repo.create_chapter(
+            book_id=book.id,
+            chapter_number=chapter_number,
+            name=name,
+            start_page=start_page,
+            end_page=end_page,
+        )
+        if ch.start_page is not None and ch.end_page is not None:
+            self.repo.reassign_chunks_for_page_range(
+                book_id=book.id,
+                chapter_id=ch.id,
+                start_page=ch.start_page,
+                end_page=ch.end_page,
+            )
+        return ch
 
     def list_chapters(self, book_id: UUID, current_user_id: UUID) -> List[Chapter]:
         book = self.get_book(book_id, current_user_id)
@@ -141,6 +169,8 @@ class WorkspaceService:
         current_user_id: UUID,
         chapter_number: Optional[int] = None,
         name: Optional[str] = None,
+        start_page: Optional[int] = None,
+        end_page: Optional[int] = None,
     ) -> Chapter:
         chapter = self.get_chapter(chapter_id, current_user_id)
         if chapter_number is not None and chapter_number != chapter.chapter_number:
@@ -150,7 +180,30 @@ class WorkspaceService:
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Chapter number {chapter_number} already exists in this book.",
                 )
-        return self.repo.update_chapter(chapter, chapter_number=chapter_number, name=name)
+
+        new_start = start_page if start_page is not None else chapter.start_page
+        new_end = end_page if end_page is not None else chapter.end_page
+        if new_start is not None and new_end is not None and new_start > new_end:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="start_page must be less than or equal to end_page.",
+            )
+
+        updated_ch = self.repo.update_chapter(
+            chapter,
+            chapter_number=chapter_number,
+            name=name,
+            start_page=start_page,
+            end_page=end_page,
+        )
+        if updated_ch.start_page is not None and updated_ch.end_page is not None:
+            self.repo.reassign_chunks_for_page_range(
+                book_id=updated_ch.book_id,
+                chapter_id=updated_ch.id,
+                start_page=updated_ch.start_page,
+                end_page=updated_ch.end_page,
+            )
+        return updated_ch
 
     def delete_chapter(self, chapter_id: UUID, current_user_id: UUID) -> None:
         chapter = self.get_chapter(chapter_id, current_user_id)

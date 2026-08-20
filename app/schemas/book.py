@@ -1,8 +1,10 @@
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from app.schemas.document import DocumentResponse
 
 
 class BookCreate(BaseModel):
@@ -21,3 +23,7 @@ class BookResponse(BaseModel):
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class BookDetailResponse(BookResponse):
+    documents: List[DocumentResponse] = Field(default_factory=list)

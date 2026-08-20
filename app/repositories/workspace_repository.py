@@ -97,8 +97,21 @@ class WorkspaceRepository:
         self.db.commit()
 
     # Chapter operations
-    def create_chapter(self, book_id: UUID, chapter_number: int, name: str) -> Chapter:
-        chapter = Chapter(book_id=book_id, chapter_number=chapter_number, name=name.strip())
+    def create_chapter(
+        self,
+        book_id: UUID,
+        chapter_number: int,
+        name: str,
+        start_page: Optional[int] = None,
+        end_page: Optional[int] = None,
+    ) -> Chapter:
+        chapter = Chapter(
+            book_id=book_id,
+            chapter_number=chapter_number,
+            name=name.strip(),
+            start_page=start_page,
+            end_page=end_page,
+        )
         self.db.add(chapter)
         self.db.commit()
         self.db.refresh(chapter)
@@ -115,14 +128,61 @@ class WorkspaceRepository:
         stmt = select(Chapter).where(Chapter.book_id == book_id).order_by(Chapter.chapter_number.asc())
         return list(self.db.execute(stmt).scalars().all())
 
-    def update_chapter(self, chapter: Chapter, chapter_number: Optional[int] = None, name: Optional[str] = None) -> Chapter:
+    def update_chapter(
+        self,
+        chapter: Chapter,
+        chapter_number: Optional[int] = None,
+        name: Optional[str] = None,
+        start_page: Optional[int] = None,
+        end_page: Optional[int] = None,
+    ) -> Chapter:
         if chapter_number is not None:
             chapter.chapter_number = chapter_number
         if name is not None:
             chapter.name = name.strip()
+        if start_page is not None:
+            chapter.start_page = start_page
+        if end_page is not None:
+            chapter.end_page = end_page
         self.db.commit()
         self.db.refresh(chapter)
         return chapter
+
+    def reassign_chunks_for_page_range(
+        self,
+        book_id: UUID,
+        chapter_id: UUID,
+        start_page: int,
+        end_page: int,
+    ) -> int:
+        from app.models.document import DocumentChunk
+        from sqlalchemy import update
+
+        # Clear any chunks previously assigned to this chapter outside new page range
+        clear_stmt = (
+            update(DocumentChunk)
+            .where(
+                DocumentChunk.book_id == book_id,
+                DocumentChunk.chapter_id == chapter_id,
+                (DocumentChunk.page_number < start_page) | (DocumentChunk.page_number > end_page),
+            )
+            .values(chapter_id=None)
+        )
+        self.db.execute(clear_stmt)
+
+        # Set chapter_id for all DocumentChunks in this book within [start_page, end_page]
+        assign_stmt = (
+            update(DocumentChunk)
+            .where(
+                DocumentChunk.book_id == book_id,
+                DocumentChunk.page_number >= start_page,
+                DocumentChunk.page_number <= end_page,
+            )
+            .values(chapter_id=chapter_id)
+        )
+        res = self.db.execute(assign_stmt)
+        self.db.commit()
+        return res.rowcount
 
     def delete_chapter(self, chapter: Chapter) -> None:
         self.db.delete(chapter)

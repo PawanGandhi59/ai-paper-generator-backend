@@ -14,6 +14,7 @@ class ChunkingService:
         subject_id: UUID,
         workspace_id: UUID,
         chapter_id: Optional[UUID] = None,
+        page_to_chapter_map: Optional[Dict[int, UUID]] = None,
         max_chunk_chars: int = 800,
         overlap_chars: int = 100,
     ) -> List[Dict[str, Any]]:
@@ -28,13 +29,19 @@ class ChunkingService:
             page_meta = page.metadata_json or {}
             content_type = page.content_type or "PAGE"
 
+            current_chapter_id = (
+                page_to_chapter_map.get(page.page_number)
+                if page_to_chapter_map and page.page_number in page_to_chapter_map
+                else chapter_id
+            )
+
             # If page text is short or empty, keep page as a single chunk (e.g., visual/image page)
             if not text or len(text) <= max_chunk_chars:
                 chunks_data.append({
                     "chunk_index": global_chunk_index,
                     "document_id": document_id,
                     "document_page_id": page.id,
-                    "chapter_id": chapter_id,
+                    "chapter_id": current_chapter_id,
                     "book_id": book_id,
                     "subject_id": subject_id,
                     "workspace_id": workspace_id,
@@ -64,7 +71,7 @@ class ChunkingService:
                             "chunk_index": global_chunk_index,
                             "document_id": document_id,
                             "document_page_id": page.id,
-                            "chapter_id": chapter_id,
+                            "chapter_id": current_chapter_id,
                             "book_id": book_id,
                             "subject_id": subject_id,
                             "workspace_id": workspace_id,
@@ -89,7 +96,7 @@ class ChunkingService:
                     "chunk_index": global_chunk_index,
                     "document_id": document_id,
                     "document_page_id": page.id,
-                    "chapter_id": chapter_id,
+                    "chapter_id": current_chapter_id,
                     "book_id": book_id,
                     "subject_id": subject_id,
                     "workspace_id": workspace_id,

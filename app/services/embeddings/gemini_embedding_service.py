@@ -1,6 +1,5 @@
-import hashlib
 import logging
-import math
+import time
 from typing import List, Optional
 
 from google import genai
@@ -10,21 +9,6 @@ from app.core.config import settings
 from app.services.embeddings.embedding_service import EmbeddingService
 
 logger = logging.getLogger(__name__)
-
-
-def generate_deterministic_mock_vector(text: str, dimension: int = 768) -> List[float]:
-    """Generate a deterministic 768-dim unit vector for testing when API key is missing."""
-    seed_hash = hashlib.sha256(text.encode("utf-8")).digest()
-    values = []
-    for i in range(dimension):
-        byte_val = seed_hash[i % len(seed_hash)]
-        val = (byte_val / 255.0) - 0.5 + math.sin(i + len(text))
-        values.append(val)
-
-    # Normalize to unit length
-    magnitude = math.sqrt(sum(v * v for v in values)) or 1.0
-    return [v / magnitude for v in values]
-
 
 try:
     from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -43,8 +27,8 @@ class GeminiEmbeddingService(EmbeddingService):
 
     def _init_client(self):
         if not self.api_key:
-            logger.warning("GEMINI_API_KEY is not configured. GeminiEmbeddingService running in deterministic mock mode.")
-            return
+            logger.error("GEMINI_API_KEY is not configured.")
+            raise ValueError("GEMINI_API_KEY is missing. Gemini embedding service requires a valid API key.")
 
         try:
             if GoogleGenerativeAIEmbeddings:
@@ -69,40 +53,68 @@ class GeminiEmbeddingService(EmbeddingService):
         if not texts:
             return []
 
-        # Mock mode when API key is missing
         if not self.api_key or (not self.client and not self.lc_embeddings):
-            return [generate_deterministic_mock_vector(t, self.dimension) for t in texts]
+            raise ValueError("GEMINI_API_KEY is missing. Gemini embedding service requires a valid API key.")
 
-        # Real API mode via LangChain / Gemini SDK
         try:
             clean_texts = [t if t and t.strip() else "empty text" for t in texts]
+            batch_size = 100
+            all_embeddings = []
 
-            if self.lc_embeddings:
-                embeddings = self.lc_embeddings.embed_documents(clean_texts)
-            else:
-                contents = [{"parts": [{"text": t}]} for t in clean_texts]
-                res = self.client.models.embed_content(
-                    model=self.model_name,
-                    contents=contents,
-                    config=types.EmbedContentConfig(output_dimensionality=self.dimension),
-                )
-                if not res or not hasattr(res, "embeddings") or not res.embeddings:
-                    raise RuntimeError("Gemini embedding API returned empty response.")
-                embeddings = [emb.values for emb in res.embeddings]
+            for i in range(0, len(clean_texts), batch_size):
+                sub_batch = clean_texts[i : i + batch_size]
+                max_retries = 5
+                backoff = 2.0
+                sub_embeddings = None
+
+                for attempt in range(max_retries):
+                    try:
+                        if self.lc_embeddings:
+                            sub_embeddings = self.lc_embeddings.embed_documents(sub_batch)
+                        else:
+                            contents = [{"parts": [{"text": t}]} for t in sub_batch]
+                            res = self.client.models.embed_content(
+                                model=self.model_name,
+                                contents=contents,
+                                config=types.EmbedContentConfig(output_dimensionality=self.dimension),
+                            )
+                            if not res or not hasattr(res, "embeddings") or not res.embeddings:
+                                raise RuntimeError("Gemini embedding API returned empty response.")
+                            sub_embeddings = [emb.values for emb in res.embeddings]
+                        break
+                    except Exception as exc:
+                        exc_str = str(exc)
+                        if ("429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str or "quota" in exc_str.lower()) and attempt < max_retries - 1:
+                            logger.warning(
+                                f"Gemini embedding API rate limit/quota reached on batch index {i} (attempt {attempt + 1}/{max_retries}): {exc_str}. "
+                                f"Retrying in {backoff} seconds..."
+                            )
+                            time.sleep(backoff)
+                            backoff *= 2.0
+                        else:
+                            logger.error(f"Gemini embedding error on batch starting index {i}: {exc_str}")
+                            raise RuntimeError(f"Gemini embedding API failure: {exc_str}")
+
+                if not sub_embeddings:
+                    raise RuntimeError(f"Failed to generate embeddings for batch starting index {i}")
+
+                all_embeddings.extend(sub_embeddings)
+                if i + batch_size < len(clean_texts):
+                    time.sleep(0.3)
 
             # Validate batch count and dimensions
-            if len(embeddings) != len(texts):
+            if len(all_embeddings) != len(texts):
                 raise RuntimeError(
-                    f"Gemini embedding batch count mismatch: expected {len(texts)}, got {len(embeddings)}"
+                    f"Gemini embedding batch count mismatch: expected {len(texts)}, got {len(all_embeddings)}"
                 )
 
-            for idx, vec in enumerate(embeddings):
+            for idx, vec in enumerate(all_embeddings):
                 if len(vec) != self.dimension:
                     raise RuntimeError(
                         f"Gemini embedding dimension mismatch at index {idx}: expected {self.dimension}, got {len(vec)}"
                     )
 
-            return embeddings
+            return all_embeddings
 
         except Exception as exc:
             logger.error(f"Gemini embedding API error: {str(exc)}")

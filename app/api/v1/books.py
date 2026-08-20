@@ -7,7 +7,8 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.models.user import User
-from app.schemas.book import BookCreate, BookResponse, BookUpdate
+from app.schemas.book import BookCreate, BookDetailResponse, BookResponse, BookUpdate
+from app.schemas.document import DocumentResponse
 from app.services.workspace_service import WorkspaceService
 
 router = APIRouter(tags=["Books"])
@@ -42,18 +43,32 @@ def list_books(
     return [BookResponse.model_validate(b) for b in books]
 
 
-@router.get("/books/{book_id}", response_model=BookResponse, status_code=status.HTTP_200_OK)
+@router.get("/books/{book_id}", response_model=BookDetailResponse, status_code=status.HTTP_200_OK)
 def get_book(
     book_id: UUID,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> BookResponse:
+) -> BookDetailResponse:
     """
-    Get a book by ID.
+    Get a book by ID with attached uploaded documents.
     """
     service = WorkspaceService(db)
     book = service.get_book(book_id=book_id, current_user_id=current_user.id)
-    return BookResponse.model_validate(book)
+    return BookDetailResponse.model_validate(book)
+
+
+@router.get("/books/{book_id}/documents", response_model=List[DocumentResponse], status_code=status.HTTP_200_OK)
+def list_book_documents(
+    book_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> List[DocumentResponse]:
+    """
+    List all uploaded documents (PDFs/PPTXs) under a book.
+    """
+    service = WorkspaceService(db)
+    book = service.get_book(book_id=book_id, current_user_id=current_user.id)
+    return [DocumentResponse.model_validate(doc) for doc in book.documents]
 
 
 @router.patch("/books/{book_id}", response_model=BookResponse, status_code=status.HTTP_200_OK)
