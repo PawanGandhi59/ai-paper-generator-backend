@@ -15,7 +15,7 @@ from app.repositories.document_repository import DocumentRepository
 from app.services.ai.gemini_service import GeminiService
 from app.services.ai.prompts.rag_prompt import RAG_SYSTEM_INSTRUCTION, RAG_USER_PROMPT_TEMPLATE
 from app.services.ai.rag_chain import RAGOrchestrator
-from app.services.embeddings.gemini_embedding_service import GeminiEmbeddingService, generate_deterministic_mock_vector
+from app.services.embeddings.gemini_embedding_service import GeminiEmbeddingService
 from app.services.retrieval.chunking_service import ChunkingService
 from app.services.retrieval.context_builder import ContextBuilder
 from app.services.retrieval.retrieval_service import RetrievalService
@@ -80,19 +80,9 @@ def test_chunking_service_structure_preservation(tmp_path):
     assert "Newton's Second Law" in chunks[1]["content"]
 
 
-def test_embedding_service_mock_vectors():
-    service = GeminiEmbeddingService(api_key="")
-    vec1 = service.generate_embedding("Newtonian Mechanics")
-    vec2 = service.generate_embedding("Newtonian Mechanics")
-    vec3 = service.generate_embedding("Quantum Thermodynamics")
-
-    assert len(vec1) == 768
-    assert vec1 == vec2  # Deterministic mock vectors
-    assert vec1 != vec3
-
-    batch_vecs = service.generate_embeddings_batch(["Text A", "Text B"])
-    assert len(batch_vecs) == 2
-    assert len(batch_vecs[0]) == 768
+def test_embedding_service_requires_api_key():
+    with pytest.raises(ValueError):
+        GeminiEmbeddingService(api_key="")
 
 
 def test_embedding_service_error_propagation_in_real_mode():

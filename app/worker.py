@@ -11,6 +11,8 @@ from sqlalchemy.exc import DatabaseError, OperationalError
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.repositories.document_repository import DocumentRepository
+from app.repositories.workspace_repository import WorkspaceRepository
+from app.services.ai.chapter_detection_service import ChapterDetectionService
 from app.services.embeddings.gemini_embedding_service import GeminiEmbeddingService
 from app.services.processors.pdf_processor import PDFProcessor
 from app.services.processors.pptx_processor import PPTXProcessor
@@ -149,6 +151,48 @@ def generate_document_embeddings(self, document_id_str: str) -> dict:
         subject = book.subject
         workspace_id = subject.workspace_id
 
+        # AI Chapter Detection for complete book uploads (when doc.chapter_id is None)
+        page_to_chapter_map = None
+        if doc.chapter_id is None:
+            try:
+                detector = ChapterDetectionService()
+                detected_chapters = detector.detect_chapters(pages)
+                if detected_chapters:
+                    ws_repo = WorkspaceRepository(db)
+                    page_to_chapter_map = {}
+                    total_pages_count = len(pages)
+
+                    for i, det in enumerate(detected_chapters):
+                        start_p = det.start_page
+                        end_p = (detected_chapters[i + 1].start_page - 1) if (i + 1 < len(detected_chapters)) else total_pages_count
+                        if end_p < start_p:
+                            end_p = start_p
+
+                        # Idempotent chapter creation/retrieval
+                        existing_ch = ws_repo.get_chapter_by_book_and_number(book.id, det.chapter_number)
+                        if existing_ch:
+                            ch_obj = ws_repo.update_chapter(
+                                existing_ch,
+                                name=det.name,
+                                start_page=start_p,
+                                end_page=end_p,
+                            )
+                        else:
+                            ch_obj = ws_repo.create_chapter(
+                                book_id=book.id,
+                                chapter_number=det.chapter_number,
+                                name=det.name,
+                                start_page=start_p,
+                                end_page=end_p,
+                            )
+
+                        for p_num in range(start_p, end_p + 1):
+                            page_to_chapter_map[p_num] = ch_obj.id
+
+                    logger.info(f"Auto-assigned {len(page_to_chapter_map)} pages across {len(detected_chapters)} detected chapters for document_id={document_id_str}")
+            except Exception as ch_exc:
+                logger.warning(f"Failed during chapter detection workflow for document_id={document_id_str}: {ch_exc}. Proceeding with chapter_id=None.")
+
         # 1. Structure-aware Chunking
         chunks_data = ChunkingService.chunk_document_pages(
             pages=pages,
@@ -157,6 +201,7 @@ def generate_document_embeddings(self, document_id_str: str) -> dict:
             subject_id=subject_id,
             workspace_id=workspace_id,
             chapter_id=doc.chapter_id,
+            page_to_chapter_map=page_to_chapter_map,
         )
 
         # 2. Save DocumentChunks to DB
@@ -202,7 +247,14 @@ def generate_document_embeddings(self, document_id_str: str) -> dict:
             return {"status": "FAILED", "document_id": document_id_str, "error": safe_error}
 
     except Exception as general_exc:
-        logger.exception(f"Unexpected embedding generation error for document_id={document_id_str}: {str(general_exc)}")
+        exc_str = str(general_exc)
+        if ("429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str or "quota" in exc_str.lower()) and self.request.retries < self.max_retries:
+            logger.warning(f"Rate limit / quota 429 encountered for document_id={document_id_str}, retrying task in 45s (attempt {self.request.retries + 1}/{self.max_retries})...")
+            try:
+                raise self.retry(exc=general_exc, countdown=45)
+            except MaxRetriesExceededError:
+                pass
+        logger.exception(f"Unexpected embedding generation error for document_id={document_id_str}: {exc_str}")
         try:
             doc_repo = DocumentRepository(db)
             safe_error = "An unexpected error occurred during embedding generation."

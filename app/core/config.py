@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     CELERY_RESULT_BACKEND: str = "redis://redis:6379/1"
 
     LOCAL_STORAGE_PATH: str = "/app/storage"
-    MAX_UPLOAD_SIZE_MB: int = 50
+    MAX_UPLOAD_SIZE_MB: int = 500
 
     OCR_ENABLED: bool = True
     OCR_LANGUAGE: str = "eng"
