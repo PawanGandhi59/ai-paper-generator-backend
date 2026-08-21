@@ -128,13 +128,42 @@ def test_list_and_get_reference_papers():
     papers_list = list_res.json()
     assert len(papers_list) == 2
 
-    # Get detail by ID
+    # Get detail by ID (default lightweight)
     detail_res = client.get(f"/api/v1/reference-papers/{p1['id']}", headers=headers)
     assert detail_res.status_code == status.HTTP_200_OK
     detail = detail_res.json()
     assert detail["title"] == "Midterm 2024"
-    assert "pages" in detail
-    assert len(detail["pages"]) == 2
+    assert "pages" not in detail
+    assert "file_url" in detail
+
+    # Get detail with include_pages=true
+    pages_res = client.get(f"/api/v1/reference-papers/{p1['id']}?include_pages=true", headers=headers)
+    assert pages_res.status_code == status.HTTP_200_OK
+    pages_detail = pages_res.json()
+    assert "pages" in pages_detail
+    assert len(pages_detail["pages"]) == 2
+
+
+def test_upload_reference_paper_invalid_year():
+    uid = uuid.uuid4().hex[:8]
+    user = client.post("/api/v1/auth/register", json={"name": "Ref User 4", "email": f"ref4_{uid}@example.com", "password": "password123"}).json()
+    headers = {"Authorization": f"Bearer {user['access_token']}"}
+
+    ws = client.post("/api/v1/workspaces", json={"name": f"WS_{uid}"}, headers=headers).json()
+    subj = client.post(f"/api/v1/workspaces/{ws['id']}/subjects", json={"name": f"Subj_{uid}"}, headers=headers).json()
+
+    pdf_bytes = create_sample_pdf_bytes()
+    files = {"file": ("exam.pdf", io.BytesIO(pdf_bytes), "application/pdf")}
+
+    # Negative year
+    res = client.post(
+        f"/api/v1/subjects/{subj['id']}/reference-papers",
+        data={"title": "Paper 1", "year": "-1"},
+        files=files,
+        headers=headers,
+    )
+    assert res.status_code == status.HTTP_400_BAD_REQUEST
+    assert "Invalid year" in res.json()["detail"]
 
 
 def test_delete_reference_paper_db_and_filesystem():
@@ -216,3 +245,40 @@ def test_reference_paper_unauthorized_access():
     # User 2 attempts to delete User 1's paper -> 404
     bad_del = client.delete(f"/api/v1/reference-papers/{p1['id']}", headers=h2)
     assert bad_del.status_code == status.HTTP_404_NOT_FOUND
+
+
+def test_preview_and_download_reference_paper_files():
+    uid = uuid.uuid4().hex[:8]
+    user = client.post("/api/v1/auth/register", json={"name": "Dl User", "email": f"dl_{uid}@example.com", "password": "password123"}).json()
+    headers = {"Authorization": f"Bearer {user['access_token']}"}
+
+    ws = client.post("/api/v1/workspaces", json={"name": f"WS_{uid}"}, headers=headers).json()
+    subj = client.post(f"/api/v1/workspaces/{ws['id']}/subjects", json={"name": f"Subj_{uid}"}, headers=headers).json()
+
+    pdf_bytes = create_sample_pdf_bytes()
+    p1 = client.post(
+        f"/api/v1/subjects/{subj['id']}/reference-papers",
+        data={"title": "Downloadable Exam"},
+        files={"file": ("exam_dl.pdf", io.BytesIO(pdf_bytes), "application/pdf")},
+        headers=headers,
+    ).json()
+
+    assert p1["file_url"] == f"/storage/reference_papers/{p1['id']}/original.pdf"
+
+    # Direct Static Access (vigilens-backend pattern)
+    static_res = client.get(p1["file_url"])
+    assert static_res.status_code == status.HTTP_200_OK
+    assert static_res.content == pdf_bytes
+
+    # 3. Missing file on disk -> 404
+    db = SessionLocal()
+    try:
+        paper_db = db.get(ReferencePaper, uuid.UUID(p1["id"]))
+        stored_path = paper_db.stored_path
+        if os.path.exists(stored_path):
+            os.remove(stored_path)
+    finally:
+        db.close()
+
+    missing_static = client.get(p1["file_url"])
+    assert missing_static.status_code == status.HTTP_404_NOT_FOUND

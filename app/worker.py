@@ -1,5 +1,6 @@
 import logging
 import os
+import shutil
 from uuid import UUID
 
 from celery import Celery
@@ -7,6 +8,7 @@ from celery.exceptions import MaxRetriesExceededError
 from fitz import FileDataError
 from pptx.exc import PackageNotFoundError
 from sqlalchemy.exc import DatabaseError, OperationalError
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import SessionLocal
@@ -38,49 +40,70 @@ PERMANENT_ERRORS = (ValueError, FileNotFoundError, FileDataError, PackageNotFoun
 TRANSIENT_ERRORS = (OperationalError, DatabaseError, OSError)
 
 
+def cleanup_failed_document(db: Session, document_id_str: str, error_msg: str):
+    """
+    Completely delete disk storage files and DB records for a document when processing fails.
+    Prevents storage waste and ensures queries for book documents return only valid, clean items.
+    """
+    try:
+        doc_id = UUID(document_id_str)
+        doc_dir = os.path.join(settings.LOCAL_STORAGE_PATH, "documents", document_id_str)
+
+        if os.path.exists(doc_dir):
+            shutil.rmtree(doc_dir, ignore_errors=True)
+            logger.info(f"Cleaned up disk storage for failed document_id={document_id_str}")
+
+        doc_repo = DocumentRepository(db)
+        doc_repo.delete_document(doc_id)
+        logger.info(f"Cleaned up database record for failed document_id={document_id_str}")
+    except Exception as cleanup_exc:
+        logger.error(f"Failed to cleanup failed document_id={document_id_str}: {cleanup_exc}")
+
+
 @celery_app.task(bind=True, name="process_document", max_retries=3)
 def process_document(self, document_id_str: str) -> dict:
-    logger.info(f"Starting async processing for document_id={document_id_str}")
+    """
+    Celery task for document processing pipeline.
+    """
+    logger.info(f"Starting process_document pipeline for document_id={document_id_str}")
     db = SessionLocal()
     try:
         doc_repo = DocumentRepository(db)
         doc_id = UUID(document_id_str)
 
-        # 1. Atomic claim check
+        # 1. Claim processing task atomically
         doc = doc_repo.claim_document_for_processing(doc_id)
         if not doc:
             logger.info(f"Document claim skipped or already processing/processed: document_id={document_id_str}")
             return {"status": "skipped", "reason": "Already claimed or processed"}
 
-        doc_dir = os.path.dirname(doc.stored_path)
-        filename_lower = doc.original_filename.lower()
-        mime_lower = doc.mime_type.lower()
+        if not doc.stored_path:
+            logger.error(f"Document stored_path missing for document_id={document_id_str}")
+            cleanup_failed_document(db, document_id_str, "Missing stored_path")
+            return {"status": "FAILED", "reason": "Missing stored_path"}
 
-        # 2. Document format processing
-        if mime_lower == "application/pdf" or filename_lower.endswith(".pdf"):
+        doc_dir = os.path.dirname(doc.stored_path)
+        _, ext = os.path.splitext(doc.original_filename)
+        ext_lower = ext.lower()
+
+        # 2. Extract Document Pages
+        if ext_lower == ".pdf":
             pages_data = PDFProcessor.process_pdf(doc.stored_path, doc_dir)
-        elif (
-            "presentation" in mime_lower
-            or mime_lower == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-            or filename_lower.endswith(".pptx")
-        ):
+        elif ext_lower == ".pptx":
             pages_data = PPTXProcessor.process_pptx(doc.stored_path, doc_dir)
         else:
-            raise ValueError(f"Unsupported file format: mime={doc.mime_type}, name={doc.original_filename}")
+            cleanup_failed_document(db, document_id_str, f"Unsupported extension {ext_lower}")
+            return {"status": "FAILED", "reason": f"Unsupported extension {ext_lower}"}
 
-        if not pages_data:
-            raise ValueError("No pages or slides could be extracted from the document.")
-
-        # 3. Save extracted pages & trigger embedding generation task
+        # 3. Save DocumentPage records to DB
         doc_repo.save_document_pages(doc_id, pages_data)
         doc_repo.mark_embedding_started(doc_id)
 
-        # Queue embedding task
+        # 5. Trigger async embedding generation task
         try:
             generate_document_embeddings.delay(document_id_str)
         except Exception as embed_queue_exc:
             logger.error(f"Failed to queue embedding task: {embed_queue_exc}")
-            # Fallback to direct synchronous execution if async queue fails in test environments
             generate_document_embeddings(document_id_str)
 
         logger.info(f"Successfully processed document_id={document_id_str}, total_pages={len(pages_data)}")
@@ -92,12 +115,7 @@ def process_document(self, document_id_str: str) -> dict:
 
     except PERMANENT_ERRORS as perm_exc:
         logger.error(f"Permanent document processing failure for document_id={document_id_str}: {str(perm_exc)}")
-        try:
-            doc_repo = DocumentRepository(db)
-            safe_error = f"Permanent processing error: {type(perm_exc).__name__}"
-            doc_repo.mark_processing_failed(UUID(document_id_str), error_message=safe_error)
-        except Exception as save_exc:
-            logger.error(f"Failed to record permanent error state for document_id={document_id_str}: {save_exc}")
+        cleanup_failed_document(db, document_id_str, str(perm_exc))
         return {"status": "FAILED", "document_id": document_id_str, "error": str(perm_exc)}
 
     except TRANSIENT_ERRORS as trans_exc:
@@ -107,19 +125,12 @@ def process_document(self, document_id_str: str) -> dict:
             raise self.retry(exc=trans_exc, countdown=countdown)
         except MaxRetriesExceededError:
             logger.error(f"Max retries exceeded for document_id={document_id_str}")
-            doc_repo = DocumentRepository(db)
-            safe_error = f"Processing failed after max retries: {type(trans_exc).__name__}"
-            doc_repo.mark_processing_failed(UUID(document_id_str), error_message=safe_error)
-            return {"status": "FAILED", "document_id": document_id_str, "error": safe_error}
+            cleanup_failed_document(db, document_id_str, str(trans_exc))
+            return {"status": "FAILED", "document_id": document_id_str, "error": str(trans_exc)}
 
     except Exception as general_exc:
         logger.exception(f"Unexpected processing error for document_id={document_id_str}: {str(general_exc)}")
-        try:
-            doc_repo = DocumentRepository(db)
-            safe_error = "An unexpected error occurred during processing."
-            doc_repo.mark_processing_failed(UUID(document_id_str), error_message=safe_error)
-        except Exception as save_exc:
-            logger.error(f"Failed to record unexpected error state for document_id={document_id_str}: {save_exc}")
+        cleanup_failed_document(db, document_id_str, str(general_exc))
         return {"status": "FAILED", "document_id": document_id_str, "error": "Unexpected processing error"}
 
     finally:
@@ -226,12 +237,7 @@ def generate_document_embeddings(self, document_id_str: str) -> dict:
 
     except PERMANENT_ERRORS as perm_exc:
         logger.error(f"Permanent embedding generation failure for document_id={document_id_str}: {str(perm_exc)}")
-        try:
-            doc_repo = DocumentRepository(db)
-            safe_error = f"Permanent embedding error: {type(perm_exc).__name__}"
-            doc_repo.mark_processing_failed(UUID(document_id_str), error_message=safe_error)
-        except Exception as save_exc:
-            logger.error(f"Failed to record error state for document_id={document_id_str}: {save_exc}")
+        cleanup_failed_document(db, document_id_str, str(perm_exc))
         return {"status": "FAILED", "document_id": document_id_str, "error": str(perm_exc)}
 
     except TRANSIENT_ERRORS as trans_exc:
@@ -241,10 +247,8 @@ def generate_document_embeddings(self, document_id_str: str) -> dict:
             raise self.retry(exc=trans_exc, countdown=countdown)
         except MaxRetriesExceededError:
             logger.error(f"Max embedding retries exceeded for document_id={document_id_str}")
-            doc_repo = DocumentRepository(db)
-            safe_error = f"Embedding generation failed after max retries: {type(trans_exc).__name__}"
-            doc_repo.mark_processing_failed(UUID(document_id_str), error_message=safe_error)
-            return {"status": "FAILED", "document_id": document_id_str, "error": safe_error}
+            cleanup_failed_document(db, document_id_str, str(trans_exc))
+            return {"status": "FAILED", "document_id": document_id_str, "error": str(trans_exc)}
 
     except Exception as general_exc:
         exc_str = str(general_exc)
@@ -255,13 +259,12 @@ def generate_document_embeddings(self, document_id_str: str) -> dict:
             except MaxRetriesExceededError:
                 pass
         logger.exception(f"Unexpected embedding generation error for document_id={document_id_str}: {exc_str}")
-        try:
-            doc_repo = DocumentRepository(db)
-            safe_error = "An unexpected error occurred during embedding generation."
-            doc_repo.mark_processing_failed(UUID(document_id_str), error_message=safe_error)
-        except Exception as save_exc:
-            logger.error(f"Failed to record unexpected embedding error for document_id={document_id_str}: {save_exc}")
-        return {"status": "FAILED", "document_id": document_id_str, "error": "Unexpected embedding error"}
+        if "429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str or "quota" in exc_str.lower():
+            safe_error = "Gemini API rate limit or daily free tier quota exceeded (429 RESOURCE_EXHAUSTED). Please check your Gemini API billing/quota or retry later."
+        else:
+            safe_error = f"Embedding generation failed: {exc_str[:200]}"
+        cleanup_failed_document(db, document_id_str, safe_error)
+        return {"status": "FAILED", "document_id": document_id_str, "error": safe_error}
 
     finally:
         db.close()

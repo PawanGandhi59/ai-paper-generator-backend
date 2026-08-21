@@ -7,6 +7,7 @@ from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.models.chapter import Chapter
 from app.models.document import Document, DocumentChunk, DocumentPage
 
 
@@ -202,11 +203,12 @@ class DocumentRepository:
         subject_id: Optional[UUID] = None,
         book_id: Optional[UUID] = None,
         chapter_id: Optional[UUID] = None,
+        chapter_ids: Optional[List[UUID]] = None,
         document_id: Optional[UUID] = None,
     ) -> List[Tuple[DocumentChunk, float]]:
         """
         Perform pgvector cosine similarity search filtered strictly by workspace_id
-        and optional subject/book/chapter/document parameters.
+        and optional subject/book/chapter/chapter_ids/document parameters.
         Returns list of (DocumentChunk, cosine_distance) tuples.
         """
         distance_col = DocumentChunk.embedding.cosine_distance(query_vector).label("distance")
@@ -221,6 +223,18 @@ class DocumentRepository:
             stmt = stmt.where(DocumentChunk.book_id == book_id)
         if chapter_id:
             stmt = stmt.where(DocumentChunk.chapter_id == chapter_id)
+        if chapter_ids and len(chapter_ids) > 0:
+            chapters = self.db.query(Chapter).filter(Chapter.id.in_(chapter_ids)).all()
+            conditions = [DocumentChunk.chapter_id.in_(chapter_ids)]
+            for ch in chapters:
+                if ch.start_page is not None and ch.end_page is not None:
+                    conditions.append(
+                        (DocumentChunk.book_id == ch.book_id) &
+                        (DocumentChunk.page_number >= ch.start_page) &
+                        (DocumentChunk.page_number <= ch.end_page)
+                    )
+            stmt = stmt.where(or_(*conditions))
+
         if document_id:
             stmt = stmt.where(DocumentChunk.document_id == document_id)
 

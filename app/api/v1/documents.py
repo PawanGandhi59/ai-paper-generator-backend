@@ -1,10 +1,10 @@
 from typing import List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, get_current_user_from_header_or_query
 from app.core.database import get_db
 from app.models.user import User
 from app.schemas.document import DocumentPageResponse, DocumentResponse, DocumentUploadResponse
@@ -73,32 +73,3 @@ def get_document_pages(
     doc = service.get_document(current_user_id=current_user.id, document_id=document_id)
     pages = service.doc_repo.get_document_pages(doc.id)
     return [DocumentPageResponse.model_validate(p) for p in pages]
-
-
-@router.get("/{document_id}/download")
-def download_document_file(
-    document_id: UUID,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """
-    Stream / inline preview the raw binary PDF or PPTX file by document ID.
-    """
-    import os
-    from fastapi.responses import FileResponse
-
-    service = DocumentService(db)
-    doc = service.get_document(current_user_id=current_user.id, document_id=document_id)
-
-    if not doc.stored_path or not os.path.exists(doc.stored_path):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="File not found on disk storage.",
-        )
-
-    headers = {"Content-Disposition": f'inline; filename="{doc.original_filename or "document.pdf"}"'}
-    return FileResponse(
-        path=doc.stored_path,
-        media_type=doc.mime_type or "application/pdf",
-        headers=headers,
-    )

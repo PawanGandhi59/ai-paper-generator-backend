@@ -298,10 +298,9 @@ def test_permanent_and_transient_failure_handling(tmp_path):
         res = process_document(doc_id_str)
         assert res["status"] == "FAILED"
 
-    # Verify DB status is FAILED and error stored
-    doc_status = client.get(f"/api/v1/documents/{doc_id_str}", headers=headers).json()
-    assert doc_status["processing_status"] == "FAILED"
-    assert "Permanent processing error" in doc_status["processing_error"]
+    # Verify DB record and disk storage are cleaned up (returns 404 Not Found)
+    doc_resp = client.get(f"/api/v1/documents/{doc_id_str}", headers=headers)
+    assert doc_resp.status_code == 404
 
 
 def test_stale_document_reclaim():
@@ -344,3 +343,45 @@ def test_stale_document_reclaim():
     res = process_document(doc_id_str)
     assert res["status"] == "PROCESSED"
     assert res["pages_count"] == 1
+
+
+def test_document_preview_and_download_endpoints():
+    uid = uuid4().hex[:8]
+    user_a = client.post("/api/v1/auth/register", json={"name": "Owner", "email": f"own_{uid}@example.com", "password": "password123"}).json()
+    user_b = client.post("/api/v1/auth/register", json={"name": "Attacker", "email": f"att_{uid}@example.com", "password": "password123"}).json()
+
+    headers_a = {"Authorization": f"Bearer {user_a['access_token']}"}
+    headers_b = {"Authorization": f"Bearer {user_b['access_token']}"}
+
+    ws = client.post("/api/v1/workspaces", json={"name": f"WS_{uid}"}, headers=headers_a).json()
+    subj = client.post(f"/api/v1/workspaces/{ws['id']}/subjects", json={"name": f"Subj_{uid}"}, headers=headers_a).json()
+    book = client.post(f"/api/v1/subjects/{subj['id']}/books", json={"name": f"Book_{uid}"}, headers=headers_a).json()
+
+    pdf_bytes = create_sample_pdf_bytes("Doc Preview/Download PDF Test Content")
+
+    with patch("app.worker.process_document.delay"):
+        upload_resp = client.post(
+            "/api/v1/documents/upload",
+            data={"book_id": book["id"]},
+            files={"file": ("sample_doc.pdf", pdf_bytes, "application/pdf")},
+            headers=headers_a,
+        ).json()
+    doc_id = upload_resp["id"]
+
+    # 1. Direct static access (vigilens-backend pattern)
+    static_res = client.get(f"/storage/documents/{doc_id}/original.pdf")
+    assert static_res.status_code == 200
+    assert static_res.content == pdf_bytes
+
+    # 2. Missing file on disk -> 404
+    db = SessionLocal()
+    try:
+        doc_obj = db.get(Document, PyUUID(doc_id))
+        stored_path = doc_obj.stored_path
+        if os.path.exists(stored_path):
+            os.remove(stored_path)
+    finally:
+        db.close()
+
+    missing_static = client.get(f"/storage/documents/{doc_id}/original.pdf")
+    assert missing_static.status_code == 404
