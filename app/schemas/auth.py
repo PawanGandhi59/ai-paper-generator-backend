@@ -1,8 +1,18 @@
+import re
 from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+
+
+def _validate_person_name(v: str) -> str:
+    v = v.strip()
+    if not v:
+        raise ValueError("Name cannot be empty or blank")
+    if not re.search(r'[a-zA-Z\u00C0-\u024F\u1E00-\u1EFF]', v):
+        raise ValueError("Name must contain at least one letter and cannot consist only of numbers, dots, or symbols")
+    return v
 
 
 class UserRegister(BaseModel):
@@ -10,10 +20,25 @@ class UserRegister(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=6, max_length=72)
 
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        return _validate_person_name(v)
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v: str) -> str:
+        return v.strip()
+
 
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v: str) -> str:
+        return v.strip()
 
 
 class GoogleLogin(BaseModel):

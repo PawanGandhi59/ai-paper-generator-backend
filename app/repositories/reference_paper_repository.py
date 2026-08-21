@@ -68,8 +68,19 @@ class ReferencePaperRepository:
         self.db.commit()
         return created_pages
 
+    def get_reference_paper(self, paper_id: UUID) -> Optional[ReferencePaper]:
+        return self.db.get(ReferencePaper, paper_id)
+
     def get_reference_paper_by_id(self, paper_id: UUID) -> Optional[ReferencePaper]:
         return self.db.get(ReferencePaper, paper_id)
+
+    def get_reference_paper_pages(self, paper_id: UUID) -> List[ReferencePaperPage]:
+        stmt = (
+            select(ReferencePaperPage)
+            .where(ReferencePaperPage.reference_paper_id == paper_id)
+            .order_by(ReferencePaperPage.page_number.asc())
+        )
+        return list(self.db.execute(stmt).scalars().all())
 
     def list_reference_papers_by_subject(
         self, workspace_id: UUID, subject_id: UUID

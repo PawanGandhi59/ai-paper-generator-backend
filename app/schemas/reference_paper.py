@@ -2,12 +2,12 @@ from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 
 class ReferencePaperCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=255)
-    year: Optional[int] = Field(None, ge=1900, le=2100)
+    year: Optional[int] = Field(None, ge=1, le=2100, description="Valid calendar year (e.g., 2025)")
     exam_type: Optional[str] = Field(None, max_length=100)
 
 
@@ -34,6 +34,11 @@ class ReferencePaperResponse(BaseModel):
     file_size: int
     created_at: datetime
     updated_at: datetime
+
+    @computed_field
+    @property
+    def file_url(self) -> str:
+        return f"/storage/reference_papers/{self.id}/original.pdf"
 
     model_config = ConfigDict(from_attributes=True)
 

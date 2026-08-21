@@ -32,6 +32,7 @@ class RetrievalService:
         subject_id: Optional[UUID] = None,
         book_id: Optional[UUID] = None,
         chapter_id: Optional[UUID] = None,
+        chapter_ids: Optional[List[UUID]] = None,
         document_id: Optional[UUID] = None,
         top_k: int = 5,
     ) -> List[Dict[str, Any]]:
@@ -62,6 +63,7 @@ class RetrievalService:
             subject_id=subject_id,
             book_id=book_id,
             chapter_id=chapter_id,
+            chapter_ids=chapter_ids,
             document_id=document_id,
         )
 

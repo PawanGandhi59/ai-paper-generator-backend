@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, computed_field
 
 
 class DocumentUploadResponse(BaseModel):
@@ -25,6 +25,11 @@ class DocumentResponse(BaseModel):
     processing_completed_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
+
+    @computed_field
+    @property
+    def file_url(self) -> str:
+        return f"/storage/documents/{self.id}/original.pdf"
 
     model_config = ConfigDict(from_attributes=True)
 
