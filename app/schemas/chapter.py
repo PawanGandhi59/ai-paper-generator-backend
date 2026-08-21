@@ -62,6 +62,7 @@ class ChapterResponse(BaseModel):
     name: str
     start_page: Optional[int] = None
     end_page: Optional[int] = None
+    file_url: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

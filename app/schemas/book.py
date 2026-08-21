@@ -48,5 +48,6 @@ class BookResponse(BaseModel):
 
 
 class BookDetailResponse(BookResponse):
-    documents: List[DocumentResponse] = Field(default_factory=list)
+    file_url: Optional[str] = None
+
 

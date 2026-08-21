@@ -278,6 +278,11 @@ class PaperGeneratorService:
         accepted_questions: List[Dict[str, Any]] = []
         attempts = 0
 
+        # Extract section-aligned reference sample questions if in REFERENCE mode
+        section_ref_questions: List[Dict[str, Any]] = []
+        if generation_mode == GenerationMode.REFERENCE:
+            section_ref_questions = self._get_section_aligned_sample_questions(sec, sample_questions)
+
         # Assign difficulty per question
         difficulties = self._calculate_difficulty_distribution(difficulty, target_count)
 
@@ -293,7 +298,7 @@ class PaperGeneratorService:
                 context_text=context_text,
                 topic_focus=topic_focus,
                 generation_mode=generation_mode,
-                sample_questions=sample_questions,
+                section_ref_questions=section_ref_questions,
             )
 
             try:
@@ -313,10 +318,13 @@ class PaperGeneratorService:
                     if self._is_duplicate_question(candidate, accepted_questions + existing_questions):
                         continue
 
-                    # Determine source_type
-                    source_type = candidate.get("source_type", "AI_GENERATED")
-                    if source_type not in [e.value for e in QuestionSource]:
-                        source_type = "AI_GENERATED"
+                    # Determine source_type deterministically
+                    if generation_mode == GenerationMode.CUSTOM or not section_ref_questions:
+                        source_type = QuestionSource.AI_GENERATED.value
+                    else:
+                        source_type = candidate.get("source_type", QuestionSource.AI_GENERATED.value)
+                        if source_type not in [e.value for e in QuestionSource]:
+                            source_type = QuestionSource.AI_GENERATED.value
 
                     candidate["source_type"] = source_type
                     candidate["section_name"] = sec.name
@@ -342,6 +350,52 @@ class PaperGeneratorService:
 
         return accepted_questions
 
+    def _get_section_aligned_sample_questions(
+        self,
+        sec: SectionBlueprint,
+        sample_questions: Optional[List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Select reference sample questions relevant to the current section.
+        Matching priority:
+        1. Exact section_name + question_type match
+        2. question_type match
+        3. If neither is available, return empty list []
+        """
+        if not sample_questions or not isinstance(sample_questions, list):
+            return []
+
+        sec_name_clean = sec.name.strip().lower() if sec.name else ""
+        q_type_clean = sec.question_type.value.strip().upper()
+
+        # Priority 1: section_name AND question_type match
+        exact_matches: List[Dict[str, Any]] = []
+        for sq in sample_questions:
+            if not isinstance(sq, dict):
+                continue
+            sq_sec = str(sq.get("section_name", "")).strip().lower()
+            sq_type = str(sq.get("question_type", "")).strip().upper()
+            if sq_type == q_type_clean and (sq_sec == sec_name_clean or (sq_sec and sq_sec in sec_name_clean) or (sec_name_clean and sec_name_clean in sq_sec)):
+                exact_matches.append(sq)
+
+        if exact_matches:
+            return exact_matches[:5]
+
+        # Priority 2: question_type match
+        type_matches: List[Dict[str, Any]] = []
+        for sq in sample_questions:
+            if not isinstance(sq, dict):
+                continue
+            sq_type = str(sq.get("question_type", "")).strip().upper()
+            if sq_type == q_type_clean:
+                type_matches.append(sq)
+
+        if type_matches:
+            return type_matches[:5]
+
+        # Priority 3: No match available
+        return []
+
     def _build_generation_prompt(
         self,
         sec: SectionBlueprint,
@@ -350,37 +404,45 @@ class PaperGeneratorService:
         context_text: str,
         topic_focus: Optional[str],
         generation_mode: GenerationMode,
-        sample_questions: Optional[List[Dict[str, Any]]],
+        section_ref_questions: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         q_type = sec.question_type.value
 
+        has_ref_questions = generation_mode == GenerationMode.REFERENCE and bool(section_ref_questions)
+
+        source_type_schema = (
+            '"source_type": "<AI_GENERATED | REFERENCE_REUSED | REFERENCE_VARIATION>"'
+            if has_ref_questions
+            else '"source_type": "AI_GENERATED"'
+        )
+
         schema_instructions = ""
         if q_type == "MCQ":
-            schema_instructions = """
+            schema_instructions = f"""
 Each question must be a JSON object with:
 - "question_text": "<Question text>",
 - "mcq_options": ["A. Option 1", "B. Option 2", "C. Option 3", "D. Option 4"],
 - "correct_answer": "<Exact text of correct option>",
 - "solution_explanation": "<Explanation>",
-- "source_type": "<AI_GENERATED | REFERENCE_REUSED | REFERENCE_VARIATION>"
+- {source_type_schema}
 """
         elif q_type == "NUMERICAL":
-            schema_instructions = """
+            schema_instructions = f"""
 Each question must be a JSON object with:
 - "question_text": "<Numerical problem description with given data>",
-- "numerical_values": {"given": "...", "target": "..."},
+- "numerical_values": {{"given": "...", "target": "..."}},
 - "correct_answer": "<Numerical result with units>",
 - "solution_explanation": "<Step-by-step mathematical solution>",
 - "unit": "<Unit of measurement, e.g. ms, KB, %>",
-- "source_type": "<AI_GENERATED | REFERENCE_REUSED | REFERENCE_VARIATION>"
+- {source_type_schema}
 """
         else:  # SHORT_ANSWER or LONG_ANSWER
-            schema_instructions = """
+            schema_instructions = f"""
 Each question must be a JSON object with:
 - "question_text": "<Question text>",
 - "expected_answer": "<Comprehensive model answer>",
 - "solution_explanation": "<Key concepts and grading criteria>",
-- "source_type": "<AI_GENERATED | REFERENCE_REUSED | REFERENCE_VARIATION>"
+- {source_type_schema}
 """
 
         topic_instruction_str = ""
@@ -392,12 +454,12 @@ USER TOPIC FOCUS INSTRUCTION:
 """
 
         ref_instruction_str = ""
-        if generation_mode == GenerationMode.REFERENCE and sample_questions:
-            samples_formatted = json.dumps(sample_questions[:5], indent=2)
+        if has_ref_questions and section_ref_questions:
+            samples_formatted = json.dumps(section_ref_questions, indent=2)
             ref_instruction_str = f"""
-REFERENCE PAPER PATTERN & SAMPLE QUESTIONS:
+REFERENCE PAPER PATTERN & SAMPLE QUESTIONS FOR THIS SECTION ({sec.name} - {q_type}):
 {samples_formatted}
-(IMPORTANT: Use these as pattern/style references. You may reuse or adapt a reference question ONLY if its concept exists in the provided selected chapter material. Otherwise generate new questions.)
+(IMPORTANT: Use these as pattern/style references. You may reuse or adapt a reference question ONLY if its concept exists in the provided selected chapter material. Do not introduce facts that are absent from the selected chapter material. Otherwise generate new questions.)
 """
 
         prompt = f"""

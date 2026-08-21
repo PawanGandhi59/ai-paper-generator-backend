@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import List, TYPE_CHECKING
+from typing import List, Optional, TYPE_CHECKING
 import uuid
 
 from sqlalchemy import DateTime, ForeignKey, String
@@ -30,3 +30,13 @@ class Book(Base):
     subject: Mapped["Subject"] = relationship("Subject", back_populates="books")
     chapters: Mapped[List["Chapter"]] = relationship("Chapter", back_populates="book", cascade="all, delete-orphan")
     documents: Mapped[List["Document"]] = relationship("Document", back_populates="book", cascade="all, delete-orphan")
+
+    @property
+    def file_url(self) -> Optional[str]:
+        if not self.documents:
+            return None
+        for doc in self.documents:
+            if doc.chapter_id is None:
+                return f"/storage/documents/{doc.id}/original.pdf"
+        return None
+
