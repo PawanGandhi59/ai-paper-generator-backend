@@ -43,6 +43,11 @@ class Document(Base):
     pages: Mapped[List["DocumentPage"]] = relationship("DocumentPage", back_populates="document", cascade="all, delete-orphan")
     chunks: Mapped[List["DocumentChunk"]] = relationship("DocumentChunk", back_populates="document", cascade="all, delete-orphan")
 
+    @property
+    def chapter_number(self) -> Optional[int]:
+        return self.chapter.chapter_number if self.chapter else None
+
+
 
 class DocumentPage(Base):
     __tablename__ = "document_pages"

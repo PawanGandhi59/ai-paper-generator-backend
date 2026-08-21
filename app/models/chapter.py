@@ -33,3 +33,13 @@ class Chapter(Base):
     book: Mapped["Book"] = relationship("Book", back_populates="chapters")
     topics: Mapped[List["Topic"]] = relationship("Topic", back_populates="chapter", cascade="all, delete-orphan")
     documents: Mapped[List["Document"]] = relationship("Document", back_populates="chapter")
+
+    @property
+    def file_url(self) -> Optional[str]:
+        if not self.documents:
+            return None
+        for doc in self.documents:
+            if doc.chapter_id == self.id:
+                return f"/storage/documents/{doc.id}/original.pdf"
+        return None
+

@@ -16,6 +16,7 @@ class DocumentResponse(BaseModel):
     id: UUID
     book_id: UUID
     chapter_id: Optional[UUID] = None
+    chapter_number: Optional[int] = None
     original_filename: str
     mime_type: str
     file_size: int
