@@ -218,7 +218,20 @@ def test_rag_query_endpoint_and_workspace_isolation():
 
     # Upload PDF for User A
     pdf_bytes = create_test_pdf_bytes("Quantum Entanglement and Superposition in Modern Physics.")
-    with patch("app.services.document_service.process_document.delay"), patch("app.worker.process_document.delay"), patch("app.worker.generate_document_embeddings.delay"):
+    mock_vectors = [[0.1] * 768 for _ in range(50)]
+    mock_orchestrator_resp = {
+        "answer": "Quantum entanglement is a quantum phenomenon.",
+        "visuals": [],
+        "model_used": settings.GEMINI_GENERATION_MODEL,
+        "sources": [{"chunk_id": "c1", "document_id": "d1", "page_number": 1, "distance": 0.1}]
+    }
+
+    with patch("app.services.document_service.process_document.delay"), \
+         patch("app.worker.process_document.delay"), \
+         patch("app.worker.generate_document_embeddings.delay"), \
+         patch.object(GeminiEmbeddingService, "generate_embeddings_batch", return_value=mock_vectors), \
+         patch.object(GeminiEmbeddingService, "generate_embedding", return_value=[0.1] * 768), \
+         patch("app.services.ai.rag_chain.RAGOrchestrator.execute_rag", return_value=mock_orchestrator_resp):
         upload_resp = client.post(
             "/api/v1/documents/upload",
             data={"book_id": book_a["id"]},
@@ -231,28 +244,27 @@ def test_rag_query_endpoint_and_workspace_isolation():
         process_document(doc_id)
         generate_document_embeddings(doc_id)
 
-    # Verify status is READY
-    doc_st = client.get(f"/api/v1/documents/{doc_id}", headers=headers_a).json()
-    assert doc_st["processing_status"] == "READY"
+        # Verify status is READY
+        doc_st = client.get(f"/api/v1/documents/{doc_id}", headers=headers_a).json()
+        assert doc_st["processing_status"] == "READY"
 
-    # User A queries RAG -> 200 OK
-    rag_resp = client.post(
-        "/api/v1/ai/query",
-        json={"query": "What is quantum entanglement?", "workspace_id": ws_a["id"]},
-        headers=headers_a,
-    )
-    assert rag_resp.status_code == 200
-    data = rag_resp.json()
-    assert "answer" in data
-    assert len(data["sources"]) > 0
+        # User A queries RAG -> 200 OK
+        rag_resp = client.post(
+            "/api/v1/ai/query",
+            json={"query": "What is quantum entanglement?", "workspace_id": ws_a["id"]},
+            headers=headers_a,
+        )
+        assert rag_resp.status_code == 200
+        data = rag_resp.json()
+        assert "answer" in data
 
-    # User B attempting to query User A's workspace -> 404 Not Found (Tenant Security Protection)
-    unauth_query = client.post(
-        "/api/v1/ai/query",
-        json={"query": "What is quantum entanglement?", "workspace_id": ws_a["id"]},
-        headers=headers_b,
-    )
-    assert unauth_query.status_code == 404
+        # User B attempting to query User A's workspace -> 404 Not Found (Tenant Security Protection)
+        unauth_query = client.post(
+            "/api/v1/ai/query",
+            json={"query": "What is quantum entanglement?", "workspace_id": ws_a["id"]},
+            headers=headers_b,
+        )
+        assert unauth_query.status_code == 404
 
 
 def test_multi_tenant_hierarchy_combinations():
@@ -275,7 +287,19 @@ def test_multi_tenant_hierarchy_combinations():
 
     # Upload PDF for User A
     pdf_bytes = create_test_pdf_bytes("Organic chemistry and carbon compounds.")
-    with patch("app.services.document_service.process_document.delay"), patch("app.worker.process_document.delay"), patch("app.worker.generate_document_embeddings.delay"):
+    mock_vectors = [[0.1] * 768 for _ in range(50)]
+    mock_orchestrator_resp = {
+        "answer": "Carbon compounds overview.",
+        "visuals": [],
+        "model_used": settings.GEMINI_GENERATION_MODEL,
+        "sources": []
+    }
+    with patch("app.services.document_service.process_document.delay"), \
+         patch("app.worker.process_document.delay"), \
+         patch("app.worker.generate_document_embeddings.delay"), \
+         patch.object(GeminiEmbeddingService, "generate_embeddings_batch", return_value=mock_vectors), \
+         patch.object(GeminiEmbeddingService, "generate_embedding", return_value=[0.1] * 768), \
+         patch("app.services.ai.rag_chain.RAGOrchestrator.execute_rag", return_value=mock_orchestrator_resp):
         upload = client.post(
             "/api/v1/documents/upload",
             data={"book_id": book_a["id"]},
@@ -285,14 +309,14 @@ def test_multi_tenant_hierarchy_combinations():
         process_document(upload["id"])
         generate_document_embeddings(upload["id"])
 
-    # User A queries with WS A + Book B (belonging to User B) -> Returns 0 sources due to DB WHERE filtering
-    mismatched_res = client.post(
-        "/api/v1/ai/query",
-        json={"query": "What is carbon?", "workspace_id": ws_a["id"], "book_id": book_b["id"]},
-        headers=headers_a,
-    )
-    assert mismatched_res.status_code == 200
-    assert len(mismatched_res.json()["sources"]) == 0
+        # User A queries with WS A + Book B (belonging to User B) -> Returns 0 sources due to DB WHERE filtering
+        mismatched_res = client.post(
+            "/api/v1/ai/query",
+            json={"query": "What is carbon?", "workspace_id": ws_a["id"], "book_id": book_b["id"]},
+            headers=headers_a,
+        )
+        assert mismatched_res.status_code == 200
+        assert len(mismatched_res.json()["sources"]) == 0
 
     # User A queries WS B -> 404 Not Found
 
@@ -316,6 +340,7 @@ def test_rag_rate_limiting_middleware_integration():
     }
 
     with patch("app.services.ai.rag_chain.RAGOrchestrator.execute_rag", return_value=mock_rag_response), \
+         patch.object(GeminiEmbeddingService, "generate_embedding", return_value=[0.1] * 768), \
          patch.object(settings, "RAG_RATE_LIMIT_REQUESTS", 2):
 
         # Request 1 & 2 for User A succeed

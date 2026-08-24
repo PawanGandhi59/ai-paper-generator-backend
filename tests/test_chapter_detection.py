@@ -166,7 +166,9 @@ def test_worker_complete_book_chunk_chapter_assignment():
         up_res = client.post("/api/v1/documents/upload", data=data, files=files, headers=headers).json()
         doc_id = up_res["id"]
 
+    mock_vectors = [[0.1] * 768 for _ in range(50)]
     with patch.object(ChapterDetectionService, "detect_chapters", return_value=mock_items), \
+         patch.object(GeminiEmbeddingService, "generate_embeddings_batch", return_value=mock_vectors), \
          patch("app.worker.generate_document_embeddings.delay", side_effect=Exception("Async fallback")):
         from app.worker import process_document
         res = process_document(doc_id)
@@ -217,7 +219,9 @@ def test_explicit_chapter_upload_bypasses_detection():
         doc_id = up_res["id"]
 
     mock_detector = MagicMock()
+    mock_vectors = [[0.1] * 768 for _ in range(50)]
     with patch("app.worker.ChapterDetectionService", return_value=mock_detector), \
+         patch.object(GeminiEmbeddingService, "generate_embeddings_batch", return_value=mock_vectors), \
          patch("app.worker.generate_document_embeddings.delay", side_effect=Exception("Async fallback")):
         from app.worker import process_document
         res = process_document(doc_id)
@@ -253,12 +257,14 @@ def test_worker_retry_idempotency():
     mock_items = [
         ChapterDetectionItem(chapter_number=1, name="Processes", start_page=1),
     ]
+    mock_vectors = [[0.1] * 768 for _ in range(50)]
 
     with patch("app.services.document_service.process_document.delay"):
         up_res = client.post("/api/v1/documents/upload", data=data, files=files, headers=headers).json()
         doc_id = up_res["id"]
 
     with patch.object(ChapterDetectionService, "detect_chapters", return_value=mock_items), \
+         patch.object(GeminiEmbeddingService, "generate_embeddings_batch", return_value=mock_vectors), \
          patch("app.worker.generate_document_embeddings.delay", side_effect=Exception("Async fallback")):
         from app.worker import process_document, generate_document_embeddings
         process_document(doc_id)
