@@ -282,3 +282,196 @@ def test_preview_and_download_reference_paper_files():
 
     missing_static = client.get(p1["file_url"])
     assert missing_static.status_code == status.HTTP_404_NOT_FOUND
+
+
+def test_reference_paper_normal_text_pdf_no_ocr():
+    """
+    Test 1: Normal text PDF with meaningful extracted text should NOT invoke OCR fallback.
+    """
+    from unittest.mock import patch
+    from app.services.processors.pdf_processor import PDFProcessor
+
+    pdf_bytes = create_sample_pdf_bytes(pages_count=1)
+    
+    with patch("pytesseract.image_to_string") as mock_ocr:
+        pages_data = PDFProcessor.process_pdf(file_path="", doc_dir="") if False else None
+        
+        # Test PDFProcessor directly with mock
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = tmp.name
+
+        try:
+            pages = PDFProcessor.process_pdf(tmp_path, tempfile.gettempdir())
+            assert len(pages) == 1
+            assert pages[0]["metadata_json"]["ocr_applied"] is False
+            assert "Sample Reference Paper" in pages[0]["text_content"]
+            mock_ocr.assert_not_called()
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+
+def test_reference_paper_scanned_pdf_ocr_fallback_and_persistence():
+    """
+    Test 2 & 3: Scanned PDF page returning '5' triggers OCR fallback and persists OCR text.
+    """
+    from unittest.mock import patch
+    import tempfile
+    from app.services.processors.pdf_processor import PDFProcessor
+
+    # Create a PDF page with text '5' (scanned page artifact)
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((50, 50), "5")
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    mock_ocr_result = "SECTION A\nQ1. Define blockchain technology.\nQ2. What is proof of work?"
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    try:
+        with patch("pytesseract.image_to_string", return_value=mock_ocr_result):
+            pages = PDFProcessor.process_pdf(tmp_path, tempfile.gettempdir())
+            assert len(pages) == 1
+            assert pages[0]["metadata_json"]["ocr_applied"] is True
+            assert pages[0]["text_content"] == mock_ocr_result
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def test_reference_paper_ocr_failure_handling():
+    """
+    Test 4: OCR failure on scanned paper returns appropriate processing error.
+    """
+    from unittest.mock import patch
+    import tempfile
+
+    # Create a PDF page with text '5'
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((50, 50), "5")
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    uid = uuid.uuid4().hex[:8]
+    user = client.post("/api/v1/auth/register", json={"name": "OCR Fail User", "email": f"ocrf_{uid}@example.com", "password": "password123"}).json()
+    headers = {"Authorization": f"Bearer {user['access_token']}"}
+
+    ws = client.post("/api/v1/workspaces", json={"name": f"WS_{uid}"}, headers=headers).json()
+    subj = client.post(f"/api/v1/workspaces/{ws['id']}/subjects", json={"name": f"Subj_{uid}"}, headers=headers).json()
+
+    files = {"file": ("scanned_fail.pdf", io.BytesIO(pdf_bytes), "application/pdf")}
+    data = {"title": "Failed OCR Paper"}
+
+    with patch("pytesseract.image_to_string", side_effect=Exception("Tesseract OCR engine crash")):
+        res = client.post(f"/api/v1/subjects/{subj['id']}/reference-papers", data=data, files=files, headers=headers)
+        assert res.status_code == status.HTTP_400_BAD_REQUEST
+        assert "Could not extract readable text content" in res.json()["detail"] or "Failed to process" in res.json()["detail"]
+
+
+def test_realistic_ocr_structure_reference_blueprint_analysis():
+    """
+    Test 5: Verify that realistic OCR text produces Section A (3 marks), Section B (20 marks), Section C (35 marks), Total = 58 marks.
+    """
+    from unittest.mock import patch
+    from app.services.paper.blueprint_service import BlueprintService
+
+    ocr_text = """
+    SECTION A (3 Questions x 1 Mark = 3 Marks)
+    1. Define blockchain ledger.
+    2. What is a cryptographic nonce?
+    3. What is a smart contract?
+
+    SECTION B (5 Questions x 4 Marks = 20 Marks)
+    4a. Explain PoW consensus mechanism.
+    OR
+    4b. Explain PoS consensus mechanism.
+
+    5a. Describe Ethereum virtual machine.
+    OR
+    5b. Describe Hyperledger Fabric architecture.
+
+    6a. What is mining difficulty?
+    OR
+    6b. What is block reward halving?
+
+    7a. What is a Sybil attack?
+    OR
+    7b. What is a 51 percent attack?
+
+    8a. Explain public blockchain vs private blockchain.
+    OR
+    8b. Explain permissioned vs permissionless blockchain.
+
+    SECTION C (5 Questions x 7 Marks = 35 Marks)
+    9a. Explain blockchain scaling trilemma in detail.
+    OR
+    9b. Explain Layer 2 scaling solutions.
+
+    10a. Describe application of blockchain in healthcare.
+    OR
+    10b. Describe application of blockchain in supply chain.
+
+    11a. Explain digital signatures and public key cryptography.
+    OR
+    11b. Explain Merkle tree root hash generation.
+
+    12a. Explain zero knowledge proofs and zk-SNARKs.
+    OR
+    12b. Explain decentralized identity protocols.
+
+    13a. Explain smart contract security vulnerabilities and reentrancy.
+    OR
+    13b. Explain decentralized finance (DeFi) liquidity pools.
+    """
+
+    fake_analysis_response = """
+    {
+      "total_marks": 58,
+      "sections": [
+        {
+          "name": "Section A",
+          "question_type": "SHORT_ANSWER",
+          "question_count": 3,
+          "marks_per_question": 1,
+          "has_internal_choice": false,
+          "alternatives_per_question": 1
+        },
+        {
+          "name": "Section B",
+          "question_type": "SHORT_ANSWER",
+          "question_count": 5,
+          "marks_per_question": 4,
+          "has_internal_choice": true,
+          "alternatives_per_question": 2,
+          "choice_rule": "answer_one_of_two"
+        },
+        {
+          "name": "Section C",
+          "question_type": "LONG_ANSWER",
+          "question_count": 5,
+          "marks_per_question": 7,
+          "has_internal_choice": true,
+          "alternatives_per_question": 2,
+          "choice_rule": "answer_one_of_two"
+        }
+      ]
+    }
+    """
+
+    with patch("app.services.paper.blueprint_service.GeminiService.generate_response", return_value=fake_analysis_response):
+        bp_svc = BlueprintService()
+        bp = bp_svc.analyze_reference_paper([ocr_text])
+
+    assert bp.total_marks == 58
+    assert len(bp.sections) == 3
+    assert bp.sections[0].total_section_marks == 3
+    assert bp.sections[1].total_section_marks == 20
+    assert bp.sections[2].total_section_marks == 35
+

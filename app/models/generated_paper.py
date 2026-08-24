@@ -61,6 +61,9 @@ class GeneratedPaperQuestion(Base):
     difficulty = Column(String(50), nullable=False)
     source_type = Column(String(50), nullable=False)  # "AI_GENERATED", "REFERENCE_REUSED", "REFERENCE_VARIATION"
 
+    choice_group = Column(String(50), nullable=True)  # e.g., "Q4" or "4"
+    alternative_label = Column(String(10), nullable=True)  # e.g., "a", "b"
+
     mcq_options = Column(JSONB, nullable=True)  # List of option strings
     correct_answer = Column(Text, nullable=True)
     expected_answer = Column(Text, nullable=True)

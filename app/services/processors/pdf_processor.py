@@ -1,5 +1,6 @@
 import io
 import os
+import re
 from typing import Any, Dict, List
 
 import fitz  # PyMuPDF
@@ -10,6 +11,21 @@ from app.core.config import settings
 
 
 class PDFProcessor:
+    @staticmethod
+    def is_meaningful_text(text: str) -> bool:
+        if not text or not text.strip():
+            return False
+        clean_text = text.strip()
+        if len(clean_text) < 20:
+            return False
+        words = re.findall(r"\b[a-zA-Z]{2,}\b", clean_text)
+        if len(words) < 3:
+            return False
+        alpha_chars = sum(1 for c in clean_text if c.isalpha())
+        if alpha_chars / float(len(clean_text)) < 0.20:
+            return False
+        return True
+
     @staticmethod
     def process_pdf(file_path: str, doc_dir: str) -> List[Dict[str, Any]]:
         pages_data = []
@@ -29,25 +45,51 @@ class PDFProcessor:
 
                 # 1. Primary text extraction
                 extracted_text = page.get_text("text") or ""
+                usable_text = extracted_text.strip()
+
                 ocr_applied = False
                 ocr_failed = False
                 ocr_error = None
 
-                # 2. OCR Fallback if text is insufficient
-                usable_text = extracted_text.strip()
-                if len(usable_text) < 20 and settings.OCR_ENABLED:
+                # 2. OCR Fallback if text extraction quality is insufficient
+                if not PDFProcessor.is_meaningful_text(usable_text) and settings.OCR_ENABLED:
                     ocr_applied = True
+                    best_ocr_text = ""
+
+                    # Method A: Try OCR on embedded image objects
                     try:
-                        pix = page.get_pixmap(dpi=150)
+                        embedded_imgs = page.get_images(full=True)
+                        for img_info in embedded_imgs:
+                            try:
+                                xref = img_info[0]
+                                base_image = pdf_doc.extract_image(xref)
+                                pil_img = Image.open(io.BytesIO(base_image["image"]))
+                                for psm_cfg in ["", "--psm 6"]:
+                                    t = pytesseract.image_to_string(pil_img, lang=settings.OCR_LANGUAGE, config=psm_cfg)
+                                    if t and len(t.strip()) > len(best_ocr_text):
+                                        best_ocr_text = t.strip()
+                            except Exception:
+                                pass
+                    except Exception as emb_exc:
+                        print(f"OCR embedded image warning on page {page_number}: {emb_exc}")
+
+                    # Method B: Try OCR on rendered pixmap
+                    try:
+                        pix = page.get_pixmap(dpi=200)
                         img_bytes = pix.tobytes("png")
                         pil_img = Image.open(io.BytesIO(img_bytes))
-                        ocr_text = pytesseract.image_to_string(pil_img, lang=settings.OCR_LANGUAGE)
-                        if ocr_text and ocr_text.strip():
-                            usable_text = f"{usable_text}\n{ocr_text.strip()}".strip()
-                    except Exception as ocr_exc:
+                        for psm_cfg in ["", "--psm 6"]:
+                            t = pytesseract.image_to_string(pil_img, lang=settings.OCR_LANGUAGE, config=psm_cfg)
+                            if t and len(t.strip()) > len(best_ocr_text):
+                                best_ocr_text = t.strip()
+                    except Exception as pix_exc:
+                        print(f"OCR pixmap warning on page {page_number}: {pix_exc}")
+
+                    if best_ocr_text:
+                        usable_text = best_ocr_text
+                    else:
                         ocr_failed = True
-                        ocr_error = f"OCR failed on page {page_number}: {str(ocr_exc)}"
-                        print(ocr_error)
+                        ocr_error = f"OCR failed to extract readable text on page {page_number}"
 
                 # 3. Image extraction
                 page_images_dir = os.path.join(doc_dir, "pages", f"{page_number:04d}", "images")

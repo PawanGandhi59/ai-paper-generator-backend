@@ -66,7 +66,6 @@ class GeminiEmbeddingService(EmbeddingService):
                 max_retries = 5
                 backoff = 2.0
                 sub_embeddings = None
-
                 for attempt in range(max_retries):
                     try:
                         if self.lc_embeddings:

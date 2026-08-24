@@ -108,6 +108,11 @@ class PaperRepository:
                 except ValueError:
                     ch_id = None
 
+            diff_val = q_info.get("difficulty")
+            if not diff_val:
+                paper = self.db.get(GeneratedPaper, paper_id)
+                diff_val = paper.difficulty if (paper and paper.difficulty) else "MEDIUM"
+
             question = GeneratedPaperQuestion(
                 id=uuid.uuid4(),
                 paper_id=paper_id,
@@ -117,8 +122,10 @@ class PaperRepository:
                 question_type=q_info["question_type"],
                 question_text=q_info["question_text"],
                 marks=q_info["marks"],
-                difficulty=q_info.get("difficulty", "MEDIUM"),
+                difficulty=diff_val,
                 source_type=q_info.get("source_type", "AI_GENERATED"),
+                choice_group=q_info.get("choice_group"),
+                alternative_label=q_info.get("alternative_label"),
                 mcq_options=q_info.get("mcq_options"),
                 correct_answer=q_info.get("correct_answer"),
                 expected_answer=q_info.get("expected_answer"),

@@ -15,3 +15,4 @@ os.makedirs("storage", exist_ok=True)
 app.mount("/storage", StaticFiles(directory="storage"), name="storage")
 
 app.include_router(api_router)
+

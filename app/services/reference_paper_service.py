@@ -94,6 +94,18 @@ class ReferencePaperService:
             # 4. Extract PDF text pages using PDFProcessor
             pages_data = PDFProcessor.process_pdf(stored_path, paper_dir)
 
+            # Validate overall text quality across all extracted pages
+            has_readable_text = any(
+                PDFProcessor.is_meaningful_text(p.get("text_content", ""))
+                for p in pages_data
+            )
+            if not has_readable_text:
+                shutil.rmtree(paper_dir, ignore_errors=True)
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Could not extract readable text content from reference paper pages. OCR processing failed or text is unreadable.",
+                )
+
             # 5. Create database records
             paper = self.repo.create_reference_paper(
                 paper_id=paper_id,

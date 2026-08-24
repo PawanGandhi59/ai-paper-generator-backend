@@ -131,6 +131,19 @@ class WorkspaceService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="start_page must be less than or equal to end_page.",
             )
+        has_whole_book_doc = any(doc.chapter_id is None for doc in book.documents)
+        if has_whole_book_doc:
+            if start_page is None or end_page is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="start_page and end_page are required when creating a chapter for a book with a whole book document uploaded.",
+                )
+        else:
+            if start_page is not None or end_page is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Cannot set start_page or end_page because no whole book document has been uploaded for this book.",
+                )
 
         ch = self.repo.create_chapter(
             book_id=book.id,
@@ -188,6 +201,21 @@ class WorkspaceService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="start_page must be less than or equal to end_page.",
             )
+
+        book = self.get_book(chapter.book_id, current_user_id)
+        has_whole_book_doc = any(doc.chapter_id is None for doc in book.documents)
+        if has_whole_book_doc:
+            if new_start is None or new_end is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="start_page and end_page are required for chapters in a book with a whole book document uploaded.",
+                )
+        else:
+            if start_page is not None or end_page is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Cannot set start_page or end_page because no whole book document has been uploaded for this book.",
+                )
 
         updated_ch = self.repo.update_chapter(
             chapter,

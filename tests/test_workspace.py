@@ -171,3 +171,77 @@ def test_manual_chapter_page_range_reassignment_and_security():
         headers=headers_b,
     )
     assert unauth_patch.status_code == 404
+
+
+def test_create_chapter_page_range_requires_whole_book_pdf():
+    uid = uuid4().hex[:8]
+    user = client.post("/api/v1/auth/register", json={"name": "Page Check User", "email": f"page_{uid}@example.com", "password": "password123"}).json()
+    headers = {"Authorization": f"Bearer {user['access_token']}"}
+
+    ws = client.post("/api/v1/workspaces", json={"name": "Bio WS"}, headers=headers).json()
+    subj = client.post(f"/api/v1/workspaces/{ws['id']}/subjects", json={"name": "Biology"}, headers=headers).json()
+    book = client.post(f"/api/v1/subjects/{subj['id']}/books", json={"name": "Genetics"}, headers=headers).json()
+
+    # 1. Attempt to create chapter with page range without uploading a whole book PDF -> 400 Bad Request
+    bad_ch = client.post(
+        f"/api/v1/books/{book['id']}/chapters",
+        json={"chapter_number": 1, "name": "DNA Structure", "start_page": 1, "end_page": 10},
+        headers=headers,
+    )
+    assert bad_ch.status_code == 400
+    assert "no whole book document has been uploaded" in bad_ch.json()["detail"]
+
+    # 2. Creating chapter WITHOUT page range is allowed -> 201 Created
+    good_ch = client.post(
+        f"/api/v1/books/{book['id']}/chapters",
+        json={"chapter_number": 1, "name": "DNA Structure"},
+        headers=headers,
+    )
+    assert good_ch.status_code == 201
+    assert good_ch.json()["start_page"] is None
+    assert good_ch.json()["end_page"] is None
+
+    # 3. Attempting to patch page range on chapter without whole book PDF -> 400 Bad Request
+    bad_patch = client.patch(
+        f"/api/v1/chapters/{good_ch.json()['id']}",
+        json={"start_page": 1, "end_page": 10},
+        headers=headers,
+    )
+    assert bad_patch.status_code == 400
+    assert "no whole book document has been uploaded" in bad_patch.json()["detail"]
+
+    # 4. Now upload whole book PDF to DB
+    db = SessionLocal()
+    try:
+        doc = Document(
+            book_id=book["id"],
+            original_filename="genetics_book.pdf",
+            stored_path="/fake/genetics.pdf",
+            mime_type="application/pdf",
+            file_size=2000,
+            processing_status="READY",
+        )
+        db.add(doc)
+        db.commit()
+    finally:
+        db.close()
+
+    # 5. Attempting to create chapter WITHOUT page range when whole book PDF exists -> 400 Bad Request
+    missing_pages_ch = client.post(
+        f"/api/v1/books/{book['id']}/chapters",
+        json={"chapter_number": 2, "name": "RNA Transcription"},
+        headers=headers,
+    )
+    assert missing_pages_ch.status_code == 400
+    assert "start_page and end_page are required" in missing_pages_ch.json()["detail"]
+
+    # 6. Creating chapter WITH page range when whole book PDF exists -> 201 Created
+    valid_whole_ch = client.post(
+        f"/api/v1/books/{book['id']}/chapters",
+        json={"chapter_number": 2, "name": "RNA Transcription", "start_page": 11, "end_page": 20},
+        headers=headers,
+    )
+    assert valid_whole_ch.status_code == 201
+    assert valid_whole_ch.json()["start_page"] == 11
+    assert valid_whole_ch.json()["end_page"] == 20
+

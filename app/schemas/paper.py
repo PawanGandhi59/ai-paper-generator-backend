@@ -36,6 +36,27 @@ class QuestionConfigItem(BaseModel):
     question_count: int = Field(..., ge=1, description="Number of questions for this type")
     marks_per_question: int = Field(..., ge=1, description="Marks assigned to each question")
     section_name: Optional[str] = Field(None, max_length=100)
+    has_internal_choice: bool = Field(False, description="Whether questions have internal choices (e.g. Q4(a) OR Q4(b))")
+    alternatives_per_question: int = Field(1, ge=1, description="Number of alternatives per question number")
+    alternatives: Optional[int] = Field(None, ge=1, description="Alias for alternatives_per_question")
+    choice_rule: Optional[str] = Field(None, max_length=100)
+
+    @model_validator(mode="after")
+    def sync_choice_fields(self) -> "QuestionConfigItem":
+        if self.alternatives is not None:
+            self.alternatives_per_question = self.alternatives
+
+        if self.alternatives_per_question > 1 or self.has_internal_choice:
+            self.has_internal_choice = True
+            if self.alternatives_per_question < 2:
+                self.alternatives_per_question = 2
+            if not self.choice_rule:
+                self.choice_rule = "answer_one_of_two"
+        else:
+            self.has_internal_choice = False
+            self.alternatives_per_question = 1
+            self.choice_rule = None
+        return self
 
 
 class PaperGenerateRequest(BaseModel):
@@ -105,6 +126,9 @@ class PaperQuestionResponse(BaseModel):
     marks: int
     difficulty: str
     source_type: QuestionSource
+
+    choice_group: Optional[str] = None
+    alternative_label: Optional[str] = None
 
     # Answer fields (conditionally included based on include_answers)
     mcq_options: Optional[List[str]] = None
