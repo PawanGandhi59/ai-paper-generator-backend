@@ -79,20 +79,32 @@ class PaperGeneratorService:
 
         # Reference Mode specific scope check
         reference_paper = None
+        source_is_generated_paper = False
         if request_data.generation_mode == GenerationMode.REFERENCE:
             reference_paper = self.ref_paper_repo.get_reference_paper(request_data.reference_paper_id)
             if not reference_paper:
+                # Try looking up in generated_papers table
+                reference_paper = self.paper_repo.get_paper(request_data.reference_paper_id)
+                if reference_paper:
+                    source_is_generated_paper = True
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Reference paper not found in uploaded reference papers or generated papers.",
+                    )
+            # Verify current user has access to the reference paper's subject/workspace
+            try:
+                self.workspace_service.get_subject(reference_paper.subject_id, current_user_id)
+            except Exception:
                 raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Reference paper not found.",
-                )
-            if reference_paper.subject_id != subject_id:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Reference paper belongs to a different subject.",
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Access denied: You do not have access to this reference paper.",
                 )
 
+
+
         # 2. Create Initial Paper Record (PENDING)
+        ref_paper_fk = None if source_is_generated_paper else request_data.reference_paper_id
         paper = self.paper_repo.create_paper(
             user_id=current_user_id,
             workspace_id=workspace_id,
@@ -105,7 +117,7 @@ class PaperGeneratorService:
             include_answers=request_data.include_answers,
             title=request_data.title,
             topic_focus=request_data.topic_focus,
-            reference_paper_id=request_data.reference_paper_id,
+            reference_paper_id=ref_paper_fk,
         )
 
         try:
@@ -118,15 +130,22 @@ class PaperGeneratorService:
                     total_marks=request_data.total_marks,
                 )
             else:
-                # Reference Mode: fetch reference pages text & analyze
-                ref_pages = self.ref_paper_repo.get_reference_paper_pages(reference_paper.id)
-                pages_text = [p.text_content for p in ref_pages] if ref_pages else []
-                blueprint = self.blueprint_service.analyze_reference_paper(
-                    paper_pages_text=pages_text,
-                    requested_total_marks=request_data.total_marks,
-                )
+                if source_is_generated_paper:
+                    blueprint = self.blueprint_service.build_blueprint_from_generated_paper(
+                        paper=reference_paper,
+                        requested_total_marks=request_data.total_marks,
+                    )
+                else:
+                    # Reference Mode (Uploaded PDF): fetch reference pages text & analyze
+                    ref_pages = self.ref_paper_repo.get_reference_paper_pages(reference_paper.id)
+                    pages_text = [p.text_content for p in ref_pages] if ref_pages else []
+                    blueprint = self.blueprint_service.analyze_reference_paper(
+                        paper_pages_text=pages_text,
+                        requested_total_marks=request_data.total_marks,
+                    )
 
             self.paper_repo.update_status(paper.id, "GENERATING", blueprint_json=blueprint.model_dump())
+
 
             # 4. RAG Candidate Retrieval strictly bounded to selected_chapter_ids
             context_text = self._retrieve_chapter_context(

@@ -281,6 +281,107 @@ class BlueprintService:
             self.validate_blueprint(fallback_bp)
             return fallback_bp
 
+    def build_blueprint_from_generated_paper(
+        self,
+        paper: Any,
+        requested_total_marks: Optional[int] = None,
+    ) -> PaperBlueprint:
+        """
+        Builds a PaperBlueprint directly from an existing GeneratedPaper instance.
+        Deserializes stored blueprint_json or reconstructs blueprint from paper questions,
+        extracting sample questions and adapting total marks if requested.
+        """
+        raw_blueprint = paper.blueprint_json
+        sample_questions: List[Dict[str, Any]] = []
+
+        # Extract sample questions from existing generated paper questions
+        if hasattr(paper, "questions") and paper.questions:
+            for q in paper.questions:
+                sample_questions.append({
+                    "section_name": getattr(q, "section_name", "Section A"),
+                    "question_type": getattr(q, "question_type", "SHORT_ANSWER"),
+                    "question_text": getattr(q, "question_text", ""),
+                    "marks": getattr(q, "marks", 1),
+                    "choice_group": getattr(q, "choice_group", None),
+                    "alternative_label": getattr(q, "alternative_label", None),
+                })
+
+        if raw_blueprint and isinstance(raw_blueprint, dict):
+            try:
+                blueprint = PaperBlueprint.model_validate(raw_blueprint)
+                if sample_questions:
+                    blueprint.sample_questions = sample_questions
+                self.validate_blueprint(blueprint)
+            except Exception as exc:
+                logger.warning(f"Failed to parse stored blueprint_json for paper {getattr(paper, 'id', 'unknown')}: {exc}")
+                blueprint = None
+        else:
+            blueprint = None
+
+        if not blueprint:
+            # Reconstruct blueprint from questions if blueprint_json was missing/invalid
+            section_map: Dict[str, Dict[str, Any]] = {}
+            if hasattr(paper, "questions") and paper.questions:
+                for q in paper.questions:
+                    sec_name = getattr(q, "section_name", "Section A")
+                    q_type = getattr(q, "question_type", "SHORT_ANSWER")
+                    q_marks = getattr(q, "marks", 1)
+
+                    if sec_name not in section_map:
+                        section_map[sec_name] = {
+                            "name": sec_name,
+                            "question_type": q_type,
+                            "question_count": 0,
+                            "marks_per_question": q_marks,
+                            "total_section_marks": 0,
+                            "has_internal_choice": False,
+                            "alternatives_per_question": 1,
+                        }
+                    sec_entry = section_map[sec_name]
+                    if getattr(q, "choice_group", None):
+                        sec_entry["has_internal_choice"] = True
+                        sec_entry["alternatives_per_question"] = 2
+
+                    if not sec_entry["has_internal_choice"] or getattr(q, "alternative_label", "a") in ("a", None):
+                        sec_entry["question_count"] += 1
+                        sec_entry["total_section_marks"] += q_marks
+
+            sections: List[SectionBlueprint] = []
+            for sec_data in section_map.values():
+                sec_data["total_section_marks"] = sec_data["question_count"] * sec_data["marks_per_question"]
+                try:
+                    sections.append(SectionBlueprint(**sec_data))
+                except Exception:
+                    pass
+
+            if not sections:
+                sections = [
+                    SectionBlueprint(
+                        name="Section A",
+                        question_type=QuestionType.SHORT_ANSWER,
+                        question_count=5,
+                        marks_per_question=2,
+                        total_section_marks=10,
+                    )
+                ]
+
+            total_m = getattr(paper, "total_marks", sum(s.total_section_marks for s in sections))
+            blueprint = PaperBlueprint(
+                total_marks=total_m,
+                sections=sections,
+                sample_questions=sample_questions,
+            )
+            self.validate_blueprint(blueprint)
+
+        if requested_total_marks is None or requested_total_marks == blueprint.total_marks:
+            return blueprint
+
+        adapted_bp = self.adapt_reference_blueprint(blueprint, requested_total_marks)
+        self.validate_blueprint(adapted_bp)
+        return adapted_bp
+
+
+
     def adapt_reference_blueprint(
         self,
         ref_blueprint: PaperBlueprint,
