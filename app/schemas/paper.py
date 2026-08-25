@@ -73,7 +73,11 @@ class PaperGenerateRequest(BaseModel):
     question_configs: Optional[List[QuestionConfigItem]] = None
 
     # Reference mode configuration
-    reference_paper_id: Optional[UUID] = None
+    reference_paper_id: Optional[UUID] = Field(
+        None,
+        description="UUID of an uploaded reference paper OR an existing AI-generated paper to use as a structural template.",
+    )
+
 
     @field_validator("title")
     @classmethod

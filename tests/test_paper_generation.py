@@ -2226,6 +2226,184 @@ def test_reference_mode_prompt_contains_difficulty_preservation_rule():
     assert "If the requested difficulty is HARD, preserve the reference question format and layout while increasing the cognitive demand appropriately" in prompt
 
 
+def test_build_blueprint_from_generated_paper():
+    """
+    TEST: Verify that BlueprintService.build_blueprint_from_generated_paper deserializes blueprint_json,
+    extracts sample questions, and handles target marks adaptation.
+    """
+    from unittest.mock import MagicMock
+    from app.services.paper.blueprint_service import BlueprintService, SectionBlueprint, PaperBlueprint
+    from app.schemas.paper import QuestionType
+
+    mock_paper = MagicMock()
+    mock_paper.id = "11111111-1111-1111-1111-111111111111"
+    mock_paper.total_marks = 20
+    mock_paper.blueprint_json = {
+        "total_marks": 20,
+        "sections": [
+            {
+                "name": "Section A",
+                "question_type": "MCQ",
+                "question_count": 5,
+                "marks_per_question": 1,
+                "total_section_marks": 5,
+                "has_internal_choice": False,
+                "alternatives_per_question": 1,
+            },
+            {
+                "name": "Section B",
+                "question_type": "SHORT_ANSWER",
+                "question_count": 5,
+                "marks_per_question": 3,
+                "total_section_marks": 15,
+                "has_internal_choice": False,
+                "alternatives_per_question": 1,
+            },
+        ],
+        "sample_questions": [],
+    }
+
+    mock_q1 = MagicMock()
+    mock_q1.section_name = "Section A"
+    mock_q1.question_type = "MCQ"
+    mock_q1.question_text = "What is velocity?"
+    mock_q1.marks = 1
+    mock_q1.choice_group = None
+    mock_q1.alternative_label = None
+
+    mock_paper.questions = [mock_q1]
+
+    bp_svc = BlueprintService()
+    bp = bp_svc.build_blueprint_from_generated_paper(mock_paper)
+
+    assert bp.total_marks == 20
+    assert len(bp.sections) == 2
+    assert bp.sections[0].name == "Section A"
+    assert bp.sections[0].question_count == 5
+    assert len(bp.sample_questions) == 1
+    assert bp.sample_questions[0]["question_text"] == "What is velocity?"
+
+
+def test_polymorphic_reference_paper_lookup_generated_paper():
+    """
+    TEST: Verify that PaperGeneratorService successfully uses an existing GeneratedPaper as a reference source
+    when reference_paper_id is not in reference_papers table.
+    """
+    from uuid import uuid4
+    from unittest.mock import MagicMock, call, patch
+    from app.schemas.paper import PaperGenerateRequest, GenerationMode, DifficultyLevel
+    from app.services.paper.paper_generator_service import PaperGeneratorService
+
+
+    book_id = uuid4()
+    ch_id = uuid4()
+    subject_id = uuid4()
+    workspace_id = uuid4()
+    user_id = uuid4()
+    ref_gen_paper_id = uuid4()
+
+    mock_db = MagicMock()
+    pg_svc = PaperGeneratorService(db=mock_db)
+
+    # Mock book, subject, chapters
+    mock_book = MagicMock()
+    mock_book.id = book_id
+    mock_book.subject_id = subject_id
+
+    mock_subject = MagicMock()
+    mock_subject.id = subject_id
+    mock_subject.workspace_id = workspace_id
+
+    mock_ch = MagicMock()
+    mock_ch.id = ch_id
+
+    pg_svc.workspace_service.get_book = MagicMock(return_value=mock_book)
+    pg_svc.workspace_service.get_subject = MagicMock(return_value=mock_subject)
+    pg_svc.workspace_service.list_chapters = MagicMock(return_value=[mock_ch])
+
+    # Reference mode lookup: ref_paper_repo returns None, paper_repo returns existing GeneratedPaper
+    pg_svc.ref_paper_repo.get_reference_paper = MagicMock(return_value=None)
+
+    existing_paper = MagicMock()
+    existing_paper.id = ref_gen_paper_id
+    existing_paper.subject_id = subject_id
+    existing_paper.workspace_id = workspace_id
+    existing_paper.total_marks = 10
+    existing_paper.generation_mode = "CUSTOM"
+
+    existing_paper.blueprint_json = {
+        "total_marks": 10,
+        "sections": [
+            {
+                "name": "Section A",
+                "question_type": "SHORT_ANSWER",
+                "question_count": 5,
+                "marks_per_question": 2,
+                "total_section_marks": 10,
+                "has_internal_choice": False,
+                "alternatives_per_question": 1,
+            }
+        ],
+        "sample_questions": [],
+    }
+    existing_paper.questions = []
+
+    # Mock paper creation
+    created_paper = MagicMock()
+    created_paper.id = uuid4()
+    created_paper.user_id = user_id
+    created_paper.workspace_id = workspace_id
+    created_paper.subject_id = subject_id
+    created_paper.book_id = book_id
+    created_paper.reference_paper_id = None
+    created_paper.title = "Ref Gen Paper Test"
+    created_paper.generation_mode = "REFERENCE"
+    created_paper.status = "COMPLETED"
+    created_paper.total_marks = 10
+    created_paper.difficulty = "MIXED"
+    created_paper.topic_focus = None
+    created_paper.selected_chapter_ids = [str(ch_id)]
+    created_paper.include_answers = True
+    created_paper.blueprint_json = existing_paper.blueprint_json
+    created_paper.error_message = None
+    created_paper.questions = []
+    created_paper.created_at = MagicMock()
+    created_paper.updated_at = MagicMock()
+
+    pg_svc.paper_repo.get_paper = MagicMock(side_effect=[existing_paper, created_paper])
+
+
+    pg_svc.paper_repo.create_paper = MagicMock(return_value=created_paper)
+    pg_svc.paper_repo.update_status = MagicMock()
+
+    # Mock RAG & question generation
+    with patch.object(pg_svc, "_retrieve_chapter_context", return_value="Context text"), \
+         patch.object(pg_svc, "_generate_section_questions", return_value=[]), \
+         patch.object(pg_svc.paper_repo, "save_questions"):
+
+        req = PaperGenerateRequest(
+            book_id=book_id,
+            selected_chapter_ids=[ch_id],
+            generation_mode=GenerationMode.REFERENCE,
+            total_marks=10,
+            reference_paper_id=ref_gen_paper_id,
+        )
+
+        res = pg_svc.generate_paper(current_user_id=user_id, request_data=req)
+
+        assert res.generation_mode == GenerationMode.REFERENCE
+        assert res.total_marks == 10
+        pg_svc.ref_paper_repo.get_reference_paper.assert_called_with(ref_gen_paper_id)
+        assert pg_svc.paper_repo.get_paper.call_args_list == [
+            call(ref_gen_paper_id),
+            call(created_paper.id),
+        ]
+
+
+
+
+
+
 
 
 
