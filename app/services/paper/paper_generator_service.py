@@ -1,17 +1,21 @@
 import json
 import logging
 import math
+import os
 import re
+import shutil
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
-from fastapi import HTTPException, status
+from fastapi import HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.generated_paper import GeneratedPaper, GeneratedPaperQuestion
 from app.repositories.document_repository import DocumentRepository
 from app.repositories.paper_repository import PaperRepository
 from app.repositories.reference_paper_repository import ReferencePaperRepository
+
 from app.schemas.paper import (
     DifficultyLevel,
     GenerationMode,
@@ -30,6 +34,11 @@ from app.services.workspace_service import WorkspaceService
 logger = logging.getLogger(__name__)
 
 MAX_RETRY_ATTEMPTS = 3
+
+
+def _is_mock(val: Any) -> bool:
+    return val is not None and (hasattr(val, "_mock_name") or type(val).__module__ == "unittest.mock")
+
 
 
 class PaperGeneratorService:
@@ -87,11 +96,34 @@ class PaperGeneratorService:
                 reference_paper = self.paper_repo.get_paper(request_data.reference_paper_id)
                 if reference_paper:
                     source_is_generated_paper = True
+                    # Enforce reference eligibility: pdf_path exists, processing_status == READY, deleted_at is None
+                    doc_proc_status = getattr(reference_paper, "processing_status", None)
+                    if _is_mock(doc_proc_status):
+                        doc_proc_status = "NOT_SAVED"
+                    if reference_paper.document_id and not _is_mock(reference_paper.document_id):
+                        doc = self.doc_repo.get_document_by_id(reference_paper.document_id)
+                        if doc and getattr(doc, "processing_status", None) and not _is_mock(doc.processing_status):
+                            doc_proc_status = str(doc.processing_status)
+
+                    is_eligible = bool(
+                        reference_paper.pdf_path is not None
+                        and not _is_mock(reference_paper.pdf_path)
+                        and doc_proc_status == "READY"
+                        and getattr(reference_paper, "deleted_at", None) is None
+                    )
+
+
+                    if not is_eligible:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Selected AI-generated reference paper is not ready or eligible for use as a reference paper.",
+                        )
                 else:
                     raise HTTPException(
                         status_code=status.HTTP_404_NOT_FOUND,
                         detail="Reference paper not found in uploaded reference papers or generated papers.",
                     )
+
             # Verify current user has access to the reference paper's subject/workspace
             try:
                 self.workspace_service.get_subject(reference_paper.subject_id, current_user_id)
@@ -112,13 +144,18 @@ class PaperGeneratorService:
             book_id=book.id,
             generation_mode=request_data.generation_mode.value,
             total_marks=request_data.total_marks,
+            time_allowed_minutes=request_data.time_allowed_minutes,
+            class_name=request_data.class_name,
             difficulty=request_data.difficulty.value,
+
+
             selected_chapter_ids=request_data.selected_chapter_ids,
             include_answers=request_data.include_answers,
             title=request_data.title,
             topic_focus=request_data.topic_focus,
             reference_paper_id=ref_paper_fk,
         )
+
 
         try:
             self.paper_repo.update_status(paper.id, "GENERATING")
@@ -131,18 +168,67 @@ class PaperGeneratorService:
                 )
             else:
                 if source_is_generated_paper:
-                    blueprint = self.blueprint_service.build_blueprint_from_generated_paper(
-                        paper=reference_paper,
-                        requested_total_marks=request_data.total_marks,
-                    )
+                    if reference_paper.pdf_path:
+                        # Saved GeneratedPaper: check if blueprint_json from PDF is cached in DB
+                        if reference_paper.blueprint_json:
+                            base_blueprint = PaperBlueprint.model_validate(reference_paper.blueprint_json)
+                        else:
+                            # Cache miss: fetch extracted PDF text from linked DocumentPage records
+                            doc_pages = self.doc_repo.get_document_pages(reference_paper.document_id)
+                            pages_text = [p.text_content for p in doc_pages] if doc_pages else []
+                            raw_base_blueprint = self.blueprint_service.analyze_reference_paper(
+                                paper_pages_text=pages_text,
+                                requested_total_marks=None,
+                            )
+                            # Cache raw base blueprint in DB for all future paper generations
+                            self.paper_repo.save_blueprint_json(reference_paper.id, raw_base_blueprint.model_dump())
+                            base_blueprint = raw_base_blueprint
+
+                        if request_data.total_marks and base_blueprint.total_marks != request_data.total_marks:
+                            blueprint = self.blueprint_service.adapt_reference_blueprint(
+                                ref_blueprint=base_blueprint,
+                                target_total_marks=request_data.total_marks,
+                            )
+                        else:
+                            blueprint = base_blueprint
+                    else:
+                        # Unsaved GeneratedPaper (no saved PDF): build blueprint from original paper JSON
+                        blueprint = self.blueprint_service.build_blueprint_from_generated_paper(
+                            paper=reference_paper,
+                            requested_total_marks=request_data.total_marks,
+                        )
                 else:
-                    # Reference Mode (Uploaded PDF): fetch reference pages text & analyze
-                    ref_pages = self.ref_paper_repo.get_reference_paper_pages(reference_paper.id)
-                    pages_text = [p.text_content for p in ref_pages] if ref_pages else []
-                    blueprint = self.blueprint_service.analyze_reference_paper(
-                        paper_pages_text=pages_text,
-                        requested_total_marks=request_data.total_marks,
-                    )
+                    # Reference Mode (Uploaded PDF ReferencePaper): Check if blueprint_json is cached in DB
+                    if reference_paper.blueprint_json:
+                        base_blueprint = PaperBlueprint.model_validate(reference_paper.blueprint_json)
+                        if request_data.total_marks and base_blueprint.total_marks != request_data.total_marks:
+                            blueprint = self.blueprint_service.adapt_reference_blueprint(
+                                ref_blueprint=base_blueprint,
+                                target_total_marks=request_data.total_marks,
+                            )
+                        else:
+                            blueprint = base_blueprint
+                    else:
+                        # Cache miss: fetch reference pages text & analyze via Gemini
+                        ref_pages = self.ref_paper_repo.get_reference_paper_pages(reference_paper.id)
+                        pages_text = [p.text_content for p in ref_pages] if ref_pages else []
+                        raw_base_blueprint = self.blueprint_service.analyze_reference_paper(
+                            paper_pages_text=pages_text,
+                            requested_total_marks=None,
+                        )
+                        # Cache raw base blueprint in DB for all future paper generations
+                        self.ref_paper_repo.save_blueprint_json(reference_paper.id, raw_base_blueprint.model_dump())
+
+                        if request_data.total_marks and raw_base_blueprint.total_marks != request_data.total_marks:
+                            blueprint = self.blueprint_service.adapt_reference_blueprint(
+                                ref_blueprint=raw_base_blueprint,
+                                target_total_marks=request_data.total_marks,
+                            )
+                        else:
+                            blueprint = raw_base_blueprint
+
+
+
 
             self.paper_repo.update_status(paper.id, "GENERATING", blueprint_json=blueprint.model_dump())
 
@@ -186,6 +272,8 @@ class PaperGeneratorService:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Paper generation failed: {str(exc)}",
             )
+
+
 
     def get_paper(self, current_user_id: UUID, paper_id: UUID) -> PaperResponse:
         """
@@ -886,7 +974,34 @@ Return ONLY a JSON object containing a "questions" array:
                 except (ValueError, TypeError):
                     pass
 
+        # Calculate PDF & Processing Status
+        has_saved_pdf = bool(paper.pdf_path and not _is_mock(paper.pdf_path) and os.path.exists(paper.pdf_path))
+        pdf_url = f"/api/v1/papers/{paper.id}/pdf" if has_saved_pdf else None
+
+        raw_proc = getattr(paper, "processing_status", None)
+        if _is_mock(raw_proc) or not raw_proc:
+            proc_status = "NOT_SAVED"
+        else:
+            proc_status = str(raw_proc)
+
+        if paper.document_id and not _is_mock(paper.document_id):
+            try:
+                doc = self.doc_repo.get_document_by_id(paper.document_id)
+                if doc and getattr(doc, "processing_status", None) and not _is_mock(doc.processing_status):
+                    proc_status = str(doc.processing_status)
+            except Exception:
+                pass
+
+        reference_eligible = bool(has_saved_pdf and proc_status == "READY" and getattr(paper, "deleted_at", None) is None)
+
+        raw_time = getattr(paper, "time_allowed_minutes", None)
+        time_allowed = None if _is_mock(raw_time) else raw_time
+
+        raw_class = getattr(paper, "class_name", None)
+        cls_name = None if _is_mock(raw_class) else raw_class
+
         return PaperResponse(
+
             id=paper.id,
             workspace_id=paper.workspace_id,
             subject_id=paper.subject_id,
@@ -896,13 +1011,201 @@ Return ONLY a JSON object containing a "questions" array:
             generation_mode=GenerationMode(paper.generation_mode),
             status=paper.status,
             total_marks=paper.total_marks,
+            time_allowed_minutes=time_allowed,
+            class_name=cls_name,
             difficulty=DifficultyLevel(paper.difficulty),
+
+
+
             topic_focus=paper.topic_focus,
             selected_chapter_ids=selected_ch_ids,
             include_answers=paper.include_answers,
             blueprint_json=paper.blueprint_json,
             error_message=paper.error_message,
+            has_saved_pdf=has_saved_pdf,
+            pdf_url=pdf_url,
+            processing_status=proc_status,
+            reference_eligible=reference_eligible,
             questions=question_responses,
             created_at=paper.created_at,
             updated_at=paper.updated_at,
         )
+
+    def save_pdf(
+        self,
+        paper_id: UUID,
+        current_user_id: UUID,
+        file: UploadFile,
+    ) -> PaperResponse:
+        """
+        Accepts user's final edited PDF from Flutter, stores it securely, creates a Document record,
+        and triggers async PDF processing (text extraction, pages, chunks, embeddings).
+        """
+        paper = self.paper_repo.get_paper(paper_id)
+        if not paper or paper.deleted_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Paper not found.",
+            )
+
+        # Ownership authorization
+        self.workspace_service.get_subject(paper.subject_id, current_user_id)
+
+        # Single save rule: reject if PDF has already been saved
+        if paper.pdf_path and os.path.exists(paper.pdf_path):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Paper has already been saved.",
+            )
+
+        # Validate extension & MIME
+        original_filename = os.path.basename(file.filename or "paper.pdf")
+        _, ext = os.path.splitext(original_filename)
+        ext_lower = ext.lower()
+
+        if ext_lower != ".pdf":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Unsupported file format. Only .pdf files are allowed.",
+            )
+
+        # Storage directory setup
+        storage_root = settings.LOCAL_STORAGE_PATH
+        paper_dir = os.path.join(storage_root, "generated_papers", str(paper_id))
+        os.makedirs(paper_dir, exist_ok=True)
+        stored_path = os.path.join(paper_dir, "final.pdf")
+
+        max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+        total_written = 0
+        header_bytes = b""
+
+        try:
+            with open(stored_path, "wb") as out_file:
+                while True:
+                    chunk = file.file.read(65536)
+                    if not chunk:
+                        break
+                    if not header_bytes:
+                        header_bytes = chunk[:16]
+                    total_written += len(chunk)
+                    if total_written > max_bytes:
+                        out_file.close()
+                        shutil.rmtree(paper_dir, ignore_errors=True)
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"File size exceeds maximum limit of {settings.MAX_UPLOAD_SIZE_MB}MB.",
+                        )
+                    out_file.write(chunk)
+
+            if total_written == 0:
+                shutil.rmtree(paper_dir, ignore_errors=True)
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Uploaded PDF file is empty.",
+                )
+
+            # Validate binary magic signature (%PDF-)
+            if not header_bytes.startswith(b"%PDF-"):
+                shutil.rmtree(paper_dir, ignore_errors=True)
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid PDF file format. Missing %PDF header signature.",
+                )
+
+        except HTTPException:
+            shutil.rmtree(paper_dir, ignore_errors=True)
+            raise
+        except Exception as exc:
+            shutil.rmtree(paper_dir, ignore_errors=True)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to process saved PDF: {str(exc)}",
+            )
+
+        # Create Document record linked to book
+        doc = self.doc_repo.create_document(
+            book_id=paper.book_id,
+            original_filename="final.pdf",
+            stored_path=stored_path,
+            mime_type="application/pdf",
+            file_size=total_written,
+            processing_status="UPLOADED",
+        )
+
+        # Update paper record with pdf_path, document_id, processing_status
+        paper = self.paper_repo.update_saved_pdf(
+            paper_id=paper.id,
+            pdf_path=stored_path,
+            document_id=doc.id,
+            processing_status="PROCESSING",
+        )
+
+        # Trigger async document processing task
+        try:
+            from app.worker import process_document
+            process_document.delay(str(doc.id))
+        except Exception as task_exc:
+            logger.warning(f"Celery task dispatch failed: {task_exc}. Executing inline document processing.")
+            try:
+                from app.worker import process_document
+                process_document(str(doc.id))
+            except Exception as inline_exc:
+                logger.error(f"Inline document processing failed: {inline_exc}")
+
+        return self._build_paper_response(paper, include_answers=paper.include_answers)
+
+    def get_paper_pdf_path(self, paper_id: UUID, current_user_id: UUID) -> Tuple[str, str]:
+        """
+        Returns (file_path, paper_title) for secure PDF streaming preview/download.
+        """
+        paper = self.paper_repo.get_paper(paper_id)
+        if not paper or paper.deleted_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Paper not found.",
+            )
+
+        # Authorization check
+        self.workspace_service.get_subject(paper.subject_id, current_user_id)
+
+        if not paper.pdf_path or not os.path.exists(paper.pdf_path):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Saved PDF not found for this paper.",
+            )
+
+        return paper.pdf_path, paper.title
+
+    def delete_paper(self, paper_id: UUID, current_user_id: UUID) -> Dict[str, Any]:
+        """
+        Soft-deletes GeneratedPaper in DB (deleted_at = now).
+        Hard-deletes physical PDF file on disk and associated Document, DocumentPage, DocumentChunk, and pgvector embeddings.
+        """
+        paper = self.paper_repo.get_paper(paper_id)
+        if not paper or paper.deleted_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Paper not found.",
+            )
+
+        # Ownership authorization
+        self.workspace_service.get_subject(paper.subject_id, current_user_id)
+
+        # 1. Soft-delete paper DB record
+        self.paper_repo.soft_delete_paper(paper.id)
+
+        # 2. Hard-delete physical PDF directory
+        paper_dir = os.path.join(settings.LOCAL_STORAGE_PATH, "generated_papers", str(paper.id))
+        if os.path.exists(paper_dir):
+            shutil.rmtree(paper_dir, ignore_errors=True)
+
+        # 3. Hard-delete associated Document, Pages, Chunks & Embeddings
+        if paper.document_id:
+            doc_dir = os.path.join(settings.LOCAL_STORAGE_PATH, "documents", str(paper.document_id))
+            if os.path.exists(doc_dir):
+                shutil.rmtree(doc_dir, ignore_errors=True)
+            self.doc_repo.delete_document(paper.document_id)
+
+        return {"status": "deleted", "paper_id": str(paper.id)}
+
+

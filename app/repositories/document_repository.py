@@ -43,14 +43,22 @@ class DocumentRepository:
 
     def delete_document(self, document_id: UUID) -> bool:
         doc = self.db.get(Document, document_id)
-        if doc:
-            self.db.delete(doc)
+        if doc and doc.deleted_at is None:
+            now = datetime.now(timezone.utc)
+            doc.deleted_at = now
+            self.db.execute(
+                update(DocumentPage).where(DocumentPage.document_id == document_id, DocumentPage.deleted_at.is_(None)).values(deleted_at=now)
+            )
+            self.db.execute(
+                update(DocumentChunk).where(DocumentChunk.document_id == document_id, DocumentChunk.deleted_at.is_(None)).values(deleted_at=now)
+            )
             self.db.commit()
             return True
         return False
 
     def get_document_by_id(self, document_id: UUID) -> Optional[Document]:
-        return self.db.get(Document, document_id)
+        stmt = select(Document).where(Document.id == document_id, Document.deleted_at.is_(None))
+        return self.db.execute(stmt).scalar_one_or_none()
 
     def claim_document_for_processing(self, document_id: UUID) -> Optional[Document]:
         """
@@ -67,6 +75,7 @@ class DocumentRepository:
             update(Document)
             .where(
                 Document.id == document_id,
+                Document.deleted_at.is_(None),
                 or_(
                     Document.processing_status.in_(["UPLOADED", "FAILED"]),
                     and_(
@@ -86,11 +95,11 @@ class DocumentRepository:
         self.db.commit()
 
         if result.rowcount > 0:
-            return self.db.get(Document, document_id)
+            return self.get_document_by_id(document_id)
         return None
 
     def mark_processing_completed(self, document_id: UUID) -> Optional[Document]:
-        doc = self.db.get(Document, document_id)
+        doc = self.get_document_by_id(document_id)
         if doc and doc.processing_status == "PROCESSING":
             doc.processing_status = "PROCESSED"
             doc.processing_completed_at = datetime.now(timezone.utc)
@@ -99,7 +108,7 @@ class DocumentRepository:
         return doc
 
     def mark_embedding_started(self, document_id: UUID) -> Optional[Document]:
-        doc = self.db.get(Document, document_id)
+        doc = self.get_document_by_id(document_id)
         if doc:
             doc.processing_status = "EMBEDDING"
             self.db.commit()
@@ -107,7 +116,7 @@ class DocumentRepository:
         return doc
 
     def mark_ready(self, document_id: UUID) -> Optional[Document]:
-        doc = self.db.get(Document, document_id)
+        doc = self.get_document_by_id(document_id)
         if doc:
             doc.processing_status = "READY"
             doc.processing_completed_at = datetime.now(timezone.utc)
@@ -116,7 +125,7 @@ class DocumentRepository:
         return doc
 
     def mark_processing_failed(self, document_id: UUID, error_message: str) -> Optional[Document]:
-        doc = self.db.get(Document, document_id)
+        doc = self.get_document_by_id(document_id)
         if doc:
             doc.processing_status = "FAILED"
             doc.processing_error = str(error_message)[:1024]
@@ -151,7 +160,11 @@ class DocumentRepository:
         return created_pages
 
     def get_document_pages(self, document_id: UUID) -> List[DocumentPage]:
-        stmt = select(DocumentPage).where(DocumentPage.document_id == document_id).order_by(DocumentPage.page_number.asc())
+        stmt = (
+            select(DocumentPage)
+            .where(DocumentPage.document_id == document_id, DocumentPage.deleted_at.is_(None))
+            .order_by(DocumentPage.page_number.asc())
+        )
         return list(self.db.execute(stmt).scalars().all())
 
     def save_document_chunks(
@@ -187,7 +200,11 @@ class DocumentRepository:
         return created_chunks
 
     def get_document_chunks(self, document_id: UUID) -> List[DocumentChunk]:
-        stmt = select(DocumentChunk).where(DocumentChunk.document_id == document_id).order_by(DocumentChunk.chunk_index.asc())
+        stmt = (
+            select(DocumentChunk)
+            .where(DocumentChunk.document_id == document_id, DocumentChunk.deleted_at.is_(None))
+            .order_by(DocumentChunk.chunk_index.asc())
+        )
         return list(self.db.execute(stmt).scalars().all())
 
     def update_chunk_embedding(self, chunk_id: UUID, embedding: List[float]):
@@ -207,14 +224,26 @@ class DocumentRepository:
         document_id: Optional[UUID] = None,
     ) -> List[Tuple[DocumentChunk, float]]:
         """
-        Perform pgvector cosine similarity search filtered strictly by workspace_id
-        and optional subject/book/chapter/chapter_ids/document parameters.
-        Returns list of (DocumentChunk, cosine_distance) tuples.
+        Perform pgvector cosine similarity search filtered strictly by workspace_id,
+        ensuring chunk.deleted_at IS NULL and all parent entities (document, book, subject, chapter) are active.
         """
+        from app.models.book import Book
+        from app.models.subject import Subject
+
         distance_col = DocumentChunk.embedding.cosine_distance(query_vector).label("distance")
-        stmt = select(DocumentChunk, distance_col).where(
-            DocumentChunk.workspace_id == workspace_id,
-            DocumentChunk.embedding.is_not(None)
+        stmt = (
+            select(DocumentChunk, distance_col)
+            .join(Document, DocumentChunk.document_id == Document.id)
+            .join(Book, DocumentChunk.book_id == Book.id)
+            .join(Subject, DocumentChunk.subject_id == Subject.id)
+            .where(
+                DocumentChunk.workspace_id == workspace_id,
+                DocumentChunk.embedding.is_not(None),
+                DocumentChunk.deleted_at.is_(None),
+                Document.deleted_at.is_(None),
+                Book.deleted_at.is_(None),
+                Subject.deleted_at.is_(None),
+            )
         )
 
         if subject_id:
@@ -222,10 +251,13 @@ class DocumentRepository:
         if book_id:
             stmt = stmt.where(DocumentChunk.book_id == book_id)
         if chapter_id:
-            stmt = stmt.where(DocumentChunk.chapter_id == chapter_id)
+            stmt = stmt.join(Chapter, DocumentChunk.chapter_id == Chapter.id).where(
+                DocumentChunk.chapter_id == chapter_id,
+                Chapter.deleted_at.is_(None),
+            )
         if chapter_ids and len(chapter_ids) > 0:
-            chapters = self.db.query(Chapter).filter(Chapter.id.in_(chapter_ids)).all()
-            conditions = [DocumentChunk.chapter_id.in_(chapter_ids)]
+            chapters = self.db.query(Chapter).filter(Chapter.id.in_(chapter_ids), Chapter.deleted_at.is_(None)).all()
+            conditions = [and_(DocumentChunk.chapter_id.in_(chapter_ids), Chapter.deleted_at.is_(None))]
             for ch in chapters:
                 if ch.start_page is not None and ch.end_page is not None:
                     conditions.append(
@@ -233,7 +265,7 @@ class DocumentRepository:
                         (DocumentChunk.page_number >= ch.start_page) &
                         (DocumentChunk.page_number <= ch.end_page)
                     )
-            stmt = stmt.where(or_(*conditions))
+            stmt = stmt.outerjoin(Chapter, DocumentChunk.chapter_id == Chapter.id).where(or_(*conditions))
 
         if document_id:
             stmt = stmt.where(DocumentChunk.document_id == document_id)
@@ -241,3 +273,4 @@ class DocumentRepository:
         stmt = stmt.order_by(distance_col.asc()).limit(top_k)
         results = self.db.execute(stmt).all()
         return [(row[0], float(row[1])) for row in results]
+

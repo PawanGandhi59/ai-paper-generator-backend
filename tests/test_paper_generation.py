@@ -2330,6 +2330,11 @@ def test_polymorphic_reference_paper_lookup_generated_paper():
     existing_paper.workspace_id = workspace_id
     existing_paper.total_marks = 10
     existing_paper.generation_mode = "CUSTOM"
+    existing_paper.pdf_path = "/storage/generated_papers/mock/final.pdf"
+    existing_paper.document_id = None
+    existing_paper.processing_status = "READY"
+    existing_paper.deleted_at = None
+
 
     existing_paper.blueprint_json = {
         "total_marks": 10,
@@ -2398,6 +2403,292 @@ def test_polymorphic_reference_paper_lookup_generated_paper():
             call(ref_gen_paper_id),
             call(created_paper.id),
         ]
+
+
+def test_uploaded_reference_paper_blueprint_caching():
+    """
+    TEST: Verify that PaperGeneratorService caches blueprint_json on first use of an uploaded PDF reference paper,
+    and reuses the cached blueprint_json without calling analyze_reference_paper on subsequent uses.
+    """
+    from uuid import uuid4
+    from unittest.mock import MagicMock, call, patch
+    from app.schemas.paper import PaperGenerateRequest, GenerationMode
+    from app.services.paper.paper_generator_service import PaperGeneratorService
+    from app.services.paper.blueprint_service import PaperBlueprint, SectionBlueprint
+    from app.schemas.paper import QuestionType
+
+    book_id = uuid4()
+    ch_id = uuid4()
+    subject_id = uuid4()
+    workspace_id = uuid4()
+    user_id = uuid4()
+    ref_pdf_id = uuid4()
+
+    mock_db = MagicMock()
+    pg_svc = PaperGeneratorService(db=mock_db)
+
+    # Mock book & subject
+    mock_book = MagicMock()
+    mock_book.id = book_id
+    mock_book.subject_id = subject_id
+
+    mock_subject = MagicMock()
+    mock_subject.id = subject_id
+    mock_subject.workspace_id = workspace_id
+
+    mock_ch = MagicMock()
+    mock_ch.id = ch_id
+
+    pg_svc.workspace_service.get_book = MagicMock(return_value=mock_book)
+    pg_svc.workspace_service.get_subject = MagicMock(return_value=mock_subject)
+    pg_svc.workspace_service.list_chapters = MagicMock(return_value=[mock_ch])
+
+    # Uploaded PDF Reference Paper without cached blueprint_json (Cache Miss)
+    ref_paper_uncached = MagicMock()
+    ref_paper_uncached.id = ref_pdf_id
+    ref_paper_uncached.subject_id = subject_id
+    ref_paper_uncached.workspace_id = workspace_id
+    ref_paper_uncached.blueprint_json = None
+
+    created_paper = MagicMock()
+    created_paper.id = uuid4()
+    created_paper.user_id = user_id
+    created_paper.workspace_id = workspace_id
+    created_paper.subject_id = subject_id
+    created_paper.book_id = book_id
+    created_paper.reference_paper_id = ref_pdf_id
+    created_paper.title = "Uploaded PDF Test Paper"
+    created_paper.generation_mode = "REFERENCE"
+    created_paper.status = "COMPLETED"
+    created_paper.total_marks = 10
+    created_paper.difficulty = "MIXED"
+    created_paper.topic_focus = None
+    created_paper.selected_chapter_ids = [str(ch_id)]
+    created_paper.include_answers = True
+    created_paper.blueprint_json = {
+        "total_marks": 10,
+        "sections": [],
+        "sample_questions": []
+    }
+    created_paper.error_message = None
+    created_paper.questions = []
+    created_paper.created_at = MagicMock()
+    created_paper.updated_at = MagicMock()
+
+
+    pg_svc.ref_paper_repo.get_reference_paper = MagicMock(return_value=ref_paper_uncached)
+    pg_svc.paper_repo.get_paper = MagicMock(return_value=created_paper)
+    pg_svc.paper_repo.create_paper = MagicMock(return_value=created_paper)
+    pg_svc.paper_repo.update_status = MagicMock()
+    pg_svc.ref_paper_repo.save_blueprint_json = MagicMock()
+    pg_svc.ref_paper_repo.get_reference_paper_pages = MagicMock(return_value=[])
+
+    mock_blueprint = PaperBlueprint(
+        total_marks=10,
+        sections=[
+            SectionBlueprint(
+                name="Section A",
+                question_type=QuestionType.MCQ,
+                question_count=5,
+                marks_per_question=2,
+                total_section_marks=10,
+            )
+        ],
+        sample_questions=[],
+    )
+
+    with patch.object(pg_svc.blueprint_service, "analyze_reference_paper", return_value=mock_blueprint) as mock_analyze, \
+         patch.object(pg_svc, "_retrieve_chapter_context", return_value="Context text"), \
+         patch.object(pg_svc, "_generate_section_questions", return_value=[]), \
+         patch.object(pg_svc.paper_repo, "save_questions"):
+
+        req = PaperGenerateRequest(
+            book_id=book_id,
+            selected_chapter_ids=[ch_id],
+            generation_mode=GenerationMode.REFERENCE,
+            total_marks=10,
+            reference_paper_id=ref_pdf_id,
+        )
+
+        # 1. Run Cache Miss (should analyze & save_blueprint_json)
+        res1 = pg_svc.generate_paper(current_user_id=user_id, request_data=req)
+        assert mock_analyze.call_count == 1
+        pg_svc.ref_paper_repo.save_blueprint_json.assert_called_once_with(ref_pdf_id, mock_blueprint.model_dump())
+
+        # 2. Run Cache Hit (reference_paper now has blueprint_json set)
+        ref_paper_cached = MagicMock()
+        ref_paper_cached.id = ref_pdf_id
+        ref_paper_cached.subject_id = subject_id
+        ref_paper_cached.workspace_id = workspace_id
+        ref_paper_cached.blueprint_json = mock_blueprint.model_dump()
+
+        pg_svc.ref_paper_repo.get_reference_paper = MagicMock(return_value=ref_paper_cached)
+        res2 = pg_svc.generate_paper(current_user_id=user_id, request_data=req)
+        # analyze_reference_paper should NOT be called again
+        assert mock_analyze.call_count == 1
+
+
+def test_paper_time_allowed_minutes_persistence_and_response():
+    """
+    Verify user-provided time_allowed_minutes (e.g. 180 mins / 3 hours) is saved to DB
+    and returned in generate, get, and list paper responses.
+    """
+    uid = uuid4().hex[:8]
+    user = client.post(
+        "/api/v1/auth/register",
+        json={"name": "Time User", "email": f"time_{uid}@example.com", "password": "password123"},
+    ).json()
+    headers = {"Authorization": f"Bearer {user['access_token']}"}
+
+    ws = client.post("/api/v1/workspaces", json={"name": "Time WS"}, headers=headers).json()
+    subj = client.post(f"/api/v1/workspaces/{ws['id']}/subjects", json={"name": "Time Subj"}, headers=headers).json()
+    book = client.post(f"/api/v1/subjects/{subj['id']}/books", json={"name": "Time Book"}, headers=headers).json()
+    ch1 = client.post(f"/api/v1/books/{book['id']}/chapters", json={"name": "Ch 1", "chapter_number": 1}, headers=headers).json()
+
+
+    gen_payload = {
+        "book_id": book["id"],
+        "selected_chapter_ids": [ch1["id"]],
+        "generation_mode": "CUSTOM",
+        "total_marks": 20,
+        "time_allowed_minutes": 180,
+        "question_configs": [
+            {
+                "question_type": "MCQ",
+                "question_count": 10,
+                "marks_per_question": 2,
+            }
+        ],
+    }
+
+    with patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=[]):
+        res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers)
+
+    assert res.status_code == 201, res.text
+    paper = res.json()
+    assert paper["time_allowed_minutes"] == 180
+
+    # Get paper by ID
+    get_res = client.get(f"/api/v1/papers/{paper['id']}", headers=headers)
+    assert get_res.status_code == 200
+    assert get_res.json()["time_allowed_minutes"] == 180
+
+    # List papers by subject
+    list_res = client.get(f"/api/v1/subjects/{subj['id']}/papers", headers=headers)
+    assert list_res.status_code == 200
+    papers = list_res.json()
+    assert len(papers) == 1
+    assert papers[0]["time_allowed_minutes"] == 180
+
+
+def test_paper_class_name_persistence_and_response():
+    """
+    Verify user-provided class_name (e.g. Class 10 / Grade 12) is saved to DB
+    and returned in generate, get, and list paper responses.
+    """
+    uid = uuid4().hex[:8]
+    user = client.post(
+        "/api/v1/auth/register",
+        json={"name": "Class User", "email": f"class_{uid}@example.com", "password": "password123"},
+    ).json()
+    headers = {"Authorization": f"Bearer {user['access_token']}"}
+
+    ws = client.post("/api/v1/workspaces", json={"name": "Class WS"}, headers=headers).json()
+    subj = client.post(f"/api/v1/workspaces/{ws['id']}/subjects", json={"name": "Class Subj"}, headers=headers).json()
+    book = client.post(f"/api/v1/subjects/{subj['id']}/books", json={"name": "Class Book"}, headers=headers).json()
+    ch1 = client.post(f"/api/v1/books/{book['id']}/chapters", json={"name": "Ch 1", "chapter_number": 1}, headers=headers).json()
+
+    gen_payload = {
+        "book_id": book["id"],
+        "selected_chapter_ids": [ch1["id"]],
+        "generation_mode": "CUSTOM",
+        "total_marks": 50,
+        "time_allowed_minutes": 120,
+        "class_name": "Class 10",
+        "question_configs": [
+            {
+                "question_type": "MCQ",
+                "question_count": 10,
+                "marks_per_question": 5,
+            }
+        ],
+    }
+
+    with patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=[]):
+        res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers)
+
+    assert res.status_code == 201, res.text
+    paper = res.json()
+    assert paper["class_name"] == "Class 10"
+    assert paper["time_allowed_minutes"] == 120
+
+    # Get paper by ID
+    get_res = client.get(f"/api/v1/papers/{paper['id']}", headers=headers)
+    assert get_res.status_code == 200
+    assert get_res.json()["class_name"] == "Class 10"
+
+    # List papers by subject
+    list_res = client.get(f"/api/v1/subjects/{subj['id']}/papers", headers=headers)
+    assert list_res.status_code == 200
+    papers = list_res.json()
+    assert len(papers) == 1
+    assert papers[0]["class_name"] == "Class 10"
+
+
+def test_paper_time_and_class_name_validation_rejections():
+    """
+    Verify negative/zero time_allowed_minutes and invalid/blank/special-char-only class_name
+    are rejected with HTTP 422 Unprocessable Entity.
+    """
+    uid = uuid4().hex[:8]
+    user = client.post(
+        "/api/v1/auth/register",
+        json={"name": "Val User", "email": f"val_{uid}@example.com", "password": "password123"},
+    ).json()
+    headers = {"Authorization": f"Bearer {user['access_token']}"}
+
+    ws = client.post("/api/v1/workspaces", json={"name": "Val WS"}, headers=headers).json()
+    subj = client.post(f"/api/v1/workspaces/{ws['id']}/subjects", json={"name": "Val Subj"}, headers=headers).json()
+    book = client.post(f"/api/v1/subjects/{subj['id']}/books", json={"name": "Val Book"}, headers=headers).json()
+    ch1 = client.post(f"/api/v1/books/{book['id']}/chapters", json={"name": "Ch 1", "chapter_number": 1}, headers=headers).json()
+
+    base_payload = {
+        "book_id": book["id"],
+        "selected_chapter_ids": [ch1["id"]],
+        "generation_mode": "CUSTOM",
+        "total_marks": 20,
+        "question_configs": [{"question_type": "MCQ", "question_count": 10, "marks_per_question": 2}],
+    }
+
+    # 1. Negative time rejection
+    p1 = {**base_payload, "time_allowed_minutes": -15}
+    r1 = client.post("/api/v1/papers/generate", json=p1, headers=headers)
+    assert r1.status_code == 422
+
+    # 2. Zero time rejection
+    p2 = {**base_payload, "time_allowed_minutes": 0}
+    r2 = client.post("/api/v1/papers/generate", json=p2, headers=headers)
+    assert r2.status_code == 422
+
+    # 3. Blank class name rejection
+    p3 = {**base_payload, "class_name": "   "}
+    r3 = client.post("/api/v1/papers/generate", json=p3, headers=headers)
+    assert r3.status_code == 422
+
+    # 4. Symbol-only class name rejection
+    p4 = {**base_payload, "class_name": "!!!"}
+    r4 = client.post("/api/v1/papers/generate", json=p4, headers=headers)
+    assert r4.status_code == 422
+
+    # 5. Invalid special char rejection
+    p5 = {**base_payload, "class_name": "<script>alert(1)</script>"}
+    r5 = client.post("/api/v1/papers/generate", json=p5, headers=headers)
+    assert r5.status_code == 422
+
+
+
+
+
 
 
 

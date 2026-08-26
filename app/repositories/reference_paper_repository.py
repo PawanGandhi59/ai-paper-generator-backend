@@ -69,15 +69,19 @@ class ReferencePaperRepository:
         return created_pages
 
     def get_reference_paper(self, paper_id: UUID) -> Optional[ReferencePaper]:
-        return self.db.get(ReferencePaper, paper_id)
+        stmt = select(ReferencePaper).where(ReferencePaper.id == paper_id, ReferencePaper.deleted_at.is_(None))
+        return self.db.execute(stmt).scalar_one_or_none()
 
     def get_reference_paper_by_id(self, paper_id: UUID) -> Optional[ReferencePaper]:
-        return self.db.get(ReferencePaper, paper_id)
+        return self.get_reference_paper(paper_id)
 
     def get_reference_paper_pages(self, paper_id: UUID) -> List[ReferencePaperPage]:
         stmt = (
             select(ReferencePaperPage)
-            .where(ReferencePaperPage.reference_paper_id == paper_id)
+            .where(
+                ReferencePaperPage.reference_paper_id == paper_id,
+                ReferencePaperPage.deleted_at.is_(None),
+            )
             .order_by(ReferencePaperPage.page_number.asc())
         )
         return list(self.db.execute(stmt).scalars().all())
@@ -90,15 +94,38 @@ class ReferencePaperRepository:
             .where(
                 ReferencePaper.workspace_id == workspace_id,
                 ReferencePaper.subject_id == subject_id,
+                ReferencePaper.deleted_at.is_(None),
             )
             .order_by(ReferencePaper.created_at.desc())
         )
         return list(self.db.execute(stmt).scalars().all())
 
-    def delete_reference_paper(self, paper_id: UUID) -> bool:
-        paper = self.db.get(ReferencePaper, paper_id)
+    def save_blueprint_json(
+        self, paper_id: UUID, blueprint_json: Dict[str, Any]
+    ) -> Optional[ReferencePaper]:
+        paper = self.get_reference_paper(paper_id)
         if paper:
-            self.db.delete(paper)
+            paper.blueprint_json = blueprint_json
+            self.db.commit()
+            self.db.refresh(paper)
+            return paper
+        return None
+
+    def delete_reference_paper(self, paper_id: UUID) -> bool:
+        from datetime import datetime, timezone
+        from sqlalchemy import update
+
+        paper = self.get_reference_paper(paper_id)
+        if paper and paper.deleted_at is None:
+            now = datetime.now(timezone.utc)
+            paper.deleted_at = now
+            self.db.execute(
+                update(ReferencePaperPage)
+                .where(ReferencePaperPage.reference_paper_id == paper_id, ReferencePaperPage.deleted_at.is_(None))
+                .values(deleted_at=now)
+            )
             self.db.commit()
             return True
         return False
+
+

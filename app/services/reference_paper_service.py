@@ -154,7 +154,8 @@ class ReferencePaperService:
 
     def delete_reference_paper(self, current_user_id: UUID, paper_id: UUID) -> None:
         paper = self.get_reference_paper(current_user_id, paper_id)
-        paper_dir = os.path.dirname(paper.stored_path)
+        stored_path = os.path.abspath(paper.stored_path) if paper.stored_path else None
+        paper_dir = os.path.dirname(stored_path) if stored_path else None
 
         # 1. Delete DB record
         self.repo.delete_reference_paper(paper.id)
@@ -162,3 +163,10 @@ class ReferencePaperService:
         # 2. Delete storage files
         if paper_dir and os.path.exists(paper_dir):
             shutil.rmtree(paper_dir, ignore_errors=True)
+
+
+
+
+
+
+

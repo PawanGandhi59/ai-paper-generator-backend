@@ -29,7 +29,7 @@ def get_current_user(
     )
     try:
         payload = decode_access_token(token)
-        user_id_str: str = payload.get("sub")
+        user_id_str: str | None = payload.get("sub")
         if not user_id_str:
             raise credentials_exception
         user_id = UUID(user_id_str)
@@ -71,7 +71,7 @@ def get_current_user_from_header_or_query(
 
     try:
         payload = decode_access_token(effective_token)
-        user_id_str: str = payload.get("sub")
+        user_id_str: str | None = payload.get("sub")
         if not user_id_str:
             raise credentials_exception
         user_id = UUID(user_id_str)

@@ -23,6 +23,8 @@ class PaperRepository:
         total_marks: int,
         difficulty: str,
         selected_chapter_ids: List[UUID],
+        time_allowed_minutes: Optional[int] = None,
+        class_name: Optional[str] = None,
         include_answers: bool = True,
         title: Optional[str] = None,
         topic_focus: Optional[str] = None,
@@ -41,12 +43,16 @@ class PaperRepository:
             generation_mode=generation_mode,
             status="PENDING",
             total_marks=total_marks,
+            time_allowed_minutes=time_allowed_minutes,
+            class_name=class_name,
             difficulty=difficulty,
             topic_focus=topic_focus,
             selected_chapter_ids=[str(cid) for cid in selected_chapter_ids],
             include_answers=include_answers,
             blueprint_json=blueprint_json,
         )
+
+
         self.db.add(paper)
         self.db.commit()
         self.db.refresh(paper)
@@ -55,7 +61,10 @@ class PaperRepository:
     def get_paper(self, paper_id: UUID) -> Optional[GeneratedPaper]:
         stmt = (
             select(GeneratedPaper)
-            .where(GeneratedPaper.id == paper_id)
+            .where(
+                GeneratedPaper.id == paper_id,
+                GeneratedPaper.deleted_at.is_(None),
+            )
             .options(joinedload(GeneratedPaper.questions))
         )
         return self.db.execute(stmt).scalars().first()
@@ -66,6 +75,7 @@ class PaperRepository:
             .where(
                 GeneratedPaper.subject_id == subject_id,
                 GeneratedPaper.user_id == user_id,
+                GeneratedPaper.deleted_at.is_(None),
             )
             .order_by(GeneratedPaper.created_at.desc())
         )
@@ -79,7 +89,7 @@ class PaperRepository:
         blueprint_json: Optional[Dict[str, Any]] = None,
     ) -> Optional[GeneratedPaper]:
         paper = self.db.get(GeneratedPaper, paper_id)
-        if paper:
+        if paper and paper.deleted_at is None:
             paper.status = status
             if error_message is not None:
                 paper.error_message = error_message
@@ -88,6 +98,45 @@ class PaperRepository:
             self.db.commit()
             self.db.refresh(paper)
         return paper
+
+    def update_saved_pdf(
+        self,
+        paper_id: UUID,
+        pdf_path: str,
+        document_id: Optional[UUID],
+        processing_status: str,
+    ) -> Optional[GeneratedPaper]:
+        paper = self.db.get(GeneratedPaper, paper_id)
+        if paper and paper.deleted_at is None:
+            paper.pdf_path = pdf_path
+            paper.document_id = document_id
+            paper.processing_status = processing_status
+            paper.blueprint_json = None
+            self.db.commit()
+            self.db.refresh(paper)
+        return paper
+
+    def save_blueprint_json(
+        self,
+        paper_id: UUID,
+        blueprint_json: Dict[str, Any],
+    ) -> Optional[GeneratedPaper]:
+        paper = self.db.get(GeneratedPaper, paper_id)
+        if paper and paper.deleted_at is None:
+            paper.blueprint_json = blueprint_json
+            self.db.commit()
+            self.db.refresh(paper)
+        return paper
+
+
+    def soft_delete_paper(self, paper_id: UUID) -> Optional[GeneratedPaper]:
+        paper = self.db.get(GeneratedPaper, paper_id)
+        if paper and paper.deleted_at is None:
+            paper.deleted_at = datetime.now(timezone.utc)
+            self.db.commit()
+            self.db.refresh(paper)
+        return paper
+
 
     def save_questions(
         self,

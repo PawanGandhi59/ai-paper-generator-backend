@@ -34,9 +34,12 @@ class PDFProcessor:
             raise FileNotFoundError(f"PDF file not found at path: {file_path}")
 
         try:
-            pdf_doc = fitz.open(file_path)
+            with open(file_path, "rb") as f:
+                pdf_bytes = f.read()
+            pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         except Exception as open_exc:
             raise ValueError(f"Corrupt or invalid PDF file: {open_exc}")
+
 
         try:
             for page_index in range(len(pdf_doc)):
@@ -131,6 +134,14 @@ class PDFProcessor:
                     },
                 })
         finally:
-            pdf_doc.close()
+            if 'pdf_doc' in locals() and pdf_doc:
+                try:
+                    pdf_doc.close()
+                except Exception:
+                    pass
+                del pdf_doc
+            import gc
+            gc.collect()
 
         return pages_data
+

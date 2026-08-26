@@ -11,7 +11,12 @@ from app.core.database import SessionLocal
 from app.main import app
 from app.models.reference_paper import ReferencePaper, ReferencePaperPage
 
+from unittest.mock import patch
+
+from app.repositories.reference_paper_repository import ReferencePaperRepository
+
 client = TestClient(app)
+
 
 
 def create_sample_pdf_bytes(pages_count: int = 2) -> bytes:
@@ -166,46 +171,57 @@ def test_upload_reference_paper_invalid_year():
     assert "Invalid year" in res.json()["detail"]
 
 
-def test_delete_reference_paper_db_and_filesystem():
-    uid = uuid.uuid4().hex[:8]
-    user = client.post("/api/v1/auth/register", json={"name": "Del User", "email": f"del_{uid}@example.com", "password": "password123"}).json()
-    headers = {"Authorization": f"Bearer {user['access_token']}"}
+def test_delete_reference_paper_db_and_filesystem(tmp_path):
+    with patch("app.core.config.settings.LOCAL_STORAGE_PATH", str(tmp_path)):
+        uid = uuid.uuid4().hex[:8]
+        user = client.post("/api/v1/auth/register", json={"name": "Del User", "email": f"del_{uid}@example.com", "password": "password123"}).json()
+        headers = {"Authorization": f"Bearer {user['access_token']}"}
 
-    ws = client.post("/api/v1/workspaces", json={"name": f"WS_{uid}"}, headers=headers).json()
-    subj = client.post(f"/api/v1/workspaces/{ws['id']}/subjects", json={"name": f"Chem_{uid}"}, headers=headers).json()
+        ws = client.post("/api/v1/workspaces", json={"name": f"WS_{uid}"}, headers=headers).json()
+        subj = client.post(f"/api/v1/workspaces/{ws['id']}/subjects", json={"name": f"Chem_{uid}"}, headers=headers).json()
 
-    pdf_bytes = create_sample_pdf_bytes()
-    p1 = client.post(
-        f"/api/v1/subjects/{subj['id']}/reference-papers",
-        data={"title": "Chem Test 2023"},
-        files={"file": ("chem.pdf", io.BytesIO(pdf_bytes), "application/pdf")},
-        headers=headers,
-    ).json()
+        pdf_bytes = create_sample_pdf_bytes()
+        p1 = client.post(
+            f"/api/v1/subjects/{subj['id']}/reference-papers",
+            data={"title": "Chem Test 2023"},
+            files={"file": ("chem.pdf", io.BytesIO(pdf_bytes), "application/pdf")},
+            headers=headers,
+        ).json()
 
-    paper_id = p1["id"]
-    db = SessionLocal()
-    try:
-        paper_db = db.query(ReferencePaper).filter(ReferencePaper.id == paper_id).first()
-        stored_path = paper_db.stored_path
-        paper_dir = os.path.dirname(stored_path)
-    finally:
-        db.close()
+        paper_id = p1["id"]
+        db = SessionLocal()
+        try:
+            paper_db = db.query(ReferencePaper).filter(ReferencePaper.id == paper_id).first()
+            stored_path = os.path.abspath(paper_db.stored_path)
+            paper_dir = os.path.dirname(stored_path)
+        finally:
+            db.close()
 
-    assert os.path.exists(stored_path)
+        assert os.path.exists(stored_path)
 
-    # Delete paper
-    del_res = client.delete(f"/api/v1/reference-papers/{paper_id}", headers=headers)
-    assert del_res.status_code == status.HTTP_204_NO_CONTENT
+        # Delete paper
+        del_res = client.delete(f"/api/v1/reference-papers/{paper_id}", headers=headers)
+        assert del_res.status_code == status.HTTP_204_NO_CONTENT
 
-    db2 = SessionLocal()
-    try:
-        # DB record deleted
-        assert db2.query(ReferencePaper).filter(ReferencePaper.id == paper_id).first() is None
-    finally:
-        db2.close()
+        db2 = SessionLocal()
+        try:
+            # DB record soft-deleted
+            ref_paper_deleted = db2.query(ReferencePaper).filter(ReferencePaper.id == paper_id).first()
+            assert ref_paper_deleted is not None
+            assert ref_paper_deleted.deleted_at is not None
+            # Excluded from repository get
+            assert ReferencePaperRepository(db2).get_reference_paper(paper_id) is None
+        finally:
+            db2.close()
 
-    # Filesystem deleted
-    assert not os.path.exists(paper_dir)
+        # Filesystem deleted
+        assert not os.path.exists(stored_path), f"stored_path still exists: {stored_path}"
+        assert not os.path.exists(paper_dir), f"paper_dir still exists: {paper_dir}"
+
+
+
+
+
 
 
 def test_reference_paper_unauthorized_access():

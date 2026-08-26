@@ -78,8 +78,45 @@ class WorkspaceService:
         return self.repo.update_subject(subject, name=name)
 
     def delete_subject(self, subject_id: UUID, current_user_id: UUID) -> None:
+        import os
+        import shutil
+        from sqlalchemy import select
+        from app.core.config import settings
+        from app.models.book import Book
+        from app.models.document import Document
+        from app.models.reference_paper import ReferencePaper
+        from app.models.generated_paper import GeneratedPaper
+
         subject = self.get_subject(subject_id, current_user_id)
+
+        # Collect storage directories to hard-delete from disk
+        storage_root = settings.LOCAL_STORAGE_PATH
+        dirs_to_delete = []
+
+        # 1. Documents under subject
+        book_ids = [b.id for b in subject.books]
+        if book_ids:
+            docs = self.repo.db.execute(select(Document).where(Document.book_id.in_(book_ids), Document.deleted_at.is_(None))).scalars().all()
+            for doc in docs:
+                dirs_to_delete.append(os.path.join(storage_root, "documents", str(doc.id)))
+
+        # 2. Reference papers under subject
+        ref_papers = self.repo.db.execute(select(ReferencePaper).where(ReferencePaper.subject_id == subject.id, ReferencePaper.deleted_at.is_(None))).scalars().all()
+        for ref in ref_papers:
+            dirs_to_delete.append(os.path.join(storage_root, "reference_papers", str(ref.id)))
+
+        # 3. Generated papers under subject
+        gen_papers = self.repo.db.execute(select(GeneratedPaper).where(GeneratedPaper.subject_id == subject.id, GeneratedPaper.deleted_at.is_(None))).scalars().all()
+        for gen in gen_papers:
+            dirs_to_delete.append(os.path.join(storage_root, "generated_papers", str(gen.id)))
+
+        # Soft delete DB records recursively
         self.repo.delete_subject(subject)
+
+        # Hard delete physical files on disk
+        for path in dirs_to_delete:
+            if os.path.exists(path):
+                shutil.rmtree(path, ignore_errors=True)
 
     # Book operations
     def create_book(self, subject_id: UUID, current_user_id: UUID, name: str) -> Book:
@@ -106,8 +143,36 @@ class WorkspaceService:
         return self.repo.update_book(book, name=name)
 
     def delete_book(self, book_id: UUID, current_user_id: UUID) -> None:
+        import os
+        import shutil
+        from sqlalchemy import select
+        from app.core.config import settings
+        from app.models.document import Document
+        from app.models.generated_paper import GeneratedPaper
+
         book = self.get_book(book_id, current_user_id)
+
+        storage_root = settings.LOCAL_STORAGE_PATH
+        dirs_to_delete = []
+
+        # Documents under book
+        docs = self.repo.db.execute(select(Document).where(Document.book_id == book.id, Document.deleted_at.is_(None))).scalars().all()
+        for doc in docs:
+            dirs_to_delete.append(os.path.join(storage_root, "documents", str(doc.id)))
+
+        # Generated papers under book
+        gen_papers = self.repo.db.execute(select(GeneratedPaper).where(GeneratedPaper.book_id == book.id, GeneratedPaper.deleted_at.is_(None))).scalars().all()
+        for gen in gen_papers:
+            dirs_to_delete.append(os.path.join(storage_root, "generated_papers", str(gen.id)))
+
+        # Soft delete DB records
         self.repo.delete_book(book)
+
+        # Hard delete physical files on disk
+        for path in dirs_to_delete:
+            if os.path.exists(path):
+                shutil.rmtree(path, ignore_errors=True)
+
 
     # Chapter operations
     def create_chapter(
@@ -234,5 +299,27 @@ class WorkspaceService:
         return updated_ch
 
     def delete_chapter(self, chapter_id: UUID, current_user_id: UUID) -> None:
+        import os
+        import shutil
+        from sqlalchemy import select
+        from app.core.config import settings
+        from app.models.document import Document
+
         chapter = self.get_chapter(chapter_id, current_user_id)
+
+        storage_root = settings.LOCAL_STORAGE_PATH
+        dirs_to_delete = []
+
+        # Documents associated specifically with this chapter
+        docs = self.repo.db.execute(select(Document).where(Document.chapter_id == chapter.id, Document.deleted_at.is_(None))).scalars().all()
+        for doc in docs:
+            dirs_to_delete.append(os.path.join(storage_root, "documents", str(doc.id)))
+
+        # Soft delete DB records
         self.repo.delete_chapter(chapter)
+
+        # Hard delete physical files on disk
+        for path in dirs_to_delete:
+            if os.path.exists(path):
+                shutil.rmtree(path, ignore_errors=True)
+
