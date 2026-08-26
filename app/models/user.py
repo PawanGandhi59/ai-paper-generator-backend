@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 import uuid
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, String, UniqueConstraint
@@ -7,6 +7,9 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+
+if TYPE_CHECKING:
+    from app.models.workspace import Workspace
 
 
 def utc_now() -> datetime:

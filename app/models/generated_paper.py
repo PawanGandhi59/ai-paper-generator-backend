@@ -23,12 +23,22 @@ class GeneratedPaper(Base):
     generation_mode = Column(String(50), nullable=False)  # "CUSTOM", "REFERENCE"
     status = Column(String(50), nullable=False, default="PENDING")  # "PENDING", "GENERATING", "COMPLETED", "FAILED"
     total_marks = Column(Integer, nullable=False)
+    time_allowed_minutes = Column(Integer, nullable=True)
+    class_name = Column(String(100), nullable=True)
     difficulty = Column(String(50), nullable=False, default="MIXED")  # "EASY", "MEDIUM", "HARD", "MIXED"
+
+
     topic_focus = Column(Text, nullable=True)
     selected_chapter_ids = Column(JSONB, nullable=False)  # List[str] of chapter UUIDs
     include_answers = Column(Boolean, nullable=False, default=True)
     blueprint_json = Column(JSONB, nullable=True)
     error_message = Column(Text, nullable=True)
+    pdf_path = Column(String(1024), nullable=True)
+    document_id = Column(UUID(as_uuid=True), ForeignKey("documents.id", ondelete="SET NULL"), nullable=True, index=True)
+    processing_status = Column(String(50), nullable=True, default="NOT_SAVED")  # "NOT_SAVED", "PROCESSING", "READY", "FAILED"
+    deleted_at = Column(DateTime(timezone=True), nullable=True, index=True)
+
+
 
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(
@@ -37,6 +47,7 @@ class GeneratedPaper(Base):
         onupdate=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
+
 
     questions = relationship(
         "GeneratedPaperQuestion",

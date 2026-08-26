@@ -3,7 +3,7 @@ from typing import List, Optional, TYPE_CHECKING
 import uuid
 
 from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -33,6 +33,9 @@ class ReferencePaper(Base):
     mime_type: Mapped[str] = mapped_column(String(100), nullable=False)
     file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
+    blueprint_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
 
@@ -51,7 +54,9 @@ class ReferencePaperPage(Base):
     page_number: Mapped[int] = mapped_column(Integer, nullable=False)
     content_type: Mapped[str] = mapped_column(String(50), nullable=False, default="PAGE")
     text_content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
     reference_paper: Mapped["ReferencePaper"] = relationship("ReferencePaper", back_populates="pages")
+

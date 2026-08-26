@@ -49,14 +49,23 @@ class WorkspaceRepository:
         return subject
 
     def get_subject_by_id(self, subject_id: UUID) -> Optional[Subject]:
-        return self.db.get(Subject, subject_id)
+        stmt = select(Subject).where(Subject.id == subject_id, Subject.deleted_at.is_(None))
+        return self.db.execute(stmt).scalar_one_or_none()
 
     def get_subjects_by_workspace(self, workspace_id: UUID) -> List[Subject]:
-        stmt = select(Subject).where(Subject.workspace_id == workspace_id).order_by(Subject.created_at.asc())
+        stmt = (
+            select(Subject)
+            .where(Subject.workspace_id == workspace_id, Subject.deleted_at.is_(None))
+            .order_by(Subject.created_at.asc())
+        )
         return list(self.db.execute(stmt).scalars().all())
 
     def get_subject_by_workspace_and_name(self, workspace_id: UUID, name: str) -> Optional[Subject]:
-        stmt = select(Subject).where(Subject.workspace_id == workspace_id, Subject.name == name.strip())
+        stmt = select(Subject).where(
+            Subject.workspace_id == workspace_id,
+            Subject.name == name.strip(),
+            Subject.deleted_at.is_(None),
+        )
         return self.db.execute(stmt).scalar_one_or_none()
 
     def update_subject(self, subject: Subject, name: Optional[str] = None) -> Subject:
@@ -67,7 +76,54 @@ class WorkspaceRepository:
         return subject
 
     def delete_subject(self, subject: Subject) -> None:
-        self.db.delete(subject)
+        from datetime import datetime, timezone
+        from sqlalchemy import update
+        from app.models.book import Book
+        from app.models.chapter import Chapter
+        from app.models.topic import Topic
+        from app.models.document import Document, DocumentPage, DocumentChunk
+        from app.models.reference_paper import ReferencePaper, ReferencePaperPage
+        from app.models.generated_paper import GeneratedPaper
+
+        now = datetime.now(timezone.utc)
+        subject.deleted_at = now
+
+        # 1. Soft delete Books
+        self.db.execute(
+            update(Book).where(Book.subject_id == subject.id, Book.deleted_at.is_(None)).values(deleted_at=now)
+        )
+        # 2. Soft delete Chapters & Topics
+        book_ids_stmt = select(Book.id).where(Book.subject_id == subject.id)
+        chapter_ids_stmt = select(Chapter.id).where(Chapter.book_id.in_(book_ids_stmt))
+        self.db.execute(
+            update(Chapter).where(Chapter.book_id.in_(book_ids_stmt), Chapter.deleted_at.is_(None)).values(deleted_at=now)
+        )
+        self.db.execute(
+            update(Topic).where(Topic.chapter_id.in_(chapter_ids_stmt), Topic.deleted_at.is_(None)).values(deleted_at=now)
+        )
+        # 3. Soft delete Documents, Pages, Chunks
+        doc_ids_stmt = select(Document.id).where(Document.book_id.in_(book_ids_stmt))
+        self.db.execute(
+            update(Document).where(Document.book_id.in_(book_ids_stmt), Document.deleted_at.is_(None)).values(deleted_at=now)
+        )
+        self.db.execute(
+            update(DocumentPage).where(DocumentPage.document_id.in_(doc_ids_stmt), DocumentPage.deleted_at.is_(None)).values(deleted_at=now)
+        )
+        self.db.execute(
+            update(DocumentChunk).where(DocumentChunk.subject_id == subject.id, DocumentChunk.deleted_at.is_(None)).values(deleted_at=now)
+        )
+        # 4. Soft delete ReferencePapers & Pages
+        ref_ids_stmt = select(ReferencePaper.id).where(ReferencePaper.subject_id == subject.id)
+        self.db.execute(
+            update(ReferencePaper).where(ReferencePaper.subject_id == subject.id, ReferencePaper.deleted_at.is_(None)).values(deleted_at=now)
+        )
+        self.db.execute(
+            update(ReferencePaperPage).where(ReferencePaperPage.reference_paper_id.in_(ref_ids_stmt), ReferencePaperPage.deleted_at.is_(None)).values(deleted_at=now)
+        )
+        # 5. Soft delete GeneratedPapers
+        self.db.execute(
+            update(GeneratedPaper).where(GeneratedPaper.subject_id == subject.id, GeneratedPaper.deleted_at.is_(None)).values(deleted_at=now)
+        )
         self.db.commit()
 
     # Book operations
@@ -79,10 +135,11 @@ class WorkspaceRepository:
         return book
 
     def get_book_by_id(self, book_id: UUID) -> Optional[Book]:
-        return self.db.get(Book, book_id)
+        stmt = select(Book).where(Book.id == book_id, Book.deleted_at.is_(None))
+        return self.db.execute(stmt).scalar_one_or_none()
 
     def get_books_by_subject(self, subject_id: UUID) -> List[Book]:
-        stmt = select(Book).where(Book.subject_id == subject_id).order_by(Book.created_at.asc())
+        stmt = select(Book).where(Book.subject_id == subject_id, Book.deleted_at.is_(None)).order_by(Book.created_at.asc())
         return list(self.db.execute(stmt).scalars().all())
 
     def update_book(self, book: Book, name: Optional[str] = None) -> Book:
@@ -93,7 +150,39 @@ class WorkspaceRepository:
         return book
 
     def delete_book(self, book: Book) -> None:
-        self.db.delete(book)
+        from datetime import datetime, timezone
+        from sqlalchemy import update
+        from app.models.chapter import Chapter
+        from app.models.topic import Topic
+        from app.models.document import Document, DocumentPage, DocumentChunk
+        from app.models.generated_paper import GeneratedPaper
+
+        now = datetime.now(timezone.utc)
+        book.deleted_at = now
+
+        # 1. Soft delete Chapters & Topics
+        chapter_ids_stmt = select(Chapter.id).where(Chapter.book_id == book.id)
+        self.db.execute(
+            update(Chapter).where(Chapter.book_id == book.id, Chapter.deleted_at.is_(None)).values(deleted_at=now)
+        )
+        self.db.execute(
+            update(Topic).where(Topic.chapter_id.in_(chapter_ids_stmt), Topic.deleted_at.is_(None)).values(deleted_at=now)
+        )
+        # 2. Soft delete Documents, Pages, Chunks
+        doc_ids_stmt = select(Document.id).where(Document.book_id == book.id)
+        self.db.execute(
+            update(Document).where(Document.book_id == book.id, Document.deleted_at.is_(None)).values(deleted_at=now)
+        )
+        self.db.execute(
+            update(DocumentPage).where(DocumentPage.document_id.in_(doc_ids_stmt), DocumentPage.deleted_at.is_(None)).values(deleted_at=now)
+        )
+        self.db.execute(
+            update(DocumentChunk).where(DocumentChunk.book_id == book.id, DocumentChunk.deleted_at.is_(None)).values(deleted_at=now)
+        )
+        # 3. Soft delete GeneratedPapers
+        self.db.execute(
+            update(GeneratedPaper).where(GeneratedPaper.book_id == book.id, GeneratedPaper.deleted_at.is_(None)).values(deleted_at=now)
+        )
         self.db.commit()
 
     # Chapter operations
@@ -118,14 +207,23 @@ class WorkspaceRepository:
         return chapter
 
     def get_chapter_by_id(self, chapter_id: UUID) -> Optional[Chapter]:
-        return self.db.get(Chapter, chapter_id)
+        stmt = select(Chapter).where(Chapter.id == chapter_id, Chapter.deleted_at.is_(None))
+        return self.db.execute(stmt).scalar_one_or_none()
 
     def get_chapter_by_book_and_number(self, book_id: UUID, chapter_number: int) -> Optional[Chapter]:
-        stmt = select(Chapter).where(Chapter.book_id == book_id, Chapter.chapter_number == chapter_number)
+        stmt = select(Chapter).where(
+            Chapter.book_id == book_id,
+            Chapter.chapter_number == chapter_number,
+            Chapter.deleted_at.is_(None),
+        )
         return self.db.execute(stmt).scalar_one_or_none()
 
     def get_chapters_by_book(self, book_id: UUID) -> List[Chapter]:
-        stmt = select(Chapter).where(Chapter.book_id == book_id).order_by(Chapter.chapter_number.asc())
+        stmt = (
+            select(Chapter)
+            .where(Chapter.book_id == book_id, Chapter.deleted_at.is_(None))
+            .order_by(Chapter.chapter_number.asc())
+        )
         return list(self.db.execute(stmt).scalars().all())
 
     def update_chapter(
@@ -164,6 +262,7 @@ class WorkspaceRepository:
             .where(
                 DocumentChunk.book_id == book_id,
                 DocumentChunk.chapter_id == chapter_id,
+                DocumentChunk.deleted_at.is_(None),
                 (DocumentChunk.page_number < start_page) | (DocumentChunk.page_number > end_page),
             )
             .values(chapter_id=None)
@@ -175,6 +274,7 @@ class WorkspaceRepository:
             update(DocumentChunk)
             .where(
                 DocumentChunk.book_id == book_id,
+                DocumentChunk.deleted_at.is_(None),
                 DocumentChunk.page_number >= start_page,
                 DocumentChunk.page_number <= end_page,
             )
@@ -185,5 +285,28 @@ class WorkspaceRepository:
         return res.rowcount
 
     def delete_chapter(self, chapter: Chapter) -> None:
-        self.db.delete(chapter)
+        from datetime import datetime, timezone
+        from sqlalchemy import update
+        from app.models.topic import Topic
+        from app.models.document import Document, DocumentPage, DocumentChunk
+
+        now = datetime.now(timezone.utc)
+        chapter.deleted_at = now
+
+        # 1. Soft delete Topics
+        self.db.execute(
+            update(Topic).where(Topic.chapter_id == chapter.id, Topic.deleted_at.is_(None)).values(deleted_at=now)
+        )
+        # 2. Soft delete Documents, Pages, Chunks specifically associated with Chapter
+        doc_ids_stmt = select(Document.id).where(Document.chapter_id == chapter.id)
+        self.db.execute(
+            update(Document).where(Document.chapter_id == chapter.id, Document.deleted_at.is_(None)).values(deleted_at=now)
+        )
+        self.db.execute(
+            update(DocumentPage).where(DocumentPage.document_id.in_(doc_ids_stmt), DocumentPage.deleted_at.is_(None)).values(deleted_at=now)
+        )
+        self.db.execute(
+            update(DocumentChunk).where(DocumentChunk.chapter_id == chapter.id, DocumentChunk.deleted_at.is_(None)).values(deleted_at=now)
+        )
         self.db.commit()
+

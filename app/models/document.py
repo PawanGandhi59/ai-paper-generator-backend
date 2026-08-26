@@ -34,6 +34,7 @@ class Document(Base):
     processing_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     processing_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     processing_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
@@ -46,7 +47,6 @@ class Document(Base):
     @property
     def chapter_number(self) -> Optional[int]:
         return self.chapter.chapter_number if self.chapter else None
-
 
 
 class DocumentPage(Base):
@@ -63,6 +63,7 @@ class DocumentPage(Base):
     text_content: Mapped[str] = mapped_column(Text, nullable=False, default="")
     image_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     metadata_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
@@ -89,7 +90,9 @@ class DocumentChunk(Base):
     content_type: Mapped[str] = mapped_column(String(50), nullable=False, default="TEXT")
     metadata_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
     embedding: Mapped[Optional[Vector]] = mapped_column(Vector(768), nullable=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
     document: Mapped["Document"] = relationship("Document", back_populates="chunks")
+

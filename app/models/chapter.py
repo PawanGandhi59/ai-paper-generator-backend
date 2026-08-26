@@ -27,8 +27,10 @@ class Chapter(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     start_page: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     end_page: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
 
     book: Mapped["Book"] = relationship("Book", back_populates="chapters")
     topics: Mapped[List["Topic"]] = relationship("Topic", back_populates="chapter", cascade="all, delete-orphan")

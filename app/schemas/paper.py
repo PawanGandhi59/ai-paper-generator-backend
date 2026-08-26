@@ -1,6 +1,8 @@
+import re
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
+
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -64,7 +66,12 @@ class PaperGenerateRequest(BaseModel):
     selected_chapter_ids: List[UUID] = Field(..., min_length=1, description="Selected chapter IDs (HARD content boundary)")
     generation_mode: GenerationMode
     total_marks: int = Field(..., ge=1, le=1000, description="Total paper marks")
+    time_allowed_minutes: Optional[int] = Field(None, ge=1, le=1440, description="Time allowed for paper in minutes (e.g. 180 for 3 hours)")
+    class_name: Optional[str] = Field(None, max_length=100, description="Optional class/grade name (e.g. Class 10, Grade 12)")
+
     difficulty: DifficultyLevel = DifficultyLevel.MIXED
+
+
     topic_focus: Optional[str] = Field(None, max_length=1000, description="Optional natural language topic focus/preference")
     include_answers: bool = Field(True, description="Whether to include answer keys in API response")
     title: Optional[str] = Field(None, max_length=255)
@@ -79,9 +86,34 @@ class PaperGenerateRequest(BaseModel):
     )
 
 
+    @field_validator("time_allowed_minutes")
+    @classmethod
+    def validate_time_allowed_minutes(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None:
+            if v <= 0:
+                raise ValueError("time_allowed_minutes must be a positive integer greater than 0")
+            if v > 1440:
+                raise ValueError("time_allowed_minutes cannot exceed 1440 minutes (24 hours)")
+        return v
+
+    @field_validator("class_name")
+    @classmethod
+    def validate_class_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                raise ValueError("class_name cannot be blank or an empty string")
+            if not re.search(r"[a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF]", v):
+                raise ValueError("class_name must contain letters or numbers and cannot consist only of special characters")
+            if not re.match(r"^[a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF\s\-\.\,\(\)\/\\\_]+$", v):
+                raise ValueError("class_name contains invalid special characters")
+            return v
+        return None
+
     @field_validator("title")
     @classmethod
     def validate_title(cls, v: Optional[str]) -> Optional[str]:
+
         if v is not None:
             v = v.strip()
             if not v:
@@ -155,14 +187,25 @@ class PaperResponse(BaseModel):
     generation_mode: GenerationMode
     status: str
     total_marks: int
+    time_allowed_minutes: Optional[int] = None
+    class_name: Optional[str] = None
     difficulty: DifficultyLevel
+
+
     topic_focus: Optional[str] = None
     selected_chapter_ids: List[UUID]
     include_answers: bool
     blueprint_json: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
+
+    has_saved_pdf: bool = False
+    pdf_url: Optional[str] = None
+    processing_status: Optional[str] = "NOT_SAVED"
+    reference_eligible: bool = False
+
     questions: List[PaperQuestionResponse] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+

@@ -73,14 +73,30 @@ def process_document(self, document_id_str: str) -> dict:
 
         # 1. Claim processing task atomically
         doc = doc_repo.claim_document_for_processing(doc_id)
-        if not doc:
-            logger.info(f"Document claim skipped or already processing/processed: document_id={document_id_str}")
-            return {"status": "skipped", "reason": "Already claimed or processed"}
+        if not doc or doc.deleted_at is not None:
+            logger.info(f"Document claim skipped or soft-deleted: document_id={document_id_str}")
+            return {"status": "skipped", "reason": "Already claimed, processed, or deleted"}
+
+        # Validate ancestor entities are active (not soft-deleted)
+        book = doc.book
+        if not book or book.deleted_at is not None:
+            logger.warning(f"Aborting process_document task because owning book is soft-deleted: document_id={document_id_str}")
+            return {"status": "ABORTED", "reason": "Book is soft-deleted"}
+
+        subject = book.subject
+        if not subject or subject.deleted_at is not None:
+            logger.warning(f"Aborting process_document task because owning subject is soft-deleted: document_id={document_id_str}")
+            return {"status": "ABORTED", "reason": "Subject is soft-deleted"}
+
+        if doc.chapter_id and (not doc.chapter or doc.chapter.deleted_at is not None):
+            logger.warning(f"Aborting process_document task because owning chapter is soft-deleted: document_id={document_id_str}")
+            return {"status": "ABORTED", "reason": "Chapter is soft-deleted"}
 
         if not doc.stored_path:
             logger.error(f"Document stored_path missing for document_id={document_id_str}")
             cleanup_failed_document(db, document_id_str, "Missing stored_path")
             return {"status": "FAILED", "reason": "Missing stored_path"}
+
 
         doc_dir = os.path.dirname(doc.stored_path)
         _, ext = os.path.splitext(doc.original_filename)
@@ -146,11 +162,26 @@ def generate_document_embeddings(self, document_id_str: str) -> dict:
         doc_id = UUID(document_id_str)
         doc = doc_repo.get_document_by_id(doc_id)
 
-        if not doc:
-            logger.error(f"Document not found for embedding generation: {document_id_str}")
-            return {"status": "FAILED", "reason": "Document not found"}
+        if not doc or doc.deleted_at is not None:
+            logger.error(f"Document not found or soft-deleted for embedding generation: {document_id_str}")
+            return {"status": "ABORTED", "reason": "Document not found or soft-deleted"}
+
+        book = doc.book
+        if not book or book.deleted_at is not None:
+            logger.warning(f"Aborting embedding generation because owning book is soft-deleted: {document_id_str}")
+            return {"status": "ABORTED", "reason": "Book is soft-deleted"}
+
+        subject = book.subject
+        if not subject or subject.deleted_at is not None:
+            logger.warning(f"Aborting embedding generation because owning subject is soft-deleted: {document_id_str}")
+            return {"status": "ABORTED", "reason": "Subject is soft-deleted"}
+
+        if doc.chapter_id and (not doc.chapter or doc.chapter.deleted_at is not None):
+            logger.warning(f"Aborting embedding generation because owning chapter is soft-deleted: {document_id_str}")
+            return {"status": "ABORTED", "reason": "Chapter is soft-deleted"}
 
         pages = doc_repo.get_document_pages(doc_id)
+
         if not pages:
             logger.warning(f"No pages found to embed for document_id={document_id_str}")
             doc_repo.mark_ready(doc_id)
