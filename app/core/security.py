@@ -72,3 +72,33 @@ def hash_refresh_token(token: str) -> str:
     Compute SHA-256 hash of raw refresh token string for secure DB storage.
     """
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def create_password_reset_token(data: Dict[str, Any], expires_delta: timedelta | None = None) -> str:
+    """
+    Create a purpose-specific JWT password reset token containing user identity and otp_id.
+    """
+    to_encode = data.copy()
+    now = datetime.now(timezone.utc)
+    if expires_delta:
+        expire = now + expires_delta
+    else:
+        expire = now + timedelta(minutes=settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES)
+
+    to_encode.update({
+        "exp": expire,
+        "iat": now,
+        "type": "password_reset"
+    })
+    return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def decode_password_reset_token(token: str) -> Dict[str, Any]:
+    """
+    Decode and validate a purpose-specific JWT password reset token.
+    Raises PyJWT exceptions if invalid or not of type 'password_reset'.
+    """
+    payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+    if payload.get("type") != "password_reset":
+        raise jwt.InvalidTokenError("Invalid token type for password reset")
+    return payload

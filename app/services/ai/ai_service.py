@@ -32,3 +32,8 @@ class AIService(ABC):
     ) -> Dict[str, Any]:
         """Generate a response for text + optional image input + optional context."""
         pass
+
+    @abstractmethod
+    def count_tokens(self, prompt: str, system_instruction: Optional[str] = None) -> int:
+        """Calculate input token count for prompt."""
+        pass

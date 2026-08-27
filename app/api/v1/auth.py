@@ -6,12 +6,18 @@ from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.models.user import User
 from app.schemas.auth import (
+    ForgotPasswordRequest,
+    ForgotPasswordResponse,
     GoogleLogin,
     RefreshTokenRequest,
+    ResetPasswordRequest,
+    ResetPasswordResponse,
     TokenResponse,
     UserLogin,
     UserRegister,
     UserResponse,
+    VerifyResetOTPRequest,
+    VerifyResetOTPResponse,
 )
 from app.services.auth_service import AuthService
 
@@ -92,3 +98,30 @@ def get_me(current_user: User = Depends(get_current_user)) -> UserResponse:
     Get profile of currently authenticated user.
     """
     return UserResponse.model_validate(current_user)
+
+
+@router.post("/forgot-password", response_model=ForgotPasswordResponse, status_code=status.HTTP_200_OK)
+def forgot_password(data: ForgotPasswordRequest, db: Session = Depends(get_db)) -> ForgotPasswordResponse:
+    """
+    Request a password reset OTP. Always returns a generic 200 response to prevent account enumeration.
+    """
+    auth_service = AuthService(db)
+    return auth_service.forgot_password(data)
+
+
+@router.post("/verify-reset-otp", response_model=VerifyResetOTPResponse, status_code=status.HTTP_200_OK)
+def verify_reset_otp(data: VerifyResetOTPRequest, db: Session = Depends(get_db)) -> VerifyResetOTPResponse:
+    """
+    Verify 6-digit OTP and receive a short-lived purpose-specific password reset authorization token.
+    """
+    auth_service = AuthService(db)
+    return auth_service.verify_reset_otp(data)
+
+
+@router.post("/reset-password", response_model=ResetPasswordResponse, status_code=status.HTTP_200_OK)
+def reset_password(data: ResetPasswordRequest, db: Session = Depends(get_db)) -> ResetPasswordResponse:
+    """
+    Reset user password using a valid password reset token and update login credentials.
+    """
+    auth_service = AuthService(db)
+    return auth_service.reset_password(data)

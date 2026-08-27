@@ -3,6 +3,7 @@ from app.models.chapter import Chapter
 from app.models.document import Document, DocumentPage
 from app.models.generated_paper import GeneratedPaper, GeneratedPaperQuestion
 from app.models.generated_visual import GeneratedVisual
+from app.models.password_reset_otp import PasswordResetOTP
 from app.models.reference_paper import ReferencePaper, ReferencePaperPage
 from app.models.subject import Subject
 from app.models.topic import Topic
@@ -13,6 +14,7 @@ __all__ = [
     "User",
     "OAuthAccount",
     "RefreshToken",
+    "PasswordResetOTP",
     "Workspace",
     "Subject",
     "Book",

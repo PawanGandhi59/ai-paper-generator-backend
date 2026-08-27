@@ -22,6 +22,7 @@ class DifficultyLevel(str, Enum):
 
 class QuestionType(str, Enum):
     MCQ = "MCQ"
+    VERY_SHORT_ANSWER = "VERY_SHORT_ANSWER"
     SHORT_ANSWER = "SHORT_ANSWER"
     LONG_ANSWER = "LONG_ANSWER"
     NUMERICAL = "NUMERICAL"
@@ -38,27 +39,12 @@ class QuestionConfigItem(BaseModel):
     question_count: int = Field(..., ge=1, description="Number of questions for this type")
     marks_per_question: int = Field(..., ge=1, description="Marks assigned to each question")
     section_name: Optional[str] = Field(None, max_length=100)
-    has_internal_choice: bool = Field(False, description="Whether questions have internal choices (e.g. Q4(a) OR Q4(b))")
-    alternatives_per_question: int = Field(1, ge=1, description="Number of alternatives per question number")
-    alternatives: Optional[int] = Field(None, ge=1, description="Alias for alternatives_per_question")
-    choice_rule: Optional[str] = Field(None, max_length=100)
+    alternatives_per_question: int = Field(1, ge=1, description="Number of alternatives per question number (e.g. 1 for mandatory, 2 for (a) OR (b))")
 
-    @model_validator(mode="after")
-    def sync_choice_fields(self) -> "QuestionConfigItem":
-        if self.alternatives is not None:
-            self.alternatives_per_question = self.alternatives
+    @property
+    def has_internal_choice(self) -> bool:
+        return self.alternatives_per_question > 1
 
-        if self.alternatives_per_question > 1 or self.has_internal_choice:
-            self.has_internal_choice = True
-            if self.alternatives_per_question < 2:
-                self.alternatives_per_question = 2
-            if not self.choice_rule:
-                self.choice_rule = "answer_one_of_two"
-        else:
-            self.has_internal_choice = False
-            self.alternatives_per_question = 1
-            self.choice_rule = None
-        return self
 
 
 class PaperGenerateRequest(BaseModel):
@@ -75,6 +61,9 @@ class PaperGenerateRequest(BaseModel):
     topic_focus: Optional[str] = Field(None, max_length=1000, description="Optional natural language topic focus/preference")
     include_answers: bool = Field(True, description="Whether to include answer keys in API response")
     title: Optional[str] = Field(None, max_length=255)
+
+    enable_numerical_percentage: bool = Field(False, description="Whether to distribute a percentage of numerical questions across sections")
+    numerical_percentage: Optional[int] = Field(None, ge=1, le=100, description="Percentage of numerical questions in each section (1-100%)")
 
     # Custom mode configuration
     question_configs: Optional[List[QuestionConfigItem]] = None
@@ -131,6 +120,12 @@ class PaperGenerateRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_mode_requirements(self) -> "PaperGenerateRequest":
+        if self.enable_numerical_percentage:
+            if self.numerical_percentage is None or self.numerical_percentage < 1 or self.numerical_percentage > 100:
+                raise ValueError("numerical_percentage between 1 and 100 must be provided when enable_numerical_percentage is True.")
+        else:
+            self.numerical_percentage = None
+
         if self.generation_mode == GenerationMode.CUSTOM:
             if not self.question_configs or len(self.question_configs) == 0:
                 raise ValueError("question_configs is required for CUSTOM generation mode.")
@@ -162,6 +157,7 @@ class PaperQuestionResponse(BaseModel):
     marks: int
     difficulty: str
     source_type: QuestionSource
+    is_numerical: bool = False
 
     choice_group: Optional[str] = None
     alternative_label: Optional[str] = None

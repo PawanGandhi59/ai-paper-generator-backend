@@ -74,6 +74,7 @@ def test_ai_generation_returns_structured_json_without_pdf():
     pg_svc.paper_repo.update_status = MagicMock()
 
     with patch.object(pg_svc, "_retrieve_chapter_context", return_value="Context"), \
+         patch.object(pg_svc, "_generate_complete_paper", return_value=[]), \
          patch.object(pg_svc, "_generate_section_questions", return_value=[]), \
          patch.object(pg_svc.paper_repo, "save_questions"):
 
@@ -418,6 +419,7 @@ def test_saved_pdf_blueprint_override_original_json():
 
     pg_svc.blueprint_service.analyze_reference_paper = MagicMock(return_value=analyzed_blueprint)
     pg_svc._retrieve_chapter_context = MagicMock(return_value="Context")
+    pg_svc._generate_complete_paper = MagicMock(return_value=[])
     pg_svc._generate_section_questions = MagicMock(return_value=[])
 
     ch_id = uuid4()
@@ -547,6 +549,7 @@ def test_saved_pdf_blueprint_caching():
 
     pg_svc.blueprint_service.analyze_reference_paper = MagicMock()
     pg_svc._retrieve_chapter_context = MagicMock(return_value="Context")
+    pg_svc._generate_complete_paper = MagicMock(return_value=[])
     pg_svc._generate_section_questions = MagicMock(return_value=[])
 
     ch_id = uuid4()

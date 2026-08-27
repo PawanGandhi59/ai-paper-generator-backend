@@ -100,6 +100,20 @@ class ReferencePaperRepository:
         )
         return list(self.db.execute(stmt).scalars().all())
 
+    def list_reference_papers_by_user(self, user_id: UUID) -> List[ReferencePaper]:
+        from app.models.workspace import Workspace
+
+        stmt = (
+            select(ReferencePaper)
+            .join(Workspace, ReferencePaper.workspace_id == Workspace.id)
+            .where(
+                Workspace.owner_id == user_id,
+                ReferencePaper.deleted_at.is_(None),
+            )
+            .order_by(ReferencePaper.created_at.desc())
+        )
+        return list(self.db.execute(stmt).scalars().all())
+
     def save_blueprint_json(
         self, paper_id: UUID, blueprint_json: Dict[str, Any]
     ) -> Optional[ReferencePaper]:

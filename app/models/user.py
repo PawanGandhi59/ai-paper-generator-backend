@@ -9,6 +9,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 
 if TYPE_CHECKING:
+    from app.models.password_reset_otp import PasswordResetOTP
     from app.models.workspace import Workspace
 
 
@@ -30,6 +31,7 @@ class User(Base):
 
     oauth_accounts: Mapped[List["OAuthAccount"]] = relationship("OAuthAccount", back_populates="user", cascade="all, delete-orphan")
     refresh_tokens: Mapped[List["RefreshToken"]] = relationship("RefreshToken", back_populates="user", cascade="all, delete-orphan")
+    password_reset_otps: Mapped[List["PasswordResetOTP"]] = relationship("PasswordResetOTP", back_populates="user", cascade="all, delete-orphan")
     workspaces: Mapped[List["Workspace"]] = relationship("Workspace", back_populates="owner", cascade="all, delete-orphan")
 
 

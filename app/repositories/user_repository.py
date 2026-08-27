@@ -5,6 +5,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.models.password_reset_otp import PasswordResetOTP
 from app.models.user import OAuthAccount, RefreshToken, User
 
 
@@ -83,3 +84,42 @@ class UserRepository:
         for token in tokens:
             token.revoked_at = now
         self.db.commit()
+
+    def create_password_reset_otp(self, user_id: UUID, otp_hash: str, expires_at: datetime, max_attempts: int = 5) -> PasswordResetOTP:
+        otp = PasswordResetOTP(
+            user_id=user_id,
+            otp_hash=otp_hash,
+            expires_at=expires_at,
+            max_attempts=max_attempts,
+        )
+        self.db.add(otp)
+        self.db.flush()
+        return otp
+
+    def get_latest_otp_by_user_id(self, user_id: UUID) -> Optional[PasswordResetOTP]:
+        stmt = (
+            select(PasswordResetOTP)
+            .where(PasswordResetOTP.user_id == user_id)
+            .order_by(PasswordResetOTP.created_at.desc())
+        )
+        return self.db.execute(stmt).scalars().first()
+
+    def get_otp_by_id(self, otp_id: UUID) -> Optional[PasswordResetOTP]:
+        return self.db.get(PasswordResetOTP, otp_id)
+
+    def invalidate_user_otps(self, user_id: UUID) -> None:
+        now = datetime.now(timezone.utc)
+        stmt = select(PasswordResetOTP).where(
+            PasswordResetOTP.user_id == user_id,
+            PasswordResetOTP.used_at.is_(None),
+            PasswordResetOTP.expires_at > now,
+        )
+        otps = self.db.execute(stmt).scalars().all()
+        for otp in otps:
+            otp.expires_at = now
+        self.db.flush()
+
+    def update_user_password(self, user: User, new_password_hash: str) -> None:
+        user.password_hash = new_password_hash
+        user.updated_at = datetime.now(timezone.utc)
+        self.db.flush()
