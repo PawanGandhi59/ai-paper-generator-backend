@@ -491,3 +491,74 @@ def test_realistic_ocr_structure_reference_blueprint_analysis():
     assert bp.sections[1].total_section_marks == 20
     assert bp.sections[2].total_section_marks == 35
 
+
+def test_user_cross_workspace_reference_paper_visibility_and_generation():
+    """
+    TEST: Verify that a reference paper uploaded in Workspace 1 is visible
+    and usable for paper generation in Workspace 2 by the same user.
+    """
+    import json
+    uid = uuid.uuid4().hex[:8]
+    user = client.post("/api/v1/auth/register", json={"name": "Cross User", "email": f"cross_{uid}@example.com", "password": "password123"}).json()
+    headers = {"Authorization": f"Bearer {user['access_token']}"}
+
+    # Workspace 1 & Subject 1 -> Upload Reference Paper
+    ws1 = client.post("/api/v1/workspaces", json={"name": "WS 1"}, headers=headers).json()
+    subj1 = client.post(f"/api/v1/workspaces/{ws1['id']}/subjects", json={"name": "Subj 1"}, headers=headers).json()
+
+    pdf_bytes = create_sample_pdf_bytes()
+    files = {"file": ("ref1.pdf", io.BytesIO(pdf_bytes), "application/pdf")}
+    data = {"title": "Shared Ref Paper"}
+
+    ref_res = client.post(f"/api/v1/subjects/{subj1['id']}/reference-papers", data=data, files=files, headers=headers)
+    assert ref_res.status_code == status.HTTP_201_CREATED
+    ref_paper = ref_res.json()
+
+    # Workspace 2 & Subject 2
+    ws2 = client.post("/api/v1/workspaces", json={"name": "WS 2"}, headers=headers).json()
+    subj2 = client.post(f"/api/v1/workspaces/{ws2['id']}/subjects", json={"name": "Subj 2"}, headers=headers).json()
+    book2 = client.post(f"/api/v1/subjects/{subj2['id']}/books", json={"name": "Book 2"}, headers=headers).json()
+    ch2 = client.post(f"/api/v1/books/{book2['id']}/chapters", json={"name": "Ch 2", "chapter_number": 1}, headers=headers).json()
+
+    # 1. User lists reference papers for Subject 2 in Workspace 2 -> sees ref_paper from WS 1
+    list_res = client.get(f"/api/v1/subjects/{subj2['id']}/reference-papers", headers=headers)
+    assert list_res.status_code == 200
+    p_ids = [p["id"] for p in list_res.json()]
+    assert ref_paper["id"] in p_ids
+
+    # 3. User generates paper in Workspace 2 / Subject 2 using ref_paper from Workspace 1
+    gen_payload = {
+        "book_id": book2["id"],
+        "selected_chapter_ids": [ch2["id"]],
+        "generation_mode": "REFERENCE",
+        "reference_paper_id": ref_paper["id"],
+        "total_marks": 20,
+    }
+
+    from app.services.ai.gemini_service import GeminiService
+    from app.services.paper.blueprint_service import BlueprintService, PaperBlueprint, SectionBlueprint, QuestionType
+
+    sec_a = [{"question_text": f"MCQ {i}", "question_type": "MCQ", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp"} for i in range(1, 11)]
+    mock_json = json.dumps({"sections": [{"section_name": "Section A", "questions": sec_a}]})
+
+    analyzed_bp = PaperBlueprint(
+        total_marks=20,
+        sections=[
+            SectionBlueprint(
+                name="Section A",
+                question_type=QuestionType.MCQ,
+                question_count=10,
+                marks_per_question=2,
+                total_section_marks=20,
+            )
+        ]
+    )
+
+    with patch.object(BlueprintService, "analyze_reference_paper", return_value=analyzed_bp), \
+         patch.object(GeminiService, "generate_response", return_value=mock_json):
+        res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers)
+
+    assert res.status_code == 201, res.text
+    paper = res.json()
+    assert paper["reference_paper_id"] == ref_paper["id"]
+

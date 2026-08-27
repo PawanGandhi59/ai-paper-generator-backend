@@ -43,20 +43,30 @@ class GeminiService(AIService):
         if not self.client:
             raise RuntimeError("GeminiService client is not initialized.")
 
-        try:
-            sys_instruct = system_instruction or RAG_SYSTEM_INSTRUCTION
-            config = types.GenerateContentConfig(system_instruction=sys_instruct, temperature=0.2)
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=config,
-            )
-            if not response or not response.text:
-                raise RuntimeError("Gemini API returned an empty text response.")
-            return response.text
-        except Exception as exc:
-            logger.error(f"Gemini API error during generate_response: {str(exc)}")
-            raise RuntimeError(f"AI service provider error: {str(exc)}")
+        sys_instruct = system_instruction or RAG_SYSTEM_INSTRUCTION
+        config = types.GenerateContentConfig(system_instruction=sys_instruct, temperature=0.2)
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=config,
+                )
+                if not response or not response.text:
+                    raise RuntimeError("Gemini API returned an empty text response.")
+                return response.text
+            except Exception as exc:
+                err_msg = str(exc)
+                if any(k in err_msg for k in ["429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE", "500", "502", "504"]):
+                    if attempt < max_retries - 1:
+                        import time
+                        logger.warning(f"Gemini API transient error hit ({err_msg[:60]}), backing off 3s (attempt {attempt + 1}/{max_retries})...")
+                        time.sleep(3)
+                        continue
+                logger.error(f"Gemini API error during generate_response: {str(exc)}")
+                raise RuntimeError(f"AI service provider error: {str(exc)}")
 
     def generate_with_context(
         self,
@@ -128,5 +138,27 @@ class GeminiService(AIService):
         except Exception as exc:
             logger.error(f"Gemini API error during multimodal generation: {str(exc)}")
             raise RuntimeError(f"AI service provider error: {str(exc)}")
+
+    def count_tokens(self, prompt: str, system_instruction: Optional[str] = None) -> int:
+        """
+        Calculates the exact input token count for prompt + system instruction using official Google GenAI SDK.
+        """
+        if not self.client:
+            raise RuntimeError("GeminiService client is not initialized.")
+
+        sys_instruct = system_instruction or RAG_SYSTEM_INSTRUCTION
+        combined_contents = f"{sys_instruct}\n\n{prompt}"
+
+        try:
+            res = self.client.models.count_tokens(
+                model=self.model_name,
+                contents=combined_contents,
+            )
+            if res and hasattr(res, "total_tokens") and res.total_tokens is not None:
+                return res.total_tokens
+        except Exception as exc:
+            logger.warning(f"Gemini SDK count_tokens API call failed ({exc}); using fallback token estimation.")
+
+        return len(combined_contents) // 4
 
 

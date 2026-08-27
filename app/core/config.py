@@ -16,6 +16,19 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
+    PASSWORD_RESET_OTP_EXPIRE_MINUTES: int = 10
+    PASSWORD_RESET_MAX_ATTEMPTS: int = 5
+    PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: int = 10
+    PASSWORD_RESET_RESEND_COOLDOWN_SECONDS: int = 60
+
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_EMAIL: str = "noreply@example.com"
+    SMTP_FROM_NAME: str = "AI Paper Generator"
+    SMTP_USE_TLS: bool = True
+
     GOOGLE_WEB_CLIENT_ID: str = ""
     GOOGLE_ANDROID_CLIENT_ID: str = ""
     GOOGLE_IOS_CLIENT_ID: str = ""

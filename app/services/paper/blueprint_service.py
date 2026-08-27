@@ -22,6 +22,8 @@ class SectionBlueprint(BaseModel):
     has_internal_choice: bool = Field(default=False, description="Whether questions in this section have internal choices (e.g. Q4(a) OR Q4(b))")
     alternatives_per_question: int = Field(default=1, ge=1, description="Number of alternatives per question number (1 if no internal choice, 2 for (a) OR (b))")
     choice_rule: Optional[str] = Field(default=None, description="Choice rule description, e.g. 'answer_one_of_two'")
+    numerical_question_count: int = Field(default=0, ge=0, description="Calculated count of numerical questions required in this section")
+    numerical_percentage: Optional[int] = Field(default=None, ge=1, le=100, description="Percentage of numerical questions in this section")
 
 
 class PaperBlueprint(BaseModel):
@@ -39,7 +41,7 @@ Return ONLY a JSON object with this exact structure:
   "sections": [
     {{
       "name": "<Section Name, e.g. Part A, Part B, Part C>",
-      "question_type": "<One of: MCQ, SHORT_ANSWER, LONG_ANSWER, NUMERICAL>",
+      "question_type": "<One of: MCQ, VERY_SHORT_ANSWER, SHORT_ANSWER, LONG_ANSWER, NUMERICAL>",
       "question_count": <number of distinct question numbers in this section as integer>,
       "marks_per_question": <marks assigned per single question number as integer>,
       "has_internal_choice": <true if questions have internal OR choices (e.g. Q4(a) OR Q4(b)), false otherwise>,
@@ -50,7 +52,7 @@ Return ONLY a JSON object with this exact structure:
   "sample_questions": [
     {{
       "section_name": "<Section Name>",
-      "question_type": "<MCQ | SHORT_ANSWER | LONG_ANSWER | NUMERICAL>",
+      "question_type": "<MCQ | VERY_SHORT_ANSWER | SHORT_ANSWER | LONG_ANSWER | NUMERICAL>",
       "question_text": "<Question text>",
       "marks": <marks>,
       "choice_group": "<Question number like Q4 if internal choice exists, null otherwise>",
@@ -65,7 +67,7 @@ CRITICAL BLUEPRINT RULES:
 3. total_section_marks MUST BE equal to question_count * marks_per_question (e.g., 5 questions * 7 marks = 35 marks). Alternatives (a OR b) do NOT multiply or inflate section marks.
 4. Total paper marks = sum of total_section_marks across all sections (e.g. Part A: 5x1=5, Part B: 5x4=20, Part C: 5x7=35 -> Total = 60).
 5. COMPLETE SECTION EXTRACTION: Read all pages carefully. Identify all sections from question numbering (e.g., Q1-Q5, Q6-Q10, Q11-Q15), even if explicit section header labels (such as Part C) are missing or faint in OCR text. In standard 60-mark examination papers with Part A (5x1=5) and Part B (5x4=20), Part C questions Q11 to Q15 are 7 marks each (5x7=35 marks; Total = 60).
-6. QUESTION TYPES: Classify question_type based on section style: 1-4 mark questions are SHORT_ANSWER, 5+ mark questions are LONG_ANSWER. Part A (1m) and Part B (4m) are SHORT_ANSWER, while Part C (7m) is LONG_ANSWER.
+6. QUESTION TYPES: Classify question_type based on section style: 1 mark direct answers are VERY_SHORT_ANSWER, 2-4 mark questions are SHORT_ANSWER, 5+ mark questions are LONG_ANSWER. Part A (1m) is VERY_SHORT_ANSWER, Part B (4m) is SHORT_ANSWER, while Part C (7m) is LONG_ANSWER.
 
 Examination Paper Text:
 ---
@@ -124,11 +126,17 @@ class BlueprintService:
         self,
         question_configs: List[QuestionConfigItem],
         total_marks: int,
+        enable_numerical_percentage: bool = False,
+        numerical_percentage: Optional[int] = None,
     ) -> PaperBlueprint:
         """
         Constructs a PaperBlueprint from user-provided question_configs (CUSTOM mode).
         Validates that sum(question_count * marks_per_question) == total_marks.
+        If enable_numerical_percentage is True and numerical_percentage is provided (e.g. 20%),
+        computes numerical_question_count for each section.
         """
+        import math
+
         if not question_configs:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -140,10 +148,19 @@ class BlueprintService:
             sec_name = cfg.section_name or f"Section {chr(65 + idx)}"
             sec_marks = cfg.question_count * cfg.marks_per_question
 
-            alts = cfg.alternatives or cfg.alternatives_per_question
-            has_choice = bool(cfg.has_internal_choice) or (alts > 1)
-            alts_per_q = max(alts, 2) if has_choice else 1
-            c_rule = cfg.choice_rule or ("answer_one_of_two" if has_choice else None)
+            alts_per_q = max(cfg.alternatives_per_question, 1)
+            has_choice = alts_per_q > 1
+            c_rule = "answer_one_of_two" if has_choice else None
+
+            num_count = 0
+            num_pct = None
+            if enable_numerical_percentage and numerical_percentage and numerical_percentage > 0:
+                num_pct = numerical_percentage
+                # Calculate required numerical questions in section based on percentage
+                calc_val = (cfg.question_count * numerical_percentage) / 100.0
+                num_count = max(1, math.ceil(calc_val)) if calc_val > 0 else 0
+                if num_count > cfg.question_count:
+                    num_count = cfg.question_count
 
             sections.append(
                 SectionBlueprint(
@@ -155,6 +172,8 @@ class BlueprintService:
                     has_internal_choice=has_choice,
                     alternatives_per_question=alts_per_q,
                     choice_rule=c_rule,
+                    numerical_question_count=num_count,
+                    numerical_percentage=num_pct,
                 )
             )
 

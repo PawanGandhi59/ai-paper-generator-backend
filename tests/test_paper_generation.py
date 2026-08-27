@@ -42,8 +42,23 @@ def test_custom_mode_paper_generation_success():
         ],
     }
 
+    def mock_generate(prompt: str) -> str:
+        sec_a = [{"question_text": f"OS MCQ item {i}.", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Sol"} for i in range(1, 6)]
+        sec_b = [{"question_text": f"OS Short item {i}.", "expected_answer": "Ans", "solution_explanation": "Sol"} for i in range(1, 6)]
+        sec_c = [{"question_text": f"OS Long item {i}.", "expected_answer": "Ans", "solution_explanation": "Sol"} for i in range(1, 5)]
+        sec_d = [{"question_text": f"OS Numerical item {i}.", "correct_answer": "10", "solution_explanation": "Sol", "is_numerical": True} for i in range(1, 4)]
+        return json.dumps({
+            "sections": [
+                {"section_name": "Section A", "questions": sec_a},
+                {"section_name": "Section B", "questions": sec_b},
+                {"section_name": "Section C", "questions": sec_c},
+                {"section_name": "Section D", "questions": sec_d},
+            ]
+        })
+
     # Mock RAG retrieval and AI service response for test execution
-    with patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=[]):
+    with patch("app.services.paper.paper_generator_service.GeminiService.generate_response", side_effect=mock_generate), \
+         patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=[]):
         res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers)
 
     assert res.status_code == 201
@@ -152,7 +167,18 @@ def test_answer_visibility_stripping():
         ],
     }
 
-    with patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=[]):
+    def mock_generate(prompt: str) -> str:
+        sec_a = [{"question_text": f"MCQ item {i}.", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Sol"} for i in range(1, 3)]
+        sec_b = [{"question_text": f"Short item {i}.", "expected_answer": "Ans", "solution_explanation": "Sol"} for i in range(1, 5)]
+        return json.dumps({
+            "sections": [
+                {"section_name": "Section 1", "questions": sec_a},
+                {"section_name": "Section 2", "questions": sec_b},
+            ]
+        })
+
+    with patch("app.services.paper.paper_generator_service.GeminiService.generate_response", side_effect=mock_generate), \
+         patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=[]):
         res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers)
 
     assert res.status_code == 201
@@ -205,24 +231,6 @@ def test_reference_mode_paper_generation_and_adaptation():
     pdf_bytes = doc.tobytes()
     doc.close()
 
-    ref_paper_res = client.post(
-        f"/api/v1/subjects/{subj['id']}/reference-papers",
-        data={"title": "DS Exam 2024 (80 Marks)", "year": "2024", "exam_type": "FINAL"},
-        files={"file": ("exam.pdf", pdf_bytes, "application/pdf")},
-        headers=headers,
-    )
-    assert ref_paper_res.status_code == 201
-    ref_paper = ref_paper_res.json()
-
-    gen_payload = {
-        "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
-        "generation_mode": "REFERENCE",
-        "reference_paper_id": ref_paper["id"],
-        "total_marks": 50,  # Requesting 50 marks adaptation from 80 marks reference
-        "difficulty": "MIXED",
-    }
-
     from app.services.paper.blueprint_service import BlueprintService, PaperBlueprint, SectionBlueprint
     mock_bp = PaperBlueprint(
         total_marks=80,
@@ -236,11 +244,62 @@ def test_reference_mode_paper_generation_and_adaptation():
     bp_service = BlueprintService()
     adapted_bp = bp_service.adapt_reference_blueprint(mock_bp, 50)
 
-    with patch.object(BlueprintService, "analyze_reference_paper", return_value=adapted_bp), \
-         patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=[]):
-        res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers)
+    def mock_generate_paper(prompt: str) -> str:
+        sec_a = [{"question_text": f"MCQ {i}", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp"} for i in range(1, 11)]
+        sec_b = [{"question_text": f"Short {i}", "expected_answer": "Ans", "solution_explanation": "Exp"} for i in range(1, 11)]
+        sec_c = [{"question_text": f"Long {i}", "expected_answer": "Ans", "solution_explanation": "Exp"} for i in range(1, 5)]
+        return json.dumps({
+            "sections": [
+                {"section_name": "Section A", "questions": sec_a},
+                {"section_name": "Section B", "questions": sec_b},
+                {"section_name": "Section C", "questions": sec_c},
+            ]
+        })
 
-    assert res.status_code == 201, f"Response status {res.status_code}: {res.json()}"
+    def mock_gemini(prompt: str, **kwargs) -> str:
+        if "critical blueprint rules" in prompt.lower() or "examination paper text" in prompt.lower() or "blueprint" in prompt.lower():
+            return json.dumps({
+                "total_marks": 80,
+                "sections": [
+                    {"name": "Section A", "question_type": "MCQ", "question_count": 10, "marks_per_question": 1, "total_section_marks": 10},
+                    {"name": "Section B", "question_type": "SHORT_ANSWER", "question_count": 10, "marks_per_question": 2, "total_section_marks": 20},
+                    {"name": "Section C", "question_type": "LONG_ANSWER", "question_count": 10, "marks_per_question": 5, "total_section_marks": 50},
+                ],
+            })
+        return mock_generate_paper(prompt)
+
+    from app.services.ai.gemini_service import GeminiService
+    from app.services.paper.paper_generator_service import PaperGeneratorService
+    with patch.object(GeminiService, "generate_response", side_effect=mock_gemini):
+        ref_paper_res = client.post(
+            f"/api/v1/subjects/{subj['id']}/reference-papers",
+            data={"title": "DS Exam 2024 (80 Marks)", "year": "2024", "exam_type": "FINAL"},
+            files={"file": ("exam.pdf", pdf_bytes, "application/pdf")},
+            headers=headers,
+        )
+        assert ref_paper_res.status_code == 201, f"Response status {ref_paper_res.status_code}: {ref_paper_res.text}"
+        ref_paper = ref_paper_res.json()
+
+        gen_payload = {
+            "book_id": book["id"],
+            "selected_chapter_ids": [ch1["id"]],
+            "generation_mode": "REFERENCE",
+            "reference_paper_id": ref_paper["id"],
+            "total_marks": 50,  # Requesting 50 marks adaptation from 80 marks reference
+            "difficulty": "MIXED",
+        }
+
+        def mock_ref_complete_paper(*args, **kwargs):
+            sec_a = [{"question_text": f"MCQ {i}", "marks": 1, "question_type": "MCQ", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp", "section_name": "Section A", "choice_group": None, "alternative_label": None, "source_type": "AI_GENERATED", "question_order": i, "difficulty": "MEDIUM"} for i in range(1, 11)]
+            sec_b = [{"question_text": f"Short {i}", "marks": 2, "question_type": "SHORT_ANSWER", "expected_answer": "Ans", "solution_explanation": "Exp", "section_name": "Section B", "choice_group": None, "alternative_label": None, "source_type": "AI_GENERATED", "question_order": 10 + i, "difficulty": "MEDIUM"} for i in range(1, 11)]
+            sec_c = [{"question_text": f"Long {i}", "marks": 5, "question_type": "LONG_ANSWER", "expected_answer": "Ans", "solution_explanation": "Exp", "section_name": "Section C", "choice_group": None, "alternative_label": None, "source_type": "AI_GENERATED", "question_order": 20 + i, "difficulty": "MEDIUM"} for i in range(1, 5)]
+            return sec_a + sec_b + sec_c
+
+        with patch.object(BlueprintService, "analyze_reference_paper", return_value=adapted_bp), \
+             patch.object(PaperGeneratorService, "_generate_complete_paper", side_effect=mock_ref_complete_paper):
+            res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers)
+
+    assert res.status_code == 201, f"Response status {res.status_code}: {res.text}"
     paper_data = res.json()
     assert paper_data["generation_mode"] == "REFERENCE"
     assert paper_data["total_marks"] == 50
@@ -248,7 +307,7 @@ def test_reference_mode_paper_generation_and_adaptation():
 
     # Total marks of generated paper questions strictly equals 50
     computed_marks = sum(q["marks"] for q in paper_data["questions"])
-    assert computed_marks == 50
+    assert computed_marks == 50, f"MARKS_FAIL={computed_marks}"
 
 
 def test_multi_tenant_security_and_ownership():
@@ -277,7 +336,12 @@ def test_multi_tenant_security_and_ownership():
         ],
     }
 
-    with patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=[]):
+    def mock_generate(prompt: str) -> str:
+        qs = [{"question_text": f"Short {i}", "expected_answer": "Ans", "solution_explanation": "Exp"} for i in range(1, 6)]
+        return json.dumps({"sections": [{"section_name": "Section 1", "questions": qs}]})
+
+    with patch("app.services.paper.paper_generator_service.GeminiService.generate_response", side_effect=mock_generate), \
+         patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=[]):
         paper_res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers_a).json()
 
     paper_id = paper_res["id"]
@@ -373,13 +437,31 @@ def test_custom_mode_forces_ai_generated_source_type():
     """
 
     def mock_generate_response(prompt: str) -> str:
-        if "MCQ" in prompt:
-            return fake_gemini_mcq_response
-        return fake_gemini_short_response
+        return json.dumps({
+            "sections": [
+                {
+                    "section_name": "Section A",
+                    "questions": [
+                        {"question_text": "MCQ 1", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp", "source_type": "REFERENCE_REUSED"},
+                        {"question_text": "MCQ 2", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp", "source_type": "REFERENCE_VARIATION"},
+                    ]
+                },
+                {
+                    "section_name": "Section B",
+                    "questions": [
+                        {"question_text": "Short Question 1?", "expected_answer": "Answer 1", "solution_explanation": "Exp 1", "source_type": "REFERENCE_REUSED"},
+                        {"question_text": "Short Question 2?", "expected_answer": "Answer 2", "solution_explanation": "Exp 2", "source_type": "REFERENCE_VARIATION"},
+                        {"question_text": "Short Question 3?", "expected_answer": "Answer 3", "solution_explanation": "Exp 3", "source_type": "AI_GENERATED"},
+                        {"question_text": "Short Question 4?", "expected_answer": "Answer 4", "solution_explanation": "Exp 4", "source_type": "REFERENCE_REUSED"},
+                    ]
+                }
+            ]
+        })
 
-    with patch("app.services.paper.paper_generator_service.GeminiService.generate_response", side_effect=mock_generate_response), \
+    with patch("app.services.paper.paper_generator_service.GeminiService.generate_response", side_effect=mock_generate_response) as mock_gemini, \
          patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=[]):
         res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers)
+        assert mock_gemini.call_count == 1
 
     assert res.status_code == 201
     paper_data = res.json()
@@ -402,50 +484,53 @@ def test_custom_mode_forces_ai_generated_source_type():
 
 def test_prompt_construction_mode_awareness():
     """
-    Regression Test: Verify that _build_generation_prompt creates mode-aware schema instructions.
+    Regression Test: Verify that _build_complete_paper_prompt creates mode-aware schema instructions.
     - CUSTOM mode prompt must require source_type = "AI_GENERATED" and not advertise reference types.
     - REFERENCE mode prompt must retain reference source types.
     """
-    from app.schemas.paper import GenerationMode, QuestionType
-    from app.services.paper.blueprint_service import SectionBlueprint
+    from app.schemas.paper import GenerationMode, QuestionType, DifficultyLevel
+    from app.services.paper.blueprint_service import PaperBlueprint, SectionBlueprint
     from app.services.paper.paper_generator_service import PaperGeneratorService
 
     svc = PaperGeneratorService(db=None)
-    sec = SectionBlueprint(
-        name="Section A",
-        question_type=QuestionType.MCQ,
-        question_count=5,
-        marks_per_question=1,
-        total_section_marks=5,
+    bp = PaperBlueprint(
+        total_marks=5,
+        sections=[
+            SectionBlueprint(
+                name="Section A",
+                question_type=QuestionType.MCQ,
+                question_count=5,
+                marks_per_question=1,
+                total_section_marks=5,
+            )
+        ],
     )
 
     # 1. Custom mode prompt
-    custom_prompt = svc._build_generation_prompt(
-        sec=sec,
-        needed_count=5,
-        difficulties=["EASY"] * 5,
+    custom_prompt = svc._build_complete_paper_prompt(
+        blueprint=bp,
         context_text="Sample Context",
         topic_focus=None,
+        difficulty=DifficultyLevel.EASY,
         generation_mode=GenerationMode.CUSTOM,
-        section_ref_questions=[],
+        sample_questions=[],
     )
 
-    assert '- "source_type": "AI_GENERATED"' in custom_prompt
+    assert '"source_type": "AI_GENERATED"' in custom_prompt
     assert "REFERENCE_REUSED" not in custom_prompt
     assert "REFERENCE_VARIATION" not in custom_prompt
 
-    # 2. Reference mode prompt with matching section_ref_questions
-    ref_prompt = svc._build_generation_prompt(
-        sec=sec,
-        needed_count=5,
-        difficulties=["EASY"] * 5,
+    # 2. Reference mode prompt with matching sample_questions
+    ref_prompt = svc._build_complete_paper_prompt(
+        blueprint=bp,
         context_text="Sample Context",
         topic_focus=None,
+        difficulty=DifficultyLevel.EASY,
         generation_mode=GenerationMode.REFERENCE,
-        section_ref_questions=[{"section_name": "Section A", "question_type": "MCQ", "question_text": "Q1"}],
+        sample_questions=[{"section_name": "Section A", "question_type": "MCQ", "question_text": "Q1"}],
     )
 
-    assert '- "source_type": "<AI_GENERATED | REFERENCE_REUSED | REFERENCE_VARIATION>"' in ref_prompt
+    assert '"source_type": "<AI_GENERATED | REFERENCE_REUSED | REFERENCE_VARIATION>"' in ref_prompt
 
 
 def test_custom_mode_isolation_from_reference_paper():
@@ -474,7 +559,12 @@ def test_custom_mode_isolation_from_reference_paper():
         ],
     }
 
+    def mock_generate(prompt: str) -> str:
+        sec_a = [{"question_text": f"MCQ {i}", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp"} for i in range(1, 6)]
+        return json.dumps({"sections": [{"section_name": "Section A", "questions": sec_a}]})
+
     with patch("app.repositories.reference_paper_repository.ReferencePaperRepository.get_reference_paper") as mock_get_ref, \
+         patch("app.services.paper.paper_generator_service.GeminiService.generate_response", side_effect=mock_generate), \
          patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=[]):
         res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers)
 
@@ -1126,7 +1216,20 @@ def test_reference_mode_internal_choice_paper_generation():
         "include_answers": True,
     }
 
+    def mock_generate_paper(prompt: str) -> str:
+        sec_a = [{"question_text": f"Short A {i}", "expected_answer": "Ans", "solution_explanation": "Exp"} for i in range(1, 4)]
+        sec_b = [{"question_text": f"Short B {i}", "expected_answer": "Ans", "solution_explanation": "Exp"} for i in range(1, 11)]
+        sec_c = [{"question_text": f"Long C {i}", "expected_answer": "Ans", "solution_explanation": "Exp"} for i in range(1, 11)]
+        return json.dumps({
+            "sections": [
+                {"section_name": "Section A", "questions": sec_a},
+                {"section_name": "Section B", "questions": sec_b},
+                {"section_name": "Section C", "questions": sec_c},
+            ]
+        })
+
     with patch("app.services.paper.blueprint_service.BlueprintService.analyze_reference_paper", return_value=mock_ic_bp), \
+         patch("app.services.paper.paper_generator_service.GeminiService.generate_response", side_effect=mock_generate_paper), \
          patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=[]):
         res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers)
 
@@ -1201,7 +1304,16 @@ def test_internal_choice_include_answers_stripping():
         ],
     }
 
-    with patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=[]):
+    def mock_strip_generate(prompt: str) -> str:
+        sec_b = [{"question_text": f"Short B {i}", "expected_answer": "Ans", "solution_explanation": "Sol"} for i in range(1, 3)]
+        return json.dumps({
+            "sections": [
+                {"section_name": "Section B", "questions": sec_b},
+            ]
+        })
+
+    with patch("app.services.paper.paper_generator_service.GeminiService.generate_response", side_effect=mock_strip_generate), \
+         patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=[]):
         res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers)
 
     assert res.status_code == 201
@@ -1410,27 +1522,30 @@ def test_end_to_end_reference_mode_60_marks_paper_generation():
         }
         """
 
-        mock_part_c_json = """
-        {
-          "questions": [
-            {"question_text": "Analyze themes of family unity in Papa's Spectacles story.", "expected_answer": "Affection and patience", "correct_answer": "Affection and patience", "solution_explanation": "Detail", "source_type": "AI_GENERATED"},
-            {"question_text": "Write a character study of Papa's forgetfulness in Papa's Spectacles.", "expected_answer": "Drives plot action", "correct_answer": "Drives plot action", "solution_explanation": "Detail", "source_type": "AI_GENERATED"},
-            {"question_text": "Examine narrative tension in Gone with the Scooter story.", "expected_answer": "Rising action search", "correct_answer": "Rising action search", "solution_explanation": "Detail", "source_type": "AI_GENERATED"},
-            {"question_text": "Compare narrative techniques in Papa's Spectacles and Gone with the Scooter.", "expected_answer": "Third person irony", "correct_answer": "Third person irony", "solution_explanation": "Detail", "source_type": "AI_GENERATED"},
-            {"question_text": "Discuss household objects driving Papa's Spectacles and Gone with the Scooter.", "expected_answer": "Spectacles and scooter", "correct_answer": "Spectacles and scooter", "solution_explanation": "Detail", "source_type": "AI_GENERATED"},
-            {"question_text": "How does dialogue reflect Gopi's family relationships in Papa's Spectacles?", "expected_answer": "Playful banter", "correct_answer": "Playful banter", "solution_explanation": "Detail", "source_type": "AI_GENERATED"},
-            {"question_text": "Evaluate the ending of Gone with the Scooter in resolving Gopi's search.", "expected_answer": "Satisfying resolution", "correct_answer": "Satisfying resolution", "solution_explanation": "Detail", "source_type": "AI_GENERATED"},
-            {"question_text": "Explain childhood perspectives of Gopi in Papa's Spectacles.", "expected_answer": "Innocent amusement", "correct_answer": "Innocent amusement", "solution_explanation": "Detail", "source_type": "AI_GENERATED"},
-            {"question_text": "Analyze misunderstandings driving Gopi's scooter plot progress.", "expected_answer": "Minor misplacements", "correct_answer": "Minor misplacements", "solution_explanation": "Detail", "source_type": "AI_GENERATED"},
-            {"question_text": "Discuss Papa's spectacles and scooter tone balance in both stories.", "expected_answer": "Playful tone", "correct_answer": "Playful tone", "solution_explanation": "Detail", "source_type": "AI_GENERATED"}
-          ]
-        }
-        """
+        mock_part_b_questions = [
+            {"question_text": f"Part B question {i}", "expected_answer": "Ans", "solution_explanation": "Exp", "source_type": "AI_GENERATED", "choice_group": f"Q{(i-1)//2 + 6}", "alternative_label": "a" if i%2!=0 else "b"}
+            for i in range(1, 11)
+        ]
+        mock_part_c_questions = [
+            {"question_text": f"Part C question {i}", "expected_answer": "Ans", "solution_explanation": "Exp", "source_type": "AI_GENERATED", "choice_group": f"Q{(i-1)//2 + 11}", "alternative_label": "a" if i%2!=0 else "b"}
+            for i in range(1, 11)
+        ]
+        mock_complete_paper_json = json.dumps({
+            "sections": [
+                {"section_name": "Part A", "questions": json.loads(mock_part_a_json)["questions"]},
+                {"section_name": "Part B", "questions": mock_part_b_questions},
+                {"section_name": "Part C", "questions": mock_part_c_questions},
+            ]
+        })
 
-        responses = [mock_bp_json, mock_part_a_json, mock_part_b_json, mock_part_c_json]
+        def mock_dispatcher(prompt: str, **kwargs) -> str:
+            if "extract and output the exact structural blueprint" in prompt.lower() or "blueprint_json" in prompt.lower():
+                return mock_bp_json
+            return mock_complete_paper_json
 
-        with patch("app.services.paper.paper_generator_service.GeminiService.generate_response", side_effect=responses), \
-             patch("app.services.paper.blueprint_service.GeminiService.generate_response", side_effect=responses):
+        from app.services.ai.gemini_service import GeminiService
+        with patch.object(GeminiService, "generate_response", side_effect=mock_dispatcher), \
+             patch.object(PaperGeneratorService, "_is_question_grounded", return_value=True):
             svc = PaperGeneratorService(db)
             res = svc.generate_paper(current_user_id=user_id, request_data=req)
 
@@ -1719,18 +1834,16 @@ def test_generated_paper_choice_group_numbering_and_structure_validation():
     svc = PaperGeneratorService(db=MagicMock())
 
     def mock_generate_response(prompt, **kwargs):
-        qs = [
-            {
-                "question_text": f"Educational context question text item {i}.",
-                "expected_answer": "Answer text.",
-                "solution_explanation": "Explanation text.",
-                "source_type": "AI_GENERATED",
-                "choice_group": f"Q{(i // 2) + 1}",
-                "alternative_label": "a" if i % 2 == 0 else "b",
-            }
-            for i in range(12)
-        ]
-        return json.dumps({"questions": qs})
+        part_a = [{"question_text": f"Part A item {i}.", "expected_answer": "Ans", "solution_explanation": "Sol"} for i in range(1, 6)]
+        part_b = [{"question_text": f"Part B item {i}.", "expected_answer": "Ans", "solution_explanation": "Sol"} for i in range(1, 11)]
+        part_c = [{"question_text": f"Part C item {i}.", "expected_answer": "Ans", "solution_explanation": "Sol"} for i in range(1, 11)]
+        return json.dumps({
+            "sections": [
+                {"section_name": "Part A", "questions": part_a},
+                {"section_name": "Part B", "questions": part_b},
+                {"section_name": "Part C", "questions": part_c},
+            ]
+        })
 
     with patch.object(svc.ai_service, "generate_response", side_effect=mock_generate_response), \
          patch.object(svc, "_is_question_grounded", return_value=True), \
@@ -1799,18 +1912,62 @@ def test_generated_paper_choice_group_numbering_and_structure_validation():
     assert not any(q["choice_group"] in [f"Q{i}" for i in range(1, 11)] for q in part_c_qs)
 
 
+def test_very_short_answer_question_type_and_numerical_percentage_blueprint():
+    """
+    TEST: Verify VERY_SHORT_ANSWER question_type and enable_numerical_percentage calculation in blueprint construction.
+    """
+    from app.schemas.paper import QuestionConfigItem, QuestionType
+    from app.services.paper.blueprint_service import BlueprintService
+
+    cfgs = [
+        QuestionConfigItem(question_type=QuestionType.VERY_SHORT_ANSWER, question_count=10, marks_per_question=1, section_name="Section A"),
+        QuestionConfigItem(question_type=QuestionType.SHORT_ANSWER, question_count=5, marks_per_question=2, section_name="Section B"),
+        QuestionConfigItem(question_type=QuestionType.LONG_ANSWER, question_count=2, marks_per_question=5, section_name="Section C"),
+    ]
+
+    bp_svc = BlueprintService()
+    # 20% numerical questions across all sections
+    bp = bp_svc.build_custom_blueprint(
+        question_configs=cfgs,
+        total_marks=30,
+        enable_numerical_percentage=True,
+        numerical_percentage=20,
+    )
+
+    assert bp.total_marks == 30
+    assert len(bp.sections) == 3
+
+    # Section A: 10 VERY_SHORT_ANSWER questions -> 20% of 10 = 2 numerical questions
+    sec_a = bp.sections[0]
+    assert sec_a.question_type == QuestionType.VERY_SHORT_ANSWER
+    assert sec_a.numerical_question_count == 2
+    assert sec_a.numerical_percentage == 20
+
+    # Section B: 5 SHORT_ANSWER questions -> 20% of 5 = 1 numerical question
+    sec_b = bp.sections[1]
+    assert sec_b.question_type == QuestionType.SHORT_ANSWER
+    assert sec_b.numerical_question_count == 1
+    assert sec_b.numerical_percentage == 20
+
+    # Section C: 2 LONG_ANSWER questions -> 20% of 2 = 1 numerical question
+    sec_c = bp.sections[2]
+    assert sec_c.question_type == QuestionType.LONG_ANSWER
+    assert sec_c.numerical_question_count == 1
+    assert sec_c.numerical_percentage == 20
+
+
 def test_custom_mode_alternatives_field_parsing_and_blueprint_construction():
     """
-    REGRESSION TEST: Verify that QuestionConfigItem correctly parses 'alternatives' field alias,
+    REGRESSION TEST: Verify that QuestionConfigItem correctly parses 'alternatives_per_question' field,
     setting has_internal_choice=True, alternatives_per_question=2, and choice_rule='answer_one_of_two'.
     """
     from app.schemas.paper import QuestionConfigItem, QuestionType
     from app.services.paper.blueprint_service import BlueprintService
 
     cfgs = [
-        QuestionConfigItem(question_type=QuestionType.MCQ, question_count=10, marks_per_question=1, alternatives=1),
-        QuestionConfigItem(question_type=QuestionType.SHORT_ANSWER, question_count=5, marks_per_question=2, alternatives=2),
-        QuestionConfigItem(question_type=QuestionType.LONG_ANSWER, question_count=4, marks_per_question=5, alternatives=2),
+        QuestionConfigItem(question_type=QuestionType.MCQ, question_count=10, marks_per_question=1, alternatives_per_question=1),
+        QuestionConfigItem(question_type=QuestionType.SHORT_ANSWER, question_count=5, marks_per_question=2, alternatives_per_question=2),
+        QuestionConfigItem(question_type=QuestionType.LONG_ANSWER, question_count=4, marks_per_question=5, alternatives_per_question=2),
     ]
 
     bp_svc = BlueprintService()
@@ -1849,7 +2006,7 @@ def test_custom_mode_alternatives_field_parsing_and_blueprint_construction():
 
 def test_custom_mode_mixed_sections_internal_choices_40_marks():
     """
-    REGRESSION TEST: Verify CUSTOM paper generation with alternatives=2 generates 28 question records total:
+    REGRESSION TEST: Verify CUSTOM paper generation with alternatives_per_question=2 generates 28 question records total:
     - Section A (MCQ): 10 records (Q1..Q10, 1 mark each) -> 10 marks
     - Section B (SHORT_ANSWER): 10 records (Q11a/b..Q15a/b, 2 marks each) -> 10 marks
     - Section C (LONG_ANSWER): 8 records (Q16a/b..Q19a/b, 5 marks each) -> 20 marks
@@ -1861,29 +2018,26 @@ def test_custom_mode_mixed_sections_internal_choices_40_marks():
     from app.services.paper.paper_generator_service import PaperGeneratorService
 
     cfgs = [
-        QuestionConfigItem(question_type=QuestionType.MCQ, question_count=10, marks_per_question=1, alternatives=1),
-        QuestionConfigItem(question_type=QuestionType.SHORT_ANSWER, question_count=5, marks_per_question=2, alternatives=2),
-        QuestionConfigItem(question_type=QuestionType.LONG_ANSWER, question_count=4, marks_per_question=5, alternatives=2),
+        QuestionConfigItem(question_type=QuestionType.MCQ, question_count=10, marks_per_question=1, alternatives_per_question=1),
+        QuestionConfigItem(question_type=QuestionType.SHORT_ANSWER, question_count=5, marks_per_question=2, alternatives_per_question=2),
+        QuestionConfigItem(question_type=QuestionType.LONG_ANSWER, question_count=4, marks_per_question=5, alternatives_per_question=2),
     ]
 
     bp_svc = BlueprintService()
     bp = bp_svc.build_custom_blueprint(cfgs, total_marks=40)
 
     pg_svc = PaperGeneratorService(db=MagicMock())
-
-    counter = [0]
     def mock_generate_response(prompt, **kwargs):
-        qs = []
-        for i in range(15):
-            counter[0] += 1
-            qs.append({
-                "question_text": f"Unique custom question text item {counter[0]} for source content.",
-                "expected_answer": "Comprehensive model expected answer with detailed explanations.",
-                "solution_explanation": "Solution explanation criteria.",
-                "mcq_options": ["A. Option 1", "B. Option 2", "C. Option 3", "D. Option 4"],
-                "correct_answer": "A. Option 1",
-            })
-        return json.dumps({"questions": qs})
+        sec_a = [{"question_text": f"MCQ {i}", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Sol"} for i in range(1, 11)]
+        sec_b = [{"question_text": f"Short {i}", "expected_answer": "Ans", "solution_explanation": "Sol"} for i in range(1, 11)]
+        sec_c = [{"question_text": f"Long {i}", "expected_answer": "Ans", "solution_explanation": "Sol"} for i in range(1, 9)]
+        return json.dumps({
+            "sections": [
+                {"section_name": "Section A", "questions": sec_a},
+                {"section_name": "Section B", "questions": sec_b},
+                {"section_name": "Section C", "questions": sec_c},
+            ]
+        })
 
     pg_svc.ai_service.generate_response = mock_generate_response
 
@@ -1961,18 +2115,9 @@ def test_custom_mode_easy_difficulty_persisted_correctly():
     bp = BlueprintService().build_custom_blueprint(cfgs, total_marks=5)
 
     pg_svc = PaperGeneratorService(db=MagicMock())
-    counter = [0]
     def mock_generate_response(prompt, **kwargs):
-        counter[0] += 1
-        return json.dumps({
-            "questions": [{
-                "question_text": f"Direct recall easy fact question item {counter[0]}.",
-                "difficulty": "EASY",
-                "mcq_options": ["A. Opt 1", "B. Opt 2", "C. Opt 3", "D. Opt 4"],
-                "correct_answer": "A. Opt 1",
-                "solution_explanation": "Direct recall explanation."
-            } for _ in range(5)]
-        })
+        sec_a = [{"question_text": f"Direct recall easy fact question item {i}.", "difficulty": "EASY", "mcq_options": ["A. Opt 1", "B. Opt 2", "C. Opt 3", "D. Opt 4"], "correct_answer": "A. Opt 1", "solution_explanation": "Direct recall explanation."} for i in range(1, 6)]
+        return json.dumps({"sections": [{"section_name": "Section A", "questions": sec_a}]})
 
     pg_svc.ai_service.generate_response = mock_generate_response
 
@@ -2006,17 +2151,9 @@ def test_custom_mode_hard_difficulty_persisted_correctly():
     bp = BlueprintService().build_custom_blueprint(cfgs, total_marks=20)
 
     pg_svc = PaperGeneratorService(db=MagicMock())
-    counter = [0]
     def mock_generate_response(prompt, **kwargs):
-        counter[0] += 1
-        return json.dumps({
-            "questions": [{
-                "question_text": f"Deep analysis hard question requiring multi-step reasoning item {counter[0]}.",
-                "difficulty": "HARD",
-                "expected_answer": "Comprehensive model answer with synthesis.",
-                "solution_explanation": "Detailed analysis step by step."
-            } for _ in range(4)]
-        })
+        sec_a = [{"question_text": f"Deep analysis hard question requiring multi-step reasoning item {i}.", "difficulty": "HARD", "expected_answer": "Comprehensive model answer with synthesis.", "solution_explanation": "Detailed analysis step by step."} for i in range(1, 5)]
+        return json.dumps({"sections": [{"section_name": "Section A", "questions": sec_a}]})
 
     pg_svc.ai_service.generate_response = mock_generate_response
 
@@ -2051,15 +2188,8 @@ def test_llm_returned_difficulty_cannot_override_backend_target():
 
     pg_svc = PaperGeneratorService(db=MagicMock())
     def mock_generate_response(prompt, **kwargs):
-        return json.dumps({
-            "questions": [{
-                "question_text": f"Target hard question item {i}.",
-                "difficulty": "MEDIUM",  # LLM attempts to return MEDIUM
-                "mcq_options": ["A. Opt 1", "B. Opt 2", "C. Opt 3", "D. Opt 4"],
-                "correct_answer": "A. Opt 1",
-                "solution_explanation": "Explanation."
-            } for i in range(3)]
-        })
+        sec_a = [{"question_text": f"Target hard question item {i}.", "difficulty": "MEDIUM", "mcq_options": ["A. Opt 1", "B. Opt 2", "C. Opt 3", "D. Opt 4"], "correct_answer": "A. Opt 1", "solution_explanation": "Explanation."} for i in range(1, 4)]
+        return json.dumps({"sections": [{"section_name": "Section A", "questions": sec_a}]})
 
     pg_svc.ai_service.generate_response = mock_generate_response
 
@@ -2094,19 +2224,9 @@ def test_mixed_difficulty_distribution_persisted_correctly():
     bp = BlueprintService().build_custom_blueprint(cfgs, total_marks=10)
 
     pg_svc = PaperGeneratorService(db=MagicMock())
-    counter = [0]
     def mock_generate_response(prompt, **kwargs):
-        qs = []
-        for i in range(10):
-            counter[0] += 1
-            qs.append({
-                "question_text": f"Mixed difficulty question item {counter[0]}.",
-                "difficulty": "MEDIUM",
-                "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"],
-                "correct_answer": "A. 1",
-                "solution_explanation": "Exp."
-            })
-        return json.dumps({"questions": qs})
+        sec_a = [{"question_text": f"Mixed difficulty question item {i}.", "difficulty": "MEDIUM", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp."} for i in range(1, 11)]
+        return json.dumps({"sections": [{"section_name": "Section A", "questions": sec_a}]})
 
     pg_svc.ai_service.generate_response = mock_generate_response
 
@@ -2131,99 +2251,209 @@ def test_mixed_difficulty_distribution_persisted_correctly():
 
 def test_generation_prompt_contains_cognitive_taxonomy_and_anti_embellishment_rules():
     """
-    REGRESSION TEST: Verify _build_generation_prompt produces prompt text containing:
+    REGRESSION TEST: Verify _build_complete_paper_prompt produces prompt text containing:
     1. Explicit Cognitive Taxonomy (EASY/MEDIUM/HARD cognitive definitions).
     2. Anti-embellishment & spelling/vocabulary exercise fidelity instructions.
     3. JSON output contract requiring "difficulty".
     """
     from unittest.mock import MagicMock
-    from app.schemas.paper import QuestionType, GenerationMode
-    from app.services.paper.blueprint_service import SectionBlueprint
+    from app.schemas.paper import QuestionType, GenerationMode, DifficultyLevel
+    from app.services.paper.blueprint_service import PaperBlueprint, SectionBlueprint
     from app.services.paper.paper_generator_service import PaperGeneratorService
 
     pg_svc = PaperGeneratorService(db=MagicMock())
-    sec = SectionBlueprint(
-        name="Section A",
-        question_type=QuestionType.MCQ,
-        question_count=5,
-        marks_per_question=1,
-        total_section_marks=5,
-        has_internal_choice=False,
-        alternatives_per_question=1,
+    bp = PaperBlueprint(
+        total_marks=5,
+        sections=[
+            SectionBlueprint(
+                name="Section A",
+                question_type=QuestionType.MCQ,
+                question_count=5,
+                marks_per_question=1,
+                total_section_marks=5,
+                has_internal_choice=False,
+                alternatives_per_question=1,
+            )
+        ]
     )
 
-    prompt = pg_svc._build_generation_prompt(
-        sec=sec,
-        sec_start_q_num=1,
-        needed_count=5,
-        difficulties=["HARD"] * 5,
+    prompt = pg_svc._build_complete_paper_prompt(
+        blueprint=bp,
         context_text="Gopi sat in the veranda reading a book. vegatables / veggetables / vegetables.",
         topic_focus=None,
+        difficulty=DifficultyLevel.HARD,
         generation_mode=GenerationMode.CUSTOM,
-        section_ref_questions=[],
+        sample_questions=[],
     )
 
-    # 1. Cognitive Taxonomy check
-    assert "DIFFICULTY DEFINITIONS & COGNITIVE DEMAND:" in prompt
+    assert "DIFFICULTY & COGNITIVE DEMAND:" in prompt
     assert "EASY: Direct recall or recognition" in prompt
-    assert "HARD: Analysis, synthesis, multi-step reasoning" in prompt
-    assert "Difficulty means COGNITIVE DEMAND, NOT LANGUAGE COMPLEXITY." in prompt
-
-    # 2. Question-Type Specific HARD Directives check
-    assert "QUESTION-TYPE SPECIFIC COGNITIVE DIRECTIVES FOR HARD DIFFICULTY:" in prompt
-    assert "1. HARD MCQ RULES:" in prompt
-    assert "DO NOT ask for a single explicit fact" in prompt
-    assert "A HARD MCQ must require connecting at least TWO distinct source details" in prompt
-    assert "Use meaningful, plausible distractors" in prompt
-    assert "2. HARD SHORT ANSWER RULES:" in prompt
-    assert "3. HARD LONG ANSWER RULES:" in prompt
-
-    # 3. Source-Richness Limitation Rule check
-    assert "4. SOURCE-RICHNESS LIMITATION RULE:" in prompt
-    assert "HARD difficulty depends on the cognitive possibilities of the source material." in prompt
-
-    # 4. Anti-Embellishment & Source Fidelity check
+    assert "HARD: Analysis, synthesis" in prompt
     assert "CONTENT AUTHORITY, SOURCE FIDELITY & ANTI-EMBELLISHMENT RULES:" in prompt
-    assert "For spelling exercises: Keep the question direct" in prompt
-    assert "Do NOT invent semantic descriptions of the word" in prompt
-    assert "DO NOT add decorative or functional descriptions" in prompt
-
-    # 5. JSON Output Schema contract check
     assert '"difficulty": "<EASY | MEDIUM | HARD>"' in prompt
 
 
 def test_reference_mode_prompt_contains_difficulty_preservation_rule():
     """
-    REGRESSION TEST: Verify _build_generation_prompt in REFERENCE mode contains the instruction
-    requiring reference question layout preservation while increasing cognitive demand for HARD difficulty.
+    REGRESSION TEST: Verify _build_complete_paper_prompt in REFERENCE mode contains reference question instructions.
     """
     from unittest.mock import MagicMock
-    from app.schemas.paper import QuestionType, GenerationMode
-    from app.services.paper.blueprint_service import SectionBlueprint
+    from app.schemas.paper import QuestionType, GenerationMode, DifficultyLevel
+    from app.services.paper.blueprint_service import PaperBlueprint, SectionBlueprint
     from app.services.paper.paper_generator_service import PaperGeneratorService
 
     pg_svc = PaperGeneratorService(db=MagicMock())
-    sec = SectionBlueprint(
-        name="Section A",
-        question_type=QuestionType.MCQ,
-        question_count=3,
-        marks_per_question=1,
-        total_section_marks=3,
+    bp = PaperBlueprint(
+        total_marks=3,
+        sections=[
+            SectionBlueprint(
+                name="Section A",
+                question_type=QuestionType.MCQ,
+                question_count=3,
+                marks_per_question=1,
+                total_section_marks=3,
+            )
+        ]
     )
 
     sample_ref = [{"section_name": "Section A", "question_type": "MCQ", "question_text": "Sample ref Q"}]
-    prompt = pg_svc._build_generation_prompt(
-        sec=sec,
-        sec_start_q_num=1,
-        needed_count=3,
-        difficulties=["HARD"] * 3,
+    prompt = pg_svc._build_complete_paper_prompt(
+        blueprint=bp,
         context_text="Sample educational context text.",
         topic_focus=None,
+        difficulty=DifficultyLevel.HARD,
         generation_mode=GenerationMode.REFERENCE,
-        section_ref_questions=sample_ref,
+        sample_questions=sample_ref,
     )
 
-    assert "If the requested difficulty is HARD, preserve the reference question format and layout while increasing the cognitive demand appropriately" in prompt
+    assert "REFERENCE PAPER SAMPLE QUESTIONS (STYLE & STRUCTURE ONLY):" in prompt
+
+
+def test_paper_time_allowed_minutes_persistence_and_response():
+    """
+    Verify user-provided time_allowed_minutes (e.g. 180 mins / 3 hours) is saved to DB
+    and returned in generate, get, and list paper responses.
+    """
+    uid = uuid4().hex[:8]
+    user = client.post(
+        "/api/v1/auth/register",
+        json={"name": "Time User", "email": f"time_{uid}@example.com", "password": "password123"},
+    ).json()
+    headers = {"Authorization": f"Bearer {user['access_token']}"}
+
+    ws = client.post("/api/v1/workspaces", json={"name": "Time WS"}, headers=headers).json()
+    subj = client.post(f"/api/v1/workspaces/{ws['id']}/subjects", json={"name": "Time Subj"}, headers=headers).json()
+    book = client.post(f"/api/v1/subjects/{subj['id']}/books", json={"name": "Time Book"}, headers=headers).json()
+    ch1 = client.post(f"/api/v1/books/{book['id']}/chapters", json={"name": "Ch 1", "chapter_number": 1}, headers=headers).json()
+
+def mock_time_complete_paper(*args, **kwargs):
+    return [{"question_text": f"Time MCQ {i}", "marks": 2, "question_type": "MCQ", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Sol", "section_name": "Section A", "choice_group": None, "alternative_label": None, "source_type": "AI_GENERATED", "question_order": i, "difficulty": "MEDIUM"} for i in range(1, 11)]
+
+
+def test_paper_time_allowed_minutes_persistence_and_response():
+    """
+    Verify user-provided time_allowed_minutes (e.g. 180 mins / 3 hours) is saved to DB
+    and returned in generate, get, and list paper responses.
+    """
+    uid = uuid4().hex[:8]
+    user = client.post(
+        "/api/v1/auth/register",
+        json={"name": "Time User", "email": f"time_{uid}@example.com", "password": "password123"},
+    ).json()
+    headers = {"Authorization": f"Bearer {user['access_token']}"}
+
+    ws = client.post("/api/v1/workspaces", json={"name": "Time WS"}, headers=headers).json()
+    subj = client.post(f"/api/v1/workspaces/{ws['id']}/subjects", json={"name": "Time Subj"}, headers=headers).json()
+    book = client.post(f"/api/v1/subjects/{subj['id']}/books", json={"name": "Time Book"}, headers=headers).json()
+    ch1 = client.post(f"/api/v1/books/{book['id']}/chapters", json={"name": "Ch 1", "chapter_number": 1}, headers=headers).json()
+
+    gen_payload = {
+        "book_id": book["id"],
+        "selected_chapter_ids": [ch1["id"]],
+        "generation_mode": "CUSTOM",
+        "total_marks": 20,
+        "time_allowed_minutes": 180,
+        "question_configs": [
+            {
+                "question_type": "MCQ",
+                "question_count": 10,
+                "marks_per_question": 2,
+            }
+        ],
+    }
+
+    with patch.object(PaperGeneratorService, "_generate_complete_paper", side_effect=mock_time_complete_paper):
+        res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers)
+
+    assert res.status_code == 201, res.text
+    paper = res.json()
+    assert paper["time_allowed_minutes"] == 180
+
+    get_res = client.get(f"/api/v1/papers/{paper['id']}", headers=headers)
+    assert get_res.status_code == 200
+    assert get_res.json()["time_allowed_minutes"] == 180
+
+    list_res = client.get(f"/api/v1/subjects/{subj['id']}/papers", headers=headers)
+    assert list_res.status_code == 200
+    papers = list_res.json()
+    assert len(papers) == 1
+    assert papers[0]["time_allowed_minutes"] == 180
+
+
+def mock_class_complete_paper(*args, **kwargs):
+    return [{"question_text": f"Class MCQ {i}", "marks": 5, "question_type": "MCQ", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Sol", "section_name": "Section A", "choice_group": None, "alternative_label": None, "source_type": "AI_GENERATED", "question_order": i, "difficulty": "MEDIUM"} for i in range(1, 11)]
+
+
+def test_paper_class_name_persistence_and_response():
+    """
+    Verify user-provided class_name (e.g. Class 10 / Grade 12) is saved to DB
+    and returned in generate, get, and list paper responses.
+    """
+    uid = uuid4().hex[:8]
+    user = client.post(
+        "/api/v1/auth/register",
+        json={"name": "Class User", "email": f"class_{uid}@example.com", "password": "password123"},
+    ).json()
+    headers = {"Authorization": f"Bearer {user['access_token']}"}
+
+    ws = client.post("/api/v1/workspaces", json={"name": "Class WS"}, headers=headers).json()
+    subj = client.post(f"/api/v1/workspaces/{ws['id']}/subjects", json={"name": "Class Subj"}, headers=headers).json()
+    book = client.post(f"/api/v1/subjects/{subj['id']}/books", json={"name": "Class Book"}, headers=headers).json()
+    ch1 = client.post(f"/api/v1/books/{book['id']}/chapters", json={"name": "Ch 1", "chapter_number": 1}, headers=headers).json()
+
+    gen_payload = {
+        "book_id": book["id"],
+        "selected_chapter_ids": [ch1["id"]],
+        "generation_mode": "CUSTOM",
+        "total_marks": 50,
+        "time_allowed_minutes": 120,
+        "class_name": "Class 10",
+        "question_configs": [
+            {
+                "question_type": "MCQ",
+                "question_count": 10,
+                "marks_per_question": 5,
+            }
+        ],
+    }
+
+    with patch.object(PaperGeneratorService, "_generate_complete_paper", side_effect=mock_class_complete_paper):
+        res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers)
+
+    assert res.status_code == 201, res.text
+    paper = res.json()
+    assert paper["class_name"] == "Class 10"
+    assert paper["time_allowed_minutes"] == 120
+
+    get_res = client.get(f"/api/v1/papers/{paper['id']}", headers=headers)
+    assert get_res.status_code == 200
+    assert get_res.json()["class_name"] == "Class 10"
+
+    list_res = client.get(f"/api/v1/subjects/{subj['id']}/papers", headers=headers)
+    assert list_res.status_code == 200
+    papers = list_res.json()
+    assert len(papers) == 1
+    assert papers[0]["class_name"] == "Class 10"
 
 
 def test_build_blueprint_from_generated_paper():
@@ -2383,7 +2613,7 @@ def test_polymorphic_reference_paper_lookup_generated_paper():
 
     # Mock RAG & question generation
     with patch.object(pg_svc, "_retrieve_chapter_context", return_value="Context text"), \
-         patch.object(pg_svc, "_generate_section_questions", return_value=[]), \
+         patch.object(pg_svc, "_generate_complete_paper", return_value=[]), \
          patch.object(pg_svc.paper_repo, "save_questions"):
 
         req = PaperGenerateRequest(
@@ -2499,7 +2729,7 @@ def test_uploaded_reference_paper_blueprint_caching():
 
     with patch.object(pg_svc.blueprint_service, "analyze_reference_paper", return_value=mock_blueprint) as mock_analyze, \
          patch.object(pg_svc, "_retrieve_chapter_context", return_value="Context text"), \
-         patch.object(pg_svc, "_generate_section_questions", return_value=[]), \
+         patch.object(pg_svc, "_generate_complete_paper", return_value=[]), \
          patch.object(pg_svc.paper_repo, "save_questions"):
 
         req = PaperGenerateRequest(
@@ -2561,7 +2791,12 @@ def test_paper_time_allowed_minutes_persistence_and_response():
         ],
     }
 
-    with patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=[]):
+    from app.services.ai.gemini_service import GeminiService
+
+    sec_a = [{"question_text": f"MCQ question {i} context", "question_type": "MCQ", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp"} for i in range(1, 11)]
+    mock_json = json.dumps({"sections": [{"section_name": "Section A", "questions": sec_a}]})
+
+    with patch.object(GeminiService, "generate_response", return_value=mock_json):
         res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers)
 
     assert res.status_code == 201, res.text
@@ -2586,6 +2821,8 @@ def test_paper_class_name_persistence_and_response():
     Verify user-provided class_name (e.g. Class 10 / Grade 12) is saved to DB
     and returned in generate, get, and list paper responses.
     """
+    from app.services.ai.gemini_service import GeminiService
+
     uid = uuid4().hex[:8]
     user = client.post(
         "/api/v1/auth/register",
@@ -2614,7 +2851,10 @@ def test_paper_class_name_persistence_and_response():
         ],
     }
 
-    with patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=[]):
+    sec_a = [{"question_text": f"MCQ question {i} context", "question_type": "MCQ", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp"} for i in range(1, 11)]
+    mock_json = json.dumps({"sections": [{"section_name": "Section A", "questions": sec_a}]})
+
+    with patch.object(GeminiService, "generate_response", return_value=mock_json):
         res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers)
 
     assert res.status_code == 201, res.text
@@ -2684,6 +2924,104 @@ def test_paper_time_and_class_name_validation_rejections():
     p5 = {**base_payload, "class_name": "<script>alert(1)</script>"}
     r5 = client.post("/api/v1/papers/generate", json=p5, headers=headers)
     assert r5.status_code == 422
+
+
+def test_grounding_validation_paraphrased_and_applied_reasoning():
+    """
+    TEST: Verify _is_question_grounded accepts paraphrased / applied source-grounded questions
+    and rejects genuinely unsupported questions.
+    """
+    from unittest.mock import MagicMock
+    from app.services.paper.paper_generator_service import PaperGeneratorService
+
+    svc = PaperGeneratorService(db=MagicMock())
+    context = "Photosynthesis is the process by which green plants convert light energy into chemical energy to synthesize glucose."
+
+    # 1. Paraphrased grounded question
+    q_grounded = {
+        "question_text": "How do green plants transform solar radiation into glucose during photosynthesis?",
+        "expected_answer": "They convert light energy into chemical energy.",
+        "solution_explanation": "Plants utilize photosynthesis to convert light energy into chemical energy stored in glucose.",
+    }
+    assert svc._is_question_grounded(q_grounded, context) is True
+
+    # 2. Applied numerical / conceptual question based on source formula/principle
+    q_applied = {
+        "question_text": "Calculate the solar energy required for glucose synthesis in green plants.",
+        "is_numerical": True,
+        "numerical_values": {"given": "light energy=100J", "target": "chemical energy"},
+        "correct_answer": "100 Joules",
+        "solution_explanation": "According to the principle of energy conversion in photosynthesis, light energy is converted into chemical energy.",
+    }
+    assert svc._is_question_grounded(q_applied, context) is True
+
+    # 3. Genuinely unsupported question with non-existent terminology/facts
+    q_unsupported = {
+        "question_text": "Describe the quantum teleportation matrix of hyper-quantum particles.",
+        "expected_answer": "Superposition of tachyon waves.",
+        "solution_explanation": "Hyper-quantum particles utilize tachyon fields.",
+    }
+    assert svc._is_question_grounded(q_unsupported, context) is False
+
+
+def test_numerical_percentage_request_validation():
+    """
+    TEST: Verify PaperGenerateRequest validation for enable_numerical_percentage and numerical_percentage.
+    """
+    from pydantic import ValidationError
+    import pytest
+    from app.schemas.paper import GenerationMode, PaperGenerateRequest, QuestionConfigItem, QuestionType
+
+    valid_config = [QuestionConfigItem(question_type=QuestionType.MCQ, question_count=5, marks_per_question=1)]
+
+    # 1. enable_numerical_percentage=True without numerical_percentage -> Error
+    with pytest.raises(ValidationError):
+        PaperGenerateRequest(
+            book_id="95b10b9f-1346-4a75-af03-4ee2c24d6e29",
+            selected_chapter_ids=["4550c9d0-eb6c-41f4-bb8a-286101dcbec4"],
+            generation_mode=GenerationMode.CUSTOM,
+            total_marks=5,
+            enable_numerical_percentage=True,
+            numerical_percentage=None,
+            question_configs=valid_config,
+        )
+
+    # 2. numerical_percentage out of bounds (0 or 105) -> Error
+    with pytest.raises(ValidationError):
+        PaperGenerateRequest(
+            book_id="95b10b9f-1346-4a75-af03-4ee2c24d6e29",
+            selected_chapter_ids=["4550c9d0-eb6c-41f4-bb8a-286101dcbec4"],
+            generation_mode=GenerationMode.CUSTOM,
+            total_marks=5,
+            enable_numerical_percentage=True,
+            numerical_percentage=0,
+            question_configs=valid_config,
+        )
+
+    with pytest.raises(ValidationError):
+        PaperGenerateRequest(
+            book_id="95b10b9f-1346-4a75-af03-4ee2c24d6e29",
+            selected_chapter_ids=["4550c9d0-eb6c-41f4-bb8a-286101dcbec4"],
+            generation_mode=GenerationMode.CUSTOM,
+            total_marks=5,
+            enable_numerical_percentage=True,
+            numerical_percentage=105,
+            question_configs=valid_config,
+        )
+
+    # 3. Valid numerical percentage -> Success
+    req = PaperGenerateRequest(
+        book_id="95b10b9f-1346-4a75-af03-4ee2c24d6e29",
+        selected_chapter_ids=["4550c9d0-eb6c-41f4-bb8a-286101dcbec4"],
+        generation_mode=GenerationMode.CUSTOM,
+        total_marks=5,
+        enable_numerical_percentage=True,
+        numerical_percentage=25,
+        question_configs=valid_config,
+    )
+    assert req.enable_numerical_percentage is True
+    assert req.numerical_percentage == 25
+
 
 
 

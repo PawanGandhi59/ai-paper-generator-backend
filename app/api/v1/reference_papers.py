@@ -88,7 +88,7 @@ def list_reference_papers(
     db: Session = Depends(get_db),
 ) -> List[ReferencePaperResponse]:
     """
-    List all reference / past-year papers under a subject.
+    List all reference / past-year papers accessible to the user.
     """
     service = ReferencePaperService(db)
     papers = service.list_reference_papers(current_user_id=current_user.id, subject_id=subject_id)

@@ -67,3 +67,40 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     expires_in: int
     user: UserResponse
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v: str) -> str:
+        return v.strip()
+
+
+class ForgotPasswordResponse(BaseModel):
+    message: str
+
+
+class VerifyResetOTPRequest(BaseModel):
+    email: EmailStr
+    otp: str = Field(..., pattern=r"^\d{6}$")
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v: str) -> str:
+        return v.strip()
+
+
+class VerifyResetOTPResponse(BaseModel):
+    message: str
+    reset_token: str
+
+
+class ResetPasswordRequest(BaseModel):
+    reset_token: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=6, max_length=72)
+
+
+class ResetPasswordResponse(BaseModel):
+    message: str

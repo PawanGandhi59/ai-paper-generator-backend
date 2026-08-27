@@ -484,10 +484,13 @@ Workspace
 
 | Field | Type | Required? | Description |
 | :--- | :--- | :--- | :--- |
-| `question_type` | Enum String | **Yes** | `"MCQ"`, `"SHORT_ANSWER"`, `"LONG_ANSWER"`, `"FILL_IN_BLANKS"`, `"MATCH_FOLLOWING"`, `"NUMERICAL"`. |
+| `question_type` | Enum String | **Yes** | `"MCQ"`, `"VERY_SHORT_ANSWER"`, `"SHORT_ANSWER"`, `"LONG_ANSWER"`, `"NUMERICAL"`. |
 | `question_count` | Integer | **Yes** | Number of main questions in this section. |
 | `marks_per_question` | Integer | **Yes** | Marks awarded per question. |
-| `alternatives` | Integer | *Optional* | Alternatives per question for internal choice (defaults to `1` = no internal choice; `2` = Q(a) OR Q(b)). |
+| `alternatives_per_question` | Integer | *Optional* | Alternatives per question for internal choice (defaults to `1` = no internal choice; `2` = Q(a) OR Q(b)). |
+
+| `enable_numerical_percentage` | Boolean | *Optional* | Set `true` to generate a specific percentage of numerical questions in each section. Default `false`. |
+| `numerical_percentage` | Integer | *Optional* | Percentage (1-100%) of questions in each section that should be numerical problems (required when `enable_numerical_percentage` is `true`). |
 
 ---
 
@@ -503,24 +506,32 @@ Workspace
   "difficulty": "HARD",
   "topic_focus": null,
   "include_answers": true,
+  "enable_numerical_percentage": true,
+  "numerical_percentage": 20,
   "question_configs": [
     {
       "question_type": "MCQ",
       "question_count": 3,
       "marks_per_question": 1,
-      "alternatives": 1
+      "alternatives_per_question": 1
+    },
+    {
+      "question_type": "VERY_SHORT_ANSWER",
+      "question_count": 2,
+      "marks_per_question": 1,
+      "alternatives_per_question": 1
     },
     {
       "question_type": "SHORT_ANSWER",
-      "question_count": 2,
+      "question_count": 1,
       "marks_per_question": 2,
-      "alternatives": 1
+      "alternatives_per_question": 1
     },
     {
       "question_type": "LONG_ANSWER",
       "question_count": 1,
       "marks_per_question": 3,
-      "alternatives": 1
+      "alternatives_per_question": 2
     }
   ]
 }

@@ -1,6 +1,9 @@
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
 
+import secrets
+from uuid import UUID
+
 import httpx
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
@@ -8,6 +11,8 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.security import (
     create_access_token,
+    create_password_reset_token,
+    decode_password_reset_token,
     generate_refresh_token,
     get_password_hash,
     hash_refresh_token,
@@ -15,7 +20,21 @@ from app.core.security import (
 )
 from app.models.user import User
 from app.repositories.user_repository import UserRepository
-from app.schemas.auth import UserLogin, UserRegister, UserResponse, TokenResponse
+from app.schemas.auth import (
+    ForgotPasswordRequest,
+    ForgotPasswordResponse,
+    GoogleLogin,
+    RefreshTokenRequest,
+    ResetPasswordRequest,
+    ResetPasswordResponse,
+    TokenResponse,
+    UserLogin,
+    UserRegister,
+    UserResponse,
+    VerifyResetOTPRequest,
+    VerifyResetOTPResponse,
+)
+from app.services.email_service import EmailService
 
 
 def utc_now() -> datetime:
@@ -268,3 +287,180 @@ class AuthService:
         if token_obj and token_obj.revoked_at is None:
             self.user_repo.revoke_refresh_token(token_obj)
         return {"status": "ok", "message": "Successfully logged out."}
+
+    def forgot_password(self, data: ForgotPasswordRequest) -> ForgotPasswordResponse:
+        normalized_email = data.email.strip().lower()
+        user = self.user_repo.get_by_email(normalized_email)
+        if not user or not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No account found with this email address.",
+            )
+
+        success_message = "Password reset OTP has been sent to your email address."
+
+        # Resend cooldown check
+        latest_otp = self.user_repo.get_latest_otp_by_user_id(user.id)
+        if latest_otp and (utc_now() - latest_otp.created_at).total_seconds() < settings.PASSWORD_RESET_RESEND_COOLDOWN_SECONDS:
+            return ForgotPasswordResponse(message=success_message)
+
+        # Invalidate previous OTPs
+        self.user_repo.invalidate_user_otps(user.id)
+
+        # Generate secure 6-digit numeric OTP
+        plain_otp = f"{secrets.randbelow(1_000_000):06d}"
+        otp_hash = get_password_hash(plain_otp)
+        expires_at = utc_now() + timedelta(minutes=settings.PASSWORD_RESET_OTP_EXPIRE_MINUTES)
+
+        # Save OTP record
+        self.user_repo.create_password_reset_otp(
+            user_id=user.id,
+            otp_hash=otp_hash,
+            expires_at=expires_at,
+            max_attempts=settings.PASSWORD_RESET_MAX_ATTEMPTS,
+        )
+        self.db.commit()
+
+        # Send OTP email
+        email_service = EmailService()
+        try:
+            email_service.send_password_reset_otp(
+                recipient_email=user.email,
+                otp=plain_otp,
+                expires_in_minutes=settings.PASSWORD_RESET_OTP_EXPIRE_MINUTES,
+            )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).error(f"Password reset email delivery failed for user {user.id}: {exc}")
+
+        return ForgotPasswordResponse(message=success_message)
+
+    def verify_reset_otp(self, data: VerifyResetOTPRequest) -> VerifyResetOTPResponse:
+        normalized_email = data.email.strip().lower()
+        user = self.user_repo.get_by_email(normalized_email)
+        if not user or not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid OTP or request expired.",
+            )
+
+        otp = self.user_repo.get_latest_otp_by_user_id(user.id)
+        if not otp or otp.used_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid OTP or request expired.",
+            )
+
+        if otp.verified_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="OTP has already been verified.",
+            )
+
+        if otp.expires_at <= utc_now():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="OTP has expired.",
+            )
+
+        if otp.attempts >= otp.max_attempts:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Maximum verification attempts exceeded. Please request a new OTP.",
+            )
+
+        if not verify_password(data.otp, otp.otp_hash):
+            otp.attempts += 1
+            self.db.commit()
+            if otp.attempts >= otp.max_attempts:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Maximum verification attempts exceeded. Please request a new OTP.",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid OTP.",
+            )
+
+        # Mark OTP as verified
+        otp.verified_at = utc_now()
+        self.db.commit()
+
+        # Generate purpose-specific reset JWT
+        reset_token = create_password_reset_token(
+            data={"sub": str(user.id), "otp_id": str(otp.id)}
+        )
+
+        return VerifyResetOTPResponse(
+            message="OTP verified successfully.",
+            reset_token=reset_token,
+        )
+
+    def reset_password(self, data: ResetPasswordRequest) -> ResetPasswordResponse:
+        try:
+            payload = decode_password_reset_token(data.reset_token)
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or expired password reset token.",
+            )
+
+        user_id_str = payload.get("sub")
+        otp_id_str = payload.get("otp_id")
+        if not user_id_str or not otp_id_str:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or expired password reset token.",
+            )
+
+        try:
+            user_id = UUID(user_id_str)
+            otp_id = UUID(otp_id_str)
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or expired password reset token.",
+            )
+
+        user = self.user_repo.get_by_id(user_id)
+        otp = self.user_repo.get_otp_by_id(otp_id)
+        if not user or not user.is_active or not otp:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or expired password reset token.",
+            )
+
+        if otp.user_id != user.id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or expired password reset token.",
+            )
+
+        if otp.verified_at is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="OTP has not been verified.",
+            )
+
+        if otp.used_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Password reset token has already been used.",
+            )
+
+        if otp.expires_at <= utc_now():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Password reset token has expired.",
+            )
+
+        # Hash new password using existing bcrypt implementation
+        new_password_hash = get_password_hash(data.new_password)
+
+        # Execute transactional update & refresh token revocation
+        self.user_repo.update_user_password(user, new_password_hash)
+        otp.used_at = utc_now()
+        self.user_repo.revoke_all_user_refresh_tokens(user.id)
+        self.db.commit()
+
+        return ResetPasswordResponse(message="Password reset successfully.")
