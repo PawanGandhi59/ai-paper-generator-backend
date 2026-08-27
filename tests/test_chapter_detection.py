@@ -50,6 +50,23 @@ def test_chapter_schema_validation():
         ChapterUpdate(start_page=50, end_page=30)
 
 
+def test_build_page_header_context():
+    service = ChapterDetectionService()
+    doc_id = uuid.uuid4()
+    pages = [
+        DocumentPage(document_id=doc_id, page_number=1, text_content="Line 1\nLine 2\n\nLine 3\n" + "\n".join([f"Extra {i}" for i in range(20)])),
+        DocumentPage(document_id=doc_id, page_number=2, text_content="Page 2 Line 1\nPage 2 Line 2"),
+    ]
+    context = service._build_page_header_context(pages, max_lines_per_page=15)
+    assert "=== PAGE 1 ===" in context
+    assert "=== PAGE 2 ===" in context
+    assert "Line 1" in context
+    assert "Page 2 Line 1" in context
+    p1_block = context.split("=== PAGE 2 ===")[0]
+    p1_lines = p1_block.strip().splitlines()
+    assert len(p1_lines) <= 16
+
+
 def test_chapter_detection_toc_stage():
     pages = [
         DocumentPage(
