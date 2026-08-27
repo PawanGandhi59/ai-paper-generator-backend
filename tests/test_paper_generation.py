@@ -2549,6 +2549,7 @@ def test_polymorphic_reference_paper_lookup_generated_paper():
 
     pg_svc.workspace_service.get_book = MagicMock(return_value=mock_book)
     pg_svc.workspace_service.get_subject = MagicMock(return_value=mock_subject)
+    pg_svc.workspace_service.get_workspace = MagicMock(return_value=MagicMock(id=workspace_id))
     pg_svc.workspace_service.list_chapters = MagicMock(return_value=[mock_ch])
 
     # Reference mode lookup: ref_paper_repo returns None, paper_repo returns existing GeneratedPaper
@@ -2671,6 +2672,7 @@ def test_uploaded_reference_paper_blueprint_caching():
 
     pg_svc.workspace_service.get_book = MagicMock(return_value=mock_book)
     pg_svc.workspace_service.get_subject = MagicMock(return_value=mock_subject)
+    pg_svc.workspace_service.get_workspace = MagicMock(return_value=MagicMock(id=workspace_id))
     pg_svc.workspace_service.list_chapters = MagicMock(return_value=[mock_ch])
 
     # Uploaded PDF Reference Paper without cached blueprint_json (Cache Miss)

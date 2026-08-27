@@ -22,16 +22,19 @@ class ChapterDetectionResult(BaseModel):
 
 
 CHAPTER_DETECTION_SYSTEM_INSTRUCTION = """You are an expert textbook parser.
-Your task is to analyze document text or candidate chapter headings extracted from a textbook and return a structured JSON list of all actual chapters.
-For each chapter identified, extract:
-1. chapter_number: integer number of the chapter (1, 2, 3...).
-2. name: clean title of the chapter (excluding "Chapter 1:" prefix if present).
-3. start_page: 1-based page number where the chapter begins in the book.
+You are given a page-by-page header summary of a textbook. Each page block shows the page number and up to 15 non-empty lines from that page.
+
+Your task is to analyze all page headers and identify every page where a NEW GENUINE TEXTBOOK CHAPTER OR UNIT BEGINS.
+
+For each genuine chapter identified, return:
+1. chapter_number: Integer chapter number (1, 2, 3...).
+2. name: Clean chapter title / name (excluding "Chapter 1:" prefix if present).
+3. start_page: The exact 1-based page number where this chapter begins.
 
 Rules:
-- Do NOT invent fake chapters.
-- Only output genuine textbook chapters/units (do not include table of contents, preface, index, bibliography, or sub-sections as separate chapters).
-- Ensure chapter start_page values accurately reflect the starting page numbers provided in the input context.
+- Identify actual textbook chapters, units, modules, or main divisions.
+- Do NOT output table of contents, preface, index, bibliography, answer keys, or sub-sections as separate chapters.
+- Only mark a page as a start_page if a new chapter genuinely begins on that exact page number.
 - Output MUST strictly match the requested JSON schema.
 """
 
@@ -49,6 +52,22 @@ class ChapterDetectionService:
             logger.warning(f"Could not initialize GeminiService for chapter detection: {exc}")
             return None
 
+    def _build_page_header_context(
+        self, sorted_pages: List[DocumentPage], max_lines_per_page: int = 15
+    ) -> str:
+        """
+        Build a compact, deterministic page-header context across pages.
+        For every page: extracts up to 15 non-empty lines without truncation or character limits.
+        """
+        blocks = []
+        for page in sorted_pages:
+            text = page.text_content or ""
+            lines = [l.strip() for l in text.splitlines() if l.strip()][:max_lines_per_page]
+            page_text = "\n".join(lines) if lines else "(empty page)"
+            blocks.append(f"=== PAGE {page.page_number} ===\n{page_text}")
+
+        return "\n\n".join(blocks)
+
     def detect_chapters(self, pages: List[DocumentPage]) -> List[ChapterDetectionItem]:
         if not pages:
             logger.warning("Chapter detection called with empty pages list.")
@@ -58,34 +77,69 @@ class ChapterDetectionService:
         total_pages = len(sorted_pages)
 
         service = self._get_service()
-        if not service or not service.client:
-            logger.warning("GeminiService client unavailable. Skipping AI chapter detection.")
-            return []
+        detected_chapters = []
 
-        try:
-            # Stage 1: Search all pages for Table of Contents
-            toc_text = self._extract_toc_text(sorted_pages)
-            detected = []
+        # --- PRIMARY PATH: Gemini Page-Structure Detection ---
+        if service and service.client:
+            try:
+                detected_chapters = self._gemini_page_structure_detection(service, sorted_pages, total_pages)
+                if detected_chapters:
+                    logger.info("chapter_detection_method=GEMINI")
+                    return detected_chapters
+            except Exception as exc:
+                logger.warning(f"Gemini page-structure chapter detection failed: {exc}. Proceeding to regex fallback.")
 
-            if toc_text:
-                logger.info("Table of Contents detected. Attempting Stage 1 extraction.")
-                detected = self._call_gemini_detection(service, toc_text)
+        # --- FALLBACK PATH: Regex / TOC Detection ---
+        logger.info("chapter_detection_method=REGEX_FALLBACK")
+        return self._regex_fallback_detection(service, sorted_pages, total_pages)
 
-            # Stage 2: Fallback to scanning heading candidates across all pages if Stage 1 fails
-            if not detected:
-                logger.info("Stage 1 TOC detection returned no chapters. Proceeding to Stage 2 heading candidate scan.")
-                candidate_text = self._extract_heading_candidates(sorted_pages)
-                if candidate_text:
-                    detected = self._call_gemini_detection(service, candidate_text)
+    def _gemini_page_structure_detection(
+        self, service: GeminiService, sorted_pages: List[DocumentPage], total_pages: int
+    ) -> List[ChapterDetectionItem]:
+        """
+        Primary Gemini Chapter Detection pass using page-by-page header context.
+        Uses deterministic page batching if total token count exceeds single request context limits.
+        """
+        BATCH_SIZE = 250
+        raw_items: List[ChapterDetectionItem] = []
 
-            # Validate and clean up detected chapters
-            valid_chapters = self._validate_and_clean_chapters(detected, total_pages)
-            logger.info(f"Chapter detection completed. Found {len(valid_chapters)} valid chapters.")
-            return valid_chapters
+        if len(sorted_pages) <= BATCH_SIZE:
+            # Single call for normal-sized books
+            header_context = self._build_page_header_context(sorted_pages, max_lines_per_page=15)
+            items = self._call_gemini_detection(service, header_context)
+            raw_items.extend(items)
+        else:
+            # Deterministic page batching for large books
+            for i in range(0, len(sorted_pages), BATCH_SIZE):
+                batch_pages = sorted_pages[i : i + BATCH_SIZE]
+                header_context = self._build_page_header_context(batch_pages, max_lines_per_page=15)
+                items = self._call_gemini_detection(service, header_context)
+                raw_items.extend(items)
 
-        except Exception as exc:
-            logger.warning(f"AI Chapter Detection failed with error: {exc}. Falling back safely with zero detected chapters.")
-            return []
+        valid_chapters = self._validate_and_clean_chapters(raw_items, total_pages)
+        return valid_chapters
+
+    def _regex_fallback_detection(
+        self, service: Optional[GeminiService], sorted_pages: List[DocumentPage], total_pages: int
+    ) -> List[ChapterDetectionItem]:
+        """
+        Fallback path using Table of Contents / Heading Candidates regex extraction.
+        """
+        detected = []
+        if service and service.client:
+            try:
+                toc_text = self._extract_toc_text(sorted_pages)
+                if toc_text:
+                    detected = self._call_gemini_detection(service, toc_text)
+
+                if not detected:
+                    candidate_text = self._extract_heading_candidates(sorted_pages)
+                    if candidate_text:
+                        detected = self._call_gemini_detection(service, candidate_text)
+            except Exception as exc:
+                logger.warning(f"Regex fallback detection with Gemini failed: {exc}")
+
+        return self._validate_and_clean_chapters(detected, total_pages)
 
     def _extract_toc_text(self, pages: List[DocumentPage]) -> Optional[str]:
         toc_lines = []
@@ -110,7 +164,6 @@ class ChapterDetectionService:
 
                 if is_in_toc:
                     toc_lines.append(f"[Page {page.page_number}] {clean_line}")
-                    # Keep accumulating up to 500 lines of TOC
                     if len(toc_lines) > 500:
                         break
 
@@ -138,14 +191,12 @@ class ChapterDetectionService:
 
         for page in sorted_pages:
             lines = (page.text_content or "").splitlines()
-            # Inspect first 15 lines of each page for potential chapter titles
             top_lines = lines[:15]
             for idx, line in enumerate(top_lines):
                 clean_line = line.strip()
                 if not clean_line or len(clean_line) < 3 or len(clean_line) > 100:
                     continue
 
-                # Skip obvious exercise/question lines
                 if any(kw in clean_line.lower() for kw in exercise_keywords):
                     continue
 
@@ -155,7 +206,6 @@ class ChapterDetectionService:
                         candidates.append(f"--- Page {page.page_number} ---\n{top_12_text}")
                         break
 
-        # Truncate candidates if too large
         if len(candidates) > 200:
             candidates = candidates[:200]
 
@@ -164,7 +214,7 @@ class ChapterDetectionService:
     def _call_gemini_detection(self, service: GeminiService, input_text: str) -> List[ChapterDetectionItem]:
         from google.genai import types
 
-        prompt = f"Analyze the following textbook document text / candidates and identify all chapters with their 1-based start pages:\n\n{input_text}"
+        prompt = f"Analyze the following textbook document text / page headers and identify all chapters with their 1-based start pages:\n\n{input_text}"
 
         config = types.GenerateContentConfig(
             system_instruction=CHAPTER_DETECTION_SYSTEM_INSTRUCTION,
@@ -183,7 +233,6 @@ class ChapterDetectionService:
             logger.warning("Gemini returned empty response for chapter detection.")
             return []
 
-        # Parse JSON
         parsed_data = json.loads(response.text)
         result = ChapterDetectionResult.model_validate(parsed_data)
         return result.chapters
@@ -196,7 +245,6 @@ class ChapterDetectionService:
         seen_start_pages = set()
 
         for item in items:
-            # Validate chapter number and page range
             if item.chapter_number <= 0:
                 logger.warning(f"Discarding chapter with invalid chapter_number={item.chapter_number}.")
                 continue
@@ -227,6 +275,5 @@ class ChapterDetectionService:
             seen_numbers.add(item.chapter_number)
             seen_start_pages.add(item.start_page)
 
-        # Sort strictly by start_page ascending
         valid.sort(key=lambda c: c.start_page)
         return valid

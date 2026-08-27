@@ -426,6 +426,7 @@ def test_saved_pdf_blueprint_override_original_json():
     book_mock = MagicMock(id=paper.book_id, subject_id=paper.subject_id)
     pg_svc.workspace_service.get_book = MagicMock(return_value=book_mock)
     pg_svc.workspace_service.get_subject = MagicMock(return_value=MagicMock(workspace_id=uuid4()))
+    pg_svc.workspace_service.get_workspace = MagicMock()
     pg_svc.workspace_service.list_chapters = MagicMock(return_value=[MagicMock(id=ch_id)])
 
     req = PaperGenerateRequest(
@@ -556,6 +557,7 @@ def test_saved_pdf_blueprint_caching():
     book_mock = MagicMock(id=paper.book_id, subject_id=paper.subject_id)
     pg_svc.workspace_service.get_book = MagicMock(return_value=book_mock)
     pg_svc.workspace_service.get_subject = MagicMock(return_value=MagicMock(workspace_id=uuid4()))
+    pg_svc.workspace_service.get_workspace = MagicMock()
     pg_svc.workspace_service.list_chapters = MagicMock(return_value=[MagicMock(id=ch_id)])
 
     req = PaperGenerateRequest(
