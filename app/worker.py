@@ -153,7 +153,7 @@ def process_document(self, document_id_str: str) -> dict:
         db.close()
 
 
-@celery_app.task(bind=True, name="generate_document_embeddings", max_retries=3)
+@celery_app.task(bind=True, name="generate_document_embeddings", max_retries=30)
 def generate_document_embeddings(self, document_id_str: str) -> dict:
     logger.info(f"Starting chunking & embedding generation for document_id={document_id_str}")
     db = SessionLocal()
@@ -249,13 +249,16 @@ def generate_document_embeddings(self, document_id_str: str) -> dict:
         # 2. Save DocumentChunks to DB
         created_chunks = doc_repo.save_document_chunks(doc_id, chunks_data)
 
-        # 3. Generate Vector Embeddings
+        # 3. Resumable Vector Embedding Generation
         embedding_service = GeminiEmbeddingService()
-        chunk_texts = [c.content for c in created_chunks]
-        embeddings = embedding_service.generate_embeddings_batch(chunk_texts)
+        chunks_needing_embeddings = [c for c in created_chunks if not c.embedding]
 
-        for chunk_obj, vec in zip(created_chunks, embeddings):
-            doc_repo.update_chunk_embedding(chunk_obj.id, vec)
+        if chunks_needing_embeddings:
+            chunk_texts = [c.content for c in chunks_needing_embeddings]
+            embeddings = embedding_service.generate_embeddings_batch(chunk_texts)
+
+            for chunk_obj, vec in zip(chunks_needing_embeddings, embeddings):
+                doc_repo.update_chunk_embedding(chunk_obj.id, vec)
 
         # 4. Mark Document status READY
         doc_repo.mark_ready(doc_id)
@@ -274,27 +277,29 @@ def generate_document_embeddings(self, document_id_str: str) -> dict:
     except TRANSIENT_ERRORS as trans_exc:
         logger.warning(f"Transient embedding failure for document_id={document_id_str}, retry={self.request.retries}: {str(trans_exc)}")
         try:
-            countdown = 5 * (2 ** self.request.retries)
+            countdown = 15 * (2 ** min(self.request.retries, 5))
             raise self.retry(exc=trans_exc, countdown=countdown)
         except MaxRetriesExceededError:
             logger.error(f"Max embedding retries exceeded for document_id={document_id_str}")
-            cleanup_failed_document(db, document_id_str, str(trans_exc))
+            doc_repo.mark_failed(doc_id, error_message=str(trans_exc))
             return {"status": "FAILED", "document_id": document_id_str, "error": str(trans_exc)}
 
     except Exception as general_exc:
         exc_str = str(general_exc)
-        if ("429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str or "quota" in exc_str.lower()) and self.request.retries < self.max_retries:
-            logger.warning(f"Rate limit / quota 429 encountered for document_id={document_id_str}, retrying task in 45s (attempt {self.request.retries + 1}/{self.max_retries})...")
+        is_rate_limit = ("429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str or "quota" in exc_str.lower())
+
+        if is_rate_limit:
+            logger.warning(f"Gemini embedding rate limit / quota 429 encountered for document_id={document_id_str}, retrying task in 60s (attempt {self.request.retries + 1}/{self.max_retries})...")
             try:
-                raise self.retry(exc=general_exc, countdown=45)
+                raise self.retry(exc=general_exc, countdown=60)
             except MaxRetriesExceededError:
-                pass
+                safe_error = "Gemini API rate limit or daily free tier quota exceeded (429 RESOURCE_EXHAUSTED). Retries exhausted. Document preserved."
+                doc_repo.mark_failed(doc_id, error_message=safe_error)
+                return {"status": "FAILED", "document_id": document_id_str, "error": safe_error}
+
         logger.exception(f"Unexpected embedding generation error for document_id={document_id_str}: {exc_str}")
-        if "429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str or "quota" in exc_str.lower():
-            safe_error = "Gemini API rate limit or daily free tier quota exceeded (429 RESOURCE_EXHAUSTED). Please check your Gemini API billing/quota or retry later."
-        else:
-            safe_error = f"Embedding generation failed: {exc_str[:200]}"
-        cleanup_failed_document(db, document_id_str, safe_error)
+        safe_error = f"Embedding generation failed: {exc_str[:200]}"
+        doc_repo.mark_failed(doc_id, error_message=safe_error)
         return {"status": "FAILED", "document_id": document_id_str, "error": safe_error}
 
     finally:

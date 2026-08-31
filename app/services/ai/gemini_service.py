@@ -11,6 +11,31 @@ from app.services.ai.prompts.rag_prompt import RAG_SYSTEM_INSTRUCTION, RAG_USER_
 logger = logging.getLogger(__name__)
 
 
+class GeminiServiceError(RuntimeError):
+    """Base exception for Gemini service provider issues."""
+    pass
+
+
+class GeminiOutputTruncatedError(GeminiServiceError):
+    """Raised when Gemini output generation reaches MAX_TOKENS limit and is truncated."""
+    pass
+
+
+class GeminiRateLimitError(GeminiServiceError):
+    """Raised when Gemini returns HTTP 429, RESOURCE_EXHAUSTED, or quota exceeded."""
+    pass
+
+
+class GeminiProviderError(GeminiServiceError):
+    """Raised when Gemini provider returns HTTP 500, 502, 503, UNAVAILABLE, or network failure."""
+    pass
+
+
+class GeminiInvalidResponseError(GeminiServiceError):
+    """Raised when Gemini completes normally but returns malformed or unparseable JSON/text."""
+    pass
+
+
 class GeminiService(AIService):
     """
     Official Google GenAI SDK Service wrapper for gemini-3.5-flash-lite.
@@ -39,12 +64,18 @@ class GeminiService(AIService):
         self,
         prompt: str,
         system_instruction: Optional[str] = None,
+        max_output_tokens: Optional[int] = None,
     ) -> str:
         if not self.client:
             raise RuntimeError("GeminiService client is not initialized.")
 
         sys_instruct = system_instruction or RAG_SYSTEM_INSTRUCTION
-        config = types.GenerateContentConfig(system_instruction=sys_instruct, temperature=0.2)
+        token_limit = max_output_tokens or settings.GEMINI_PAPER_MAX_OUTPUT_TOKENS
+        config = types.GenerateContentConfig(
+            system_instruction=sys_instruct,
+            temperature=0.2,
+            max_output_tokens=token_limit,
+        )
 
         max_retries = 3
         for attempt in range(max_retries):
@@ -54,19 +85,46 @@ class GeminiService(AIService):
                     contents=prompt,
                     config=config,
                 )
-                if not response or not response.text:
-                    raise RuntimeError("Gemini API returned an empty text response.")
+                if not response:
+                    raise GeminiProviderError("Gemini API returned an empty response object.")
+
+                # Inspect candidates finish_reason for MAX_TOKENS truncation
+                if hasattr(response, "candidates") and response.candidates:
+                    first_cand = response.candidates[0]
+                    finish_reason_str = str(getattr(first_cand, "finish_reason", "")).upper()
+                    if "MAX_TOKENS" in finish_reason_str:
+                        logger.warning(
+                            f"Gemini output token limit reached (finish_reason={finish_reason_str}, "
+                            f"max_output_tokens={token_limit}). Raising GeminiOutputTruncatedError."
+                        )
+                        raise GeminiOutputTruncatedError(
+                            f"Gemini output token limit reached ({token_limit} tokens). Response truncated."
+                        )
+
+                if not response.text:
+                    raise GeminiInvalidResponseError("Gemini API returned an empty text response.")
+
                 return response.text
+
+            except GeminiOutputTruncatedError:
+                # Do NOT retry wasteful MAX_TOKENS truncations repeatedly with identical prompt
+                raise
+
             except Exception as exc:
                 err_msg = str(exc)
-                if any(k in err_msg for k in ["429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE", "500", "502", "504"]):
-                    if attempt < max_retries - 1:
-                        import time
-                        logger.warning(f"Gemini API transient error hit ({err_msg[:60]}), backing off 3s (attempt {attempt + 1}/{max_retries})...")
-                        time.sleep(3)
-                        continue
+                is_rate_limit = any(k in err_msg.upper() for k in ["429", "RESOURCE_EXHAUSTED", "QUOTA"])
+                is_transient = is_rate_limit or any(k in err_msg.upper() for k in ["503", "UNAVAILABLE", "500", "502", "504", "TIMEOUT"])
+
+                if is_transient and attempt < max_retries - 1:
+                    import time
+                    logger.warning(f"Gemini API transient error hit ({err_msg[:60]}), backing off 3s (attempt {attempt + 1}/{max_retries})...")
+                    time.sleep(3)
+                    continue
+
                 logger.error(f"Gemini API error during generate_response: {str(exc)}")
-                raise RuntimeError(f"AI service provider error: {str(exc)}")
+                if is_rate_limit:
+                    raise GeminiRateLimitError(f"Gemini API rate limit exceeded: {str(exc)}")
+                raise GeminiProviderError(f"AI service provider error: {str(exc)}")
 
     def generate_with_context(
         self,

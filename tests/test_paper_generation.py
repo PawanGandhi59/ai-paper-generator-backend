@@ -1026,7 +1026,7 @@ def test_insufficient_source_material_rejection():
         res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers)
 
     assert res.status_code == 400
-    assert "Insufficient educational source material" in res.json()["detail"]
+    assert "INSUFFICIENT_EDUCATIONAL_CONTENT" in str(res.json()["detail"]) or "educational" in str(res.json()["detail"]).lower()
 
 
 def test_internal_choice_blueprint_analysis():
@@ -3023,6 +3023,258 @@ def test_numerical_percentage_request_validation():
     )
     assert req.enable_numerical_percentage is True
     assert req.numerical_percentage == 25
+
+
+def test_gemini_paper_max_output_tokens_configuration():
+    """
+    TEST: Verify GEMINI_PAPER_MAX_OUTPUT_TOKENS configuration default is 65536.
+    """
+    from app.core.config import settings
+    assert settings.GEMINI_PAPER_MAX_OUTPUT_TOKENS == 65536
+
+
+def test_gemini_output_truncated_error_detection():
+    """
+    TEST: Verify GeminiService raises GeminiOutputTruncatedError when candidate finish_reason is MAX_TOKENS.
+    """
+    from unittest.mock import MagicMock
+    from app.services.ai.gemini_service import GeminiOutputTruncatedError, GeminiService
+
+    svc = GeminiService(api_key="fake_key")
+    mock_client = MagicMock()
+
+    # Candidate with MAX_TOKENS finish_reason
+    cand = MagicMock()
+    cand.finish_reason = "MAX_TOKENS"
+    mock_resp = MagicMock(candidates=[cand], text='{"sections": [')
+
+    mock_client.models.generate_content.return_value = mock_resp
+    svc.client = mock_client
+
+    with pytest.raises(GeminiOutputTruncatedError) as exc_info:
+        svc.generate_response("Generate paper prompt", max_output_tokens=65536)
+
+    assert "65536" in str(exc_info.value)
+    assert "MAX_TOKENS" in str(exc_info.value) or "truncated" in str(exc_info.value).lower()
+
+
+def test_gemini_output_limit_reached_api_response():
+    """
+    TEST: Verify MAX_TOKENS produces GEMINI_OUTPUT_LIMIT_REACHED error code and message.
+    """
+    import uuid
+    from unittest.mock import MagicMock
+    from fastapi import HTTPException
+    from app.schemas.paper import GenerationMode, PaperGenerateRequest, QuestionConfigItem, QuestionType
+    from app.services.ai.gemini_service import GeminiOutputTruncatedError
+    from app.services.paper.paper_generator_service import PaperGeneratorService
+
+    mock_db = MagicMock()
+    mock_ai_svc = MagicMock()
+    mock_ai_svc.count_tokens.return_value = 100
+    mock_ai_svc.generate_response.side_effect = GeminiOutputTruncatedError("Gemini output token limit reached (65536 tokens). Response truncated.")
+
+    svc = PaperGeneratorService(db=mock_db, ai_service=mock_ai_svc)
+    mock_paper_repo = MagicMock()
+    mock_paper = MagicMock(id=uuid.uuid4())
+    mock_paper_repo.create_paper.return_value = mock_paper
+    svc.paper_repo = mock_paper_repo
+
+    ch_id = uuid.uuid4()
+    mock_book = MagicMock(id=uuid.uuid4(), subject_id=uuid.uuid4())
+    mock_chapter = MagicMock()
+    mock_chapter.id = ch_id
+
+    mock_ws_svc = MagicMock()
+    ws_id = uuid.uuid4()
+    mock_ws_svc.get_subject.return_value = MagicMock(workspace_id=ws_id)
+    mock_ws_svc.get_workspace.return_value = MagicMock(id=ws_id)
+    mock_ws_svc.get_book.return_value = mock_book
+    mock_ws_svc.list_chapters.return_value = [mock_chapter]
+    svc.workspace_service = mock_ws_svc
+    svc.retrieval_service.retrieve_context_for_chapters = MagicMock(return_value="Sample Source Text Context")
+
+    req = PaperGenerateRequest(
+        book_id=mock_book.id,
+        selected_chapter_ids=[ch_id],
+        generation_mode=GenerationMode.CUSTOM,
+        total_marks=10,
+        question_configs=[QuestionConfigItem(section_name="Section A", question_type=QuestionType.MCQ, question_count=10, marks_per_question=1)],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        svc.generate_paper(current_user_id=uuid.uuid4(), request_data=req)
+
+    assert exc_info.value.status_code == 500
+    detail = exc_info.value.detail
+    assert isinstance(detail, dict)
+    assert detail["code"] == "GEMINI_OUTPUT_LIMIT_REACHED"
+    assert "maximum output limit" in detail["message"]
+    # Verify save_questions was NEVER called!
+    mock_paper_repo.save_questions.assert_not_called()
+
+
+def test_gemini_rate_limited_api_response():
+    """
+    TEST: Verify 429 / RESOURCE_EXHAUSTED produces GEMINI_RATE_LIMITED error code and HTTP 429 status.
+    """
+    import uuid
+    from unittest.mock import MagicMock
+    from fastapi import HTTPException
+    from app.schemas.paper import GenerationMode, PaperGenerateRequest, QuestionConfigItem, QuestionType
+    from app.services.ai.gemini_service import GeminiRateLimitError
+    from app.services.paper.paper_generator_service import PaperGeneratorService
+
+    mock_db = MagicMock()
+    mock_ai_svc = MagicMock()
+    mock_ai_svc.count_tokens.return_value = 100
+    mock_ai_svc.generate_response.side_effect = GeminiRateLimitError("Gemini API rate limit exceeded: 429 RESOURCE_EXHAUSTED")
+
+    svc = PaperGeneratorService(db=mock_db, ai_service=mock_ai_svc)
+    mock_paper_repo = MagicMock()
+    mock_paper = MagicMock(id=uuid.uuid4())
+    mock_paper_repo.create_paper.return_value = mock_paper
+    svc.paper_repo = mock_paper_repo
+
+    ch_id = uuid.uuid4()
+    mock_book = MagicMock(id=uuid.uuid4(), subject_id=uuid.uuid4())
+    mock_chapter = MagicMock()
+    mock_chapter.id = ch_id
+
+    mock_ws_svc = MagicMock()
+    ws_id = uuid.uuid4()
+    mock_ws_svc.get_subject.return_value = MagicMock(workspace_id=ws_id)
+    mock_ws_svc.get_workspace.return_value = MagicMock(id=ws_id)
+    mock_ws_svc.get_book.return_value = mock_book
+    mock_ws_svc.list_chapters.return_value = [mock_chapter]
+    svc.workspace_service = mock_ws_svc
+    svc.retrieval_service.retrieve_context_for_chapters = MagicMock(return_value="Sample Source Text Context")
+
+    req = PaperGenerateRequest(
+        book_id=mock_book.id,
+        selected_chapter_ids=[ch_id],
+        generation_mode=GenerationMode.CUSTOM,
+        total_marks=10,
+        question_configs=[QuestionConfigItem(section_name="Section A", question_type=QuestionType.MCQ, question_count=10, marks_per_question=1)],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        svc.generate_paper(current_user_id=uuid.uuid4(), request_data=req)
+
+    assert exc_info.value.status_code == 429
+    detail = exc_info.value.detail
+    assert isinstance(detail, dict)
+    assert detail["code"] == "GEMINI_RATE_LIMITED"
+    assert "rate limited" in detail["message"]
+    mock_paper_repo.save_questions.assert_not_called()
+
+
+def test_gemini_invalid_response_api_response():
+    """
+    TEST: Verify malformed JSON without MAX_TOKENS produces GEMINI_INVALID_RESPONSE error code (NOT educational content).
+    """
+    import uuid
+    from unittest.mock import MagicMock
+    from fastapi import HTTPException
+    from app.schemas.paper import GenerationMode, PaperGenerateRequest, QuestionConfigItem, QuestionType
+    from app.services.paper.paper_generator_service import PaperGeneratorService
+
+    mock_db = MagicMock()
+    mock_ai_svc = MagicMock()
+    mock_ai_svc.count_tokens.return_value = 100
+    mock_ai_svc.generate_response.return_value = "MALFORMED JSON {{{ questions: [..."
+
+    svc = PaperGeneratorService(db=mock_db, ai_service=mock_ai_svc)
+    mock_paper_repo = MagicMock()
+    mock_paper = MagicMock(id=uuid.uuid4())
+    mock_paper_repo.create_paper.return_value = mock_paper
+    svc.paper_repo = mock_paper_repo
+
+    ch_id = uuid.uuid4()
+    mock_book = MagicMock(id=uuid.uuid4(), subject_id=uuid.uuid4())
+    mock_chapter = MagicMock()
+    mock_chapter.id = ch_id
+
+    mock_ws_svc = MagicMock()
+    ws_id = uuid.uuid4()
+    mock_ws_svc.get_subject.return_value = MagicMock(workspace_id=ws_id)
+    mock_ws_svc.get_workspace.return_value = MagicMock(id=ws_id)
+    mock_ws_svc.get_book.return_value = mock_book
+    mock_ws_svc.list_chapters.return_value = [mock_chapter]
+    svc.workspace_service = mock_ws_svc
+    svc.retrieval_service.retrieve_context_for_chapters = MagicMock(return_value="Sample Source Text Context")
+
+    req = PaperGenerateRequest(
+        book_id=mock_book.id,
+        selected_chapter_ids=[ch_id],
+        generation_mode=GenerationMode.CUSTOM,
+        total_marks=10,
+        question_configs=[QuestionConfigItem(section_name="Section A", question_type=QuestionType.MCQ, question_count=10, marks_per_question=1)],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        svc.generate_paper(current_user_id=uuid.uuid4(), request_data=req)
+
+    assert exc_info.value.status_code == 500
+    detail = exc_info.value.detail
+    assert isinstance(detail, dict)
+    assert detail["code"] == "GEMINI_INVALID_RESPONSE"
+    assert "invalid response" in detail["message"]
+    mock_paper_repo.save_questions.assert_not_called()
+
+
+def test_insufficient_educational_content_api_response():
+    """
+    TEST: Verify genuine educational content insufficiency produces INSUFFICIENT_EDUCATIONAL_CONTENT code.
+    """
+    import uuid
+    from unittest.mock import MagicMock
+    from fastapi import HTTPException
+    from app.schemas.paper import GenerationMode, PaperGenerateRequest, QuestionConfigItem, QuestionType
+    from app.services.paper.paper_generator_service import PaperGeneratorService
+
+    mock_db = MagicMock()
+    mock_ai_svc = MagicMock()
+    mock_ai_svc.count_tokens.return_value = 100
+    mock_ai_svc.generate_response.return_value = '{"sections": [{"section_name": "Section A", "questions": []}]}'
+
+    svc = PaperGeneratorService(db=mock_db, ai_service=mock_ai_svc)
+    mock_paper_repo = MagicMock()
+    mock_paper = MagicMock(id=uuid.uuid4())
+    mock_paper_repo.create_paper.return_value = mock_paper
+    svc.paper_repo = mock_paper_repo
+
+    ch_id = uuid.uuid4()
+    mock_book = MagicMock(id=uuid.uuid4(), subject_id=uuid.uuid4())
+    mock_chapter = MagicMock()
+    mock_chapter.id = ch_id
+
+    mock_ws_svc = MagicMock()
+    ws_id = uuid.uuid4()
+    mock_ws_svc.get_subject.return_value = MagicMock(workspace_id=ws_id)
+    mock_ws_svc.get_workspace.return_value = MagicMock(id=ws_id)
+    mock_ws_svc.get_book.return_value = mock_book
+    mock_ws_svc.list_chapters.return_value = [mock_chapter]
+    svc.workspace_service = mock_ws_svc
+    svc.retrieval_service.retrieve_context_for_chapters = MagicMock(return_value="Sample Source Text Context")
+
+    req = PaperGenerateRequest(
+        book_id=mock_book.id,
+        selected_chapter_ids=[ch_id],
+        generation_mode=GenerationMode.CUSTOM,
+        total_marks=10,
+        question_configs=[QuestionConfigItem(section_name="Section A", question_type=QuestionType.MCQ, question_count=10, marks_per_question=1)],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        svc.generate_paper(current_user_id=uuid.uuid4(), request_data=req)
+
+    assert exc_info.value.status_code == 400
+    detail = exc_info.value.detail
+    assert isinstance(detail, dict)
+    assert detail["code"] == "INSUFFICIENT_EDUCATIONAL_CONTENT"
+    mock_paper_repo.save_questions.assert_not_called()
+
 
 
 
