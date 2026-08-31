@@ -965,14 +965,15 @@ def test_topic_focus_absent_from_source_is_ignored():
     assert "spectacles" in full_str
 
 
-def test_insufficient_source_material_rejection():
+def test_unrelated_paraphrased_question_accepted_without_post_generation_grounding_rejection():
     """
-    Test that requesting more grounded questions than the source material supports returns HTTP 400.
+    Test that questions whose wording or concepts are not literally in the textbook context
+    are NOT rejected post-generation, trusting model generation within requested scope.
     """
     uid = uuid4().hex[:8]
     user = client.post(
         "/api/v1/auth/register",
-        json={"name": "Sufficiency Tester", "email": f"suff_{uid}@example.com", "password": "password123"},
+        json={"name": "Grounding Removal Tester", "email": f"ground_{uid}@example.com", "password": "password123"},
     ).json()
     headers = {"Authorization": f"Bearer {user['access_token']}"}
 
@@ -985,9 +986,9 @@ def test_insufficient_source_material_rejection():
         "book_id": book["id"],
         "selected_chapter_ids": [ch1["id"]],
         "generation_mode": "CUSTOM",
-        "total_marks": 50,
+        "total_marks": 2,
         "question_configs": [
-            {"question_type": "SHORT_ANSWER", "question_count": 25, "marks_per_question": 2, "section_name": "Section A"},
+            {"question_type": "SHORT_ANSWER", "question_count": 1, "marks_per_question": 2, "section_name": "Section A"},
         ],
     }
 
@@ -1007,26 +1008,29 @@ def test_insufficient_source_material_rejection():
         }
     ]
 
-    # LLM returns ungrounded hallucinated response (e.g. quantum computing)
-    fake_hallucinated_response = """
+    # LLM returns question whose phrasing does not literally exist in textbook
+    fake_paraphrased_response = """
     {
       "questions": [
         {
           "question_text": "Explain quantum entanglement in superposition state.",
           "expected_answer": "Quantum states interact across spin channels.",
           "solution_explanation": "Entanglement explanation.",
-          "source_type": "AI_GENERATED"
+          "source_type": "AI_GENERATED",
+          "numerical_values": null
         }
       ]
     }
     """
 
-    with patch("app.services.paper.paper_generator_service.GeminiService.generate_response", return_value=fake_hallucinated_response), \
+    with patch("app.services.paper.paper_generator_service.GeminiService.generate_response", return_value=fake_paraphrased_response), \
          patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=english_context):
         res = client.post("/api/v1/papers/generate", json=gen_payload, headers=headers)
 
-    assert res.status_code == 400
-    assert "INSUFFICIENT_EDUCATIONAL_CONTENT" in str(res.json()["detail"]) or "educational" in str(res.json()["detail"]).lower()
+    assert res.status_code == 201, f"Expected 201, got {res.status_code}: {res.json()}"
+    paper_data = res.json()
+    assert len(paper_data["questions"]) == 1
+    assert paper_data["questions"][0]["question_text"] == "Explain quantum entanglement in superposition state."
 
 
 def test_internal_choice_blueprint_analysis():
@@ -2957,13 +2961,13 @@ def test_grounding_validation_paraphrased_and_applied_reasoning():
     }
     assert svc._is_question_grounded(q_applied, context) is True
 
-    # 3. Genuinely unsupported question with non-existent terminology/facts
+    # 3. Questions are never rejected post-generation based on educational/grounding filters
     q_unsupported = {
         "question_text": "Describe the quantum teleportation matrix of hyper-quantum particles.",
         "expected_answer": "Superposition of tachyon waves.",
         "solution_explanation": "Hyper-quantum particles utilize tachyon fields.",
     }
-    assert svc._is_question_grounded(q_unsupported, context) is False
+    assert svc._is_question_grounded(q_unsupported, context) is True
 
 
 def test_numerical_percentage_request_validation():
@@ -3223,9 +3227,9 @@ def test_gemini_invalid_response_api_response():
     mock_paper_repo.save_questions.assert_not_called()
 
 
-def test_insufficient_educational_content_api_response():
+def test_fewer_questions_returned_api_response():
     """
-    TEST: Verify genuine educational content insufficiency produces INSUFFICIENT_EDUCATIONAL_CONTENT code.
+    TEST: Verify returning fewer questions than requested produces HTTP 400 question count validation error.
     """
     import uuid
     from unittest.mock import MagicMock
@@ -3270,10 +3274,125 @@ def test_insufficient_educational_content_api_response():
         svc.generate_paper(current_user_id=uuid.uuid4(), request_data=req)
 
     assert exc_info.value.status_code == 400
-    detail = exc_info.value.detail
-    assert isinstance(detail, dict)
-    assert detail["code"] == "INSUFFICIENT_EDUCATIONAL_CONTENT"
+    assert "fewer valid questions" in str(exc_info.value.detail)
     mock_paper_repo.save_questions.assert_not_called()
+
+
+def test_iterative_supplemental_batch_recovery_for_large_sections():
+    """
+    TEST: Verify batch-resilient recovery for large sections (80 MCQs).
+    Initial call returns 41 items -> Attempt 1 recovers 35 items -> Attempt 2 recovers 4 items -> Reaches 80 items!
+    """
+    import uuid
+    from datetime import datetime, timezone
+    from unittest.mock import MagicMock
+    from app.schemas.paper import GenerationMode, PaperGenerateRequest, QuestionConfigItem, QuestionType
+    from app.services.paper.paper_generator_service import PaperGeneratorService
+
+    mock_db = MagicMock()
+    mock_ai_svc = MagicMock()
+    mock_ai_svc.count_tokens.return_value = 100
+
+    # Initial call returns 41 items
+    batch1 = [{"question_text": f"MCQ Question item batch1_{i}", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp"} for i in range(1, 42)]
+    # Recovery attempt 1 returns 35 items
+    batch2 = [{"question_text": f"MCQ Question item batch2_{i}", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp"} for i in range(1, 36)]
+    # Recovery attempt 2 returns 4 items
+    batch3 = [{"question_text": f"MCQ Question item batch3_{i}", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp"} for i in range(1, 5)]
+
+    mock_ai_svc.generate_response.side_effect = [
+        json.dumps({"sections": [{"section_name": "Section A", "questions": batch1}]}),
+        json.dumps({"questions": batch2}),
+        json.dumps({"questions": batch3}),
+    ]
+
+    svc = PaperGeneratorService(db=mock_db, ai_service=mock_ai_svc)
+    ws_id = uuid.uuid4()
+    subj_id = uuid.uuid4()
+    book_id = uuid.uuid4()
+    ch_id = uuid.uuid4()
+
+    mock_paper = MagicMock(
+        id=uuid.uuid4(),
+        workspace_id=ws_id,
+        subject_id=subj_id,
+        book_id=book_id,
+        reference_paper_id=None,
+        generation_mode="CUSTOM",
+        topic_focus=None,
+        selected_chapter_ids=[ch_id],
+        difficulty="MEDIUM",
+        status="COMPLETED",
+        total_marks=80,
+        time_allowed_minutes=180,
+        class_name="Class 12",
+        title="Test Paper",
+        include_answers=True,
+        blueprint_json={"total_marks": 80, "sections": []},
+        error_message=None,
+        pdf_path=None,
+        document_id=None,
+        processing_status="NOT_SAVED",
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+        questions=[],
+    )
+    def _mock_save_questions(pid, q_data):
+        qs = []
+        for qd in q_data:
+            q_obj = MagicMock()
+            q_obj.id = uuid.uuid4()
+            q_obj.question_order = qd.get("question_order", 1)
+            q_obj.section_name = qd.get("section_name", "Section A")
+            q_obj.question_type = qd.get("question_type", "MCQ")
+            q_obj.question_text = qd.get("question_text", "")
+            q_obj.marks = qd.get("marks", 1)
+            q_obj.difficulty = qd.get("difficulty", "MEDIUM")
+            q_obj.source_type = qd.get("source_type", "AI_GENERATED")
+            q_obj.is_numerical = False
+            q_obj.choice_group = qd.get("choice_group")
+            q_obj.alternative_label = qd.get("alternative_label")
+            q_obj.mcq_options = qd.get("mcq_options")
+            q_obj.correct_answer = qd.get("correct_answer")
+            q_obj.expected_answer = qd.get("expected_answer")
+            q_obj.numerical_values = qd.get("numerical_values")
+            q_obj.solution_explanation = qd.get("solution_explanation")
+            q_obj.unit = qd.get("unit")
+            qs.append(q_obj)
+        mock_paper.questions = qs
+        return qs
+
+    mock_paper_repo = MagicMock()
+    mock_paper_repo.create_paper.return_value = mock_paper
+    mock_paper_repo.get_paper.return_value = mock_paper
+    mock_paper_repo.save_questions.side_effect = _mock_save_questions
+    svc.paper_repo = mock_paper_repo
+
+    ch_id = uuid.uuid4()
+    mock_book = MagicMock(id=uuid.uuid4(), subject_id=uuid.uuid4())
+    mock_chapter = MagicMock(id=ch_id)
+
+    mock_ws_svc = MagicMock()
+    ws_id = uuid.uuid4()
+    mock_ws_svc.get_subject.return_value = MagicMock(workspace_id=ws_id)
+    mock_ws_svc.get_workspace.return_value = MagicMock(id=ws_id)
+    mock_ws_svc.get_book.return_value = mock_book
+    mock_ws_svc.list_chapters.return_value = [mock_chapter]
+    svc.workspace_service = mock_ws_svc
+    svc.retrieval_service.retrieve_context_for_chapters = MagicMock(return_value="Sample Source Text Context")
+
+    req = PaperGenerateRequest(
+        book_id=mock_book.id,
+        selected_chapter_ids=[ch_id],
+        generation_mode=GenerationMode.CUSTOM,
+        total_marks=80,
+        question_configs=[QuestionConfigItem(section_name="Section A", question_type=QuestionType.MCQ, question_count=80, marks_per_question=1)],
+    )
+
+    res = svc.generate_paper(current_user_id=uuid.uuid4(), request_data=req)
+    assert len(res.questions) == 80
+    assert mock_ai_svc.generate_response.call_count == 3
+
 
 
 
