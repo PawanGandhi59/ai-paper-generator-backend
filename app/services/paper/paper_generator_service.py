@@ -25,7 +25,13 @@ from app.schemas.paper import (
     QuestionSource,
     QuestionType,
 )
-from app.services.ai.gemini_service import GeminiService
+from app.services.ai.gemini_service import (
+    GeminiInvalidResponseError,
+    GeminiOutputTruncatedError,
+    GeminiProviderError,
+    GeminiRateLimitError,
+    GeminiService,
+)
 from app.services.embeddings.gemini_embedding_service import GeminiEmbeddingService
 from app.services.paper.blueprint_service import BlueprintService, PaperBlueprint, SectionBlueprint
 from app.services.retrieval.retrieval_service import RetrievalService
@@ -34,6 +40,11 @@ from app.services.workspace_service import WorkspaceService
 logger = logging.getLogger(__name__)
 
 MAX_RETRY_ATTEMPTS = 3
+
+
+class InsufficientEducationalContentError(RuntimeError):
+    """Raised when selected chapters contain insufficient grounded educational source material."""
+    pass
 
 
 def _is_mock(val: Any) -> bool:
@@ -165,6 +176,8 @@ class PaperGeneratorService:
                 blueprint = self.blueprint_service.build_custom_blueprint(
                     question_configs=request_data.question_configs,
                     total_marks=request_data.total_marks,
+                    enable_numerical_percentage=request_data.enable_numerical_percentage,
+                    numerical_percentage=request_data.numerical_percentage,
                 )
             else:
                 if source_is_generated_paper:
@@ -261,16 +274,67 @@ class PaperGeneratorService:
             final_paper = self.paper_repo.get_paper(paper.id)
             return self._build_paper_response(final_paper, include_answers=request_data.include_answers)
 
+        except GeminiOutputTruncatedError as trunc_exc:
+            logger.error(f"Paper generation output limit reached for paper_id {paper.id}: {trunc_exc}")
+            err_detail = {
+                "code": "GEMINI_OUTPUT_LIMIT_REACHED",
+                "message": "The AI reached its maximum output limit while generating the paper. The generated response was incomplete. Please reduce the number of questions or disable detailed answers/solutions and try again.",
+            }
+            self.paper_repo.update_status(paper.id, "FAILED", error_message=err_detail["message"])
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err_detail)
+
+        except GeminiRateLimitError as rate_exc:
+            logger.error(f"Paper generation rate limited for paper_id {paper.id}: {rate_exc}")
+            err_detail = {
+                "code": "GEMINI_RATE_LIMITED",
+                "message": "The AI service is temporarily rate limited. Please wait a moment and try again.",
+            }
+            self.paper_repo.update_status(paper.id, "FAILED", error_message=err_detail["message"])
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=err_detail)
+
+        except GeminiProviderError as prov_exc:
+            logger.error(f"Paper generation provider error for paper_id {paper.id}: {prov_exc}")
+            err_detail = {
+                "code": "GEMINI_PROVIDER_ERROR",
+                "message": "The AI service is temporarily unavailable. Please try again later.",
+            }
+            self.paper_repo.update_status(paper.id, "FAILED", error_message=err_detail["message"])
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=err_detail)
+
+        except GeminiInvalidResponseError as inv_exc:
+            logger.error(f"Paper generation invalid response for paper_id {paper.id}: {inv_exc}")
+            err_detail = {
+                "code": "GEMINI_INVALID_RESPONSE",
+                "message": "The AI returned an invalid response while generating the paper. Please try again.",
+            }
+            self.paper_repo.update_status(paper.id, "FAILED", error_message=err_detail["message"])
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err_detail)
+
+        except InsufficientEducationalContentError as ed_exc:
+            logger.warning(f"Paper generation educational content error for paper_id {paper.id}: {ed_exc}")
+            err_detail = {
+                "code": "INSUFFICIENT_EDUCATIONAL_CONTENT",
+                "message": str(ed_exc) or "There is not enough relevant educational content in the selected chapters to generate the requested paper. Try selecting additional chapters or reducing the number of questions.",
+            }
+            self.paper_repo.update_status(paper.id, "FAILED", error_message=err_detail["message"])
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=err_detail)
+
         except HTTPException as http_exc:
             logger.warning(f"Paper generation validation error for paper_id {paper.id}: {http_exc.detail}")
-            self.paper_repo.update_status(paper.id, "FAILED", error_message=str(http_exc.detail))
+            err_msg = http_exc.detail.get("message") if isinstance(http_exc.detail, dict) else str(http_exc.detail)
+            self.paper_repo.update_status(paper.id, "FAILED", error_message=err_msg)
             raise http_exc
+
         except Exception as exc:
             logger.error(f"Paper generation failed for paper_id {paper.id}: {exc}")
+            err_detail = {
+                "code": "GEMINI_PROVIDER_ERROR",
+                "message": f"Paper generation failed: {str(exc)}",
+            }
             self.paper_repo.update_status(paper.id, "FAILED", error_message=str(exc))
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Paper generation failed: {str(exc)}",
+                detail=err_detail,
             )
 
 
@@ -402,9 +466,8 @@ class PaperGeneratorService:
         Validates the returned structured response against the blueprint and assigns deterministic question numbers.
         """
         if not context_text or not context_text.strip():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Insufficient educational source material found in selected chapters.",
+            raise InsufficientEducationalContentError(
+                "There is not enough relevant educational content in the selected chapters to generate the requested paper. Try selecting additional chapters or reducing the number of questions."
             )
 
         prompt = self._build_complete_paper_prompt(
@@ -441,11 +504,23 @@ class PaperGeneratorService:
             needed_items = sec.question_count * alts_per_q
             sec_ref = self._get_section_aligned_sample_questions(sec, sample_questions) if (generation_mode == GenerationMode.REFERENCE and sample_questions) else None
 
-            sec_data = next((s for s in raw_sections if isinstance(s, dict) and str(s.get("section_name", "")).strip().lower() == sec.name.strip().lower()), None)
+            sec_name_clean = sec.name.strip().lower()
+            sec_data = next(
+                (
+                    s for s in raw_sections
+                    if isinstance(s, dict) and (
+                        str(s.get("section_name", "")).strip().lower() == sec_name_clean or
+                        str(s.get("section_name", "")).strip().lower() in sec_name_clean or
+                        sec_name_clean in str(s.get("section_name", "")).strip().lower()
+                    )
+                ),
+                None
+            )
             candidates = sec_data.get("questions", []) if (sec_data and isinstance(sec_data, dict)) else []
-            if not candidates and len(raw_sections) == len(blueprint.sections):
+            if not candidates:
                 sec_idx = blueprint.sections.index(sec)
-                candidates = raw_sections[sec_idx].get("questions", []) if isinstance(raw_sections[sec_idx], dict) else []
+                if sec_idx < len(raw_sections) and isinstance(raw_sections[sec_idx], dict):
+                    candidates = raw_sections[sec_idx].get("questions", [])
 
             sec_questions = []
             sec_difficulties = self._calculate_difficulty_distribution(difficulty, sec.question_count)
@@ -487,9 +562,8 @@ class PaperGeneratorService:
 
             if len(sec_questions) < needed_items:
                 logger.error(f"Complete-paper generation section validation failed for section '{sec.name}': needed {needed_items} items, got {len(sec_questions)}.")
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Insufficient educational source material found in selected chapters for section '{sec.name}'.",
+                raise InsufficientEducationalContentError(
+                    f"Insufficient educational source material found in selected chapters for section '{sec.name}'."
                 )
 
             all_validated_questions.extend(sec_questions)
@@ -877,9 +951,13 @@ SOURCE EDUCATIONAL MATERIAL:
                 text_str = match.group(1).strip()
 
         try:
-            return json.loads(text_str)
-        except Exception:
-            return {}
+            res = json.loads(text_str)
+            if isinstance(res, dict):
+                return res
+            raise GeminiInvalidResponseError("Gemini output root is not a JSON object.")
+        except Exception as exc:
+            logger.error(f"Failed to parse Gemini output JSON: {exc}")
+            raise GeminiInvalidResponseError(f"The AI returned an invalid response while generating the paper: {str(exc)}")
 
     def _build_paper_response(
         self,
@@ -900,7 +978,12 @@ SOURCE EDUCATIONAL MATERIAL:
             sol_exp = q.solution_explanation if include_answers else None
             unit_val = q.unit if include_answers else None
 
-            is_num = bool((q.numerical_values and isinstance(q.numerical_values, dict) and q.numerical_values.get("is_numerical")) or q.unit or (q.numerical_values is not None and len(q.numerical_values) > 0))
+            is_num = bool(
+                q.question_type == "NUMERICAL"
+                or getattr(q, "is_numerical", False)
+                or (q.numerical_values and isinstance(q.numerical_values, dict) and (q.numerical_values.get("is_numerical") or len(q.numerical_values) > 0))
+                or q.unit
+            )
 
             question_responses.append(
                 PaperQuestionResponse(

@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     GEMINI_EMBEDDING_MODEL: str = "gemini-embedding-2"
     EMBEDDING_DIMENSION: int = 768
 
+    GEMINI_EMBEDDING_MAX_RPM: int = 90
+    GEMINI_EMBEDDING_MAX_TPM: int = 55000
+
+    GEMINI_PAPER_MAX_OUTPUT_TOKENS: int = 65536
+
     RAG_RATE_LIMIT_REQUESTS: int = 10
     RAG_RATE_LIMIT_WINDOW_SECONDS: int = 60
 
