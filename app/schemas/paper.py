@@ -56,6 +56,9 @@ class PaperGenerateRequest(BaseModel):
     class_name: Optional[str] = Field(None, max_length=100, description="Optional class/grade name (e.g. Class 10, Grade 12)")
 
     difficulty: DifficultyLevel = DifficultyLevel.MIXED
+    easy_percentage: Optional[int] = Field(None, ge=0, le=100, description="Optional percentage of Easy questions (0-100%)")
+    medium_percentage: Optional[int] = Field(None, ge=0, le=100, description="Optional percentage of Medium questions (0-100%)")
+    hard_percentage: Optional[int] = Field(None, ge=0, le=100, description="Optional percentage of Hard questions (0-100%)")
 
 
     topic_focus: Optional[str] = Field(None, max_length=1000, description="Optional natural language topic focus/preference")
@@ -120,6 +123,20 @@ class PaperGenerateRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_mode_requirements(self) -> "PaperGenerateRequest":
+        pct_fields = [self.easy_percentage, self.medium_percentage, self.hard_percentage]
+        provided_pcts = [p for p in pct_fields if p is not None]
+
+        if len(provided_pcts) > 0:
+            if len(provided_pcts) < 3:
+                raise ValueError("All three percentages (easy_percentage, medium_percentage, hard_percentage) must be provided together.")
+            total_pct = self.easy_percentage + self.medium_percentage + self.hard_percentage
+            if total_pct != 100:
+                raise ValueError(
+                    f"Invalid custom difficulty distribution: sum of easy_percentage ({self.easy_percentage}%), "
+                    f"medium_percentage ({self.medium_percentage}%), and hard_percentage ({self.hard_percentage}%) "
+                    f"must equal exactly 100% (got {total_pct}%)."
+                )
+
         if self.enable_numerical_percentage:
             if self.numerical_percentage is None or self.numerical_percentage < 1 or self.numerical_percentage > 100:
                 raise ValueError("numerical_percentage between 1 and 100 must be provided when enable_numerical_percentage is True.")
@@ -186,6 +203,9 @@ class PaperResponse(BaseModel):
     time_allowed_minutes: Optional[int] = None
     class_name: Optional[str] = None
     difficulty: DifficultyLevel
+    easy_percentage: Optional[int] = None
+    medium_percentage: Optional[int] = None
+    hard_percentage: Optional[int] = None
 
 
     topic_focus: Optional[str] = None

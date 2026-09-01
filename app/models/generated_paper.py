@@ -26,6 +26,9 @@ class GeneratedPaper(Base):
     time_allowed_minutes = Column(Integer, nullable=True)
     class_name = Column(String(100), nullable=True)
     difficulty = Column(String(50), nullable=False, default="MIXED")  # "EASY", "MEDIUM", "HARD", "MIXED"
+    easy_percentage = Column(Integer, nullable=True)
+    medium_percentage = Column(Integer, nullable=True)
+    hard_percentage = Column(Integer, nullable=True)
 
 
     topic_focus = Column(Text, nullable=True)
