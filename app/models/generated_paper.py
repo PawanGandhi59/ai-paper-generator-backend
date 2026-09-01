@@ -17,7 +17,7 @@ class GeneratedPaper(Base):
     workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
     subject_id = Column(UUID(as_uuid=True), ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False, index=True)
     book_id = Column(UUID(as_uuid=True), ForeignKey("books.id", ondelete="CASCADE"), nullable=False, index=True)
-    reference_paper_id = Column(UUID(as_uuid=True), ForeignKey("reference_papers.id", ondelete="SET NULL"), nullable=True, index=True)
+    reference_paper_id = Column(UUID(as_uuid=True), nullable=True, index=True)
 
     title = Column(String(255), nullable=False)
     generation_mode = Column(String(50), nullable=False)  # "CUSTOM", "REFERENCE"
