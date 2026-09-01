@@ -3395,6 +3395,87 @@ def test_iterative_supplemental_batch_recovery_for_large_sections():
     assert mock_ai_svc.generate_response.call_count == 3
 
 
+def test_custom_difficulty_percentages_validation_and_generation():
+    """
+    Test validation rules and generation behavior for custom difficulty percentages (Easy, Medium, Hard):
+    1. Rejects payload when easy_percentage + medium_percentage + hard_percentage != 100
+    2. Rejects payload when only partial percentages are supplied
+    3. Accepts valid payload (10% Easy, 20% Medium, 70% Hard) and persists percentages in DB & PaperResponse.
+    """
+    from fastapi import status
+    from app.schemas.paper import QuestionType
+    from app.services.paper.blueprint_service import PaperBlueprint, SectionBlueprint
+
+    uid = uuid4().hex[:8]
+    user = client.post(
+        "/api/v1/auth/register",
+        json={"name": "Custom Diff Tester", "email": f"diff_{uid}@example.com", "password": "password123"},
+    ).json()
+    headers = {"Authorization": f"Bearer {user['access_token']}"}
+
+    ws = client.post("/api/v1/workspaces", json={"name": f"WS_{uid}"}, headers=headers).json()
+    subj = client.post(f"/api/v1/workspaces/{ws['id']}/subjects", json={"name": f"Subj_{uid}"}, headers=headers).json()
+    book = client.post(f"/api/v1/subjects/{subj['id']}/books", json={"name": f"Book_{uid}"}, headers=headers).json()
+    ch1 = client.post(f"/api/v1/books/{book['id']}/chapters", json={"name": "Ch1", "chapter_number": 1}, headers=headers).json()
+
+    # 1. Invalid sum (!= 100)
+    bad_sum_payload = {
+        "book_id": book["id"],
+        "selected_chapter_ids": [ch1["id"]],
+        "generation_mode": "CUSTOM",
+        "total_marks": 10,
+        "easy_percentage": 20,
+        "medium_percentage": 30,
+        "hard_percentage": 60,  # sum = 110%
+        "question_configs": [{"section_name": "Section A", "question_type": "MCQ", "question_count": 10, "marks_per_question": 1}],
+    }
+    bad_res1 = client.post("/api/v1/papers/generate", json=bad_sum_payload, headers=headers)
+    assert bad_res1.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    # 2. Partial percentages
+    partial_payload = {
+        "book_id": book["id"],
+        "selected_chapter_ids": [ch1["id"]],
+        "generation_mode": "CUSTOM",
+        "total_marks": 10,
+        "easy_percentage": 20,
+        "medium_percentage": 80,
+        # missing hard_percentage
+        "question_configs": [{"section_name": "Section A", "question_type": "MCQ", "question_count": 10, "marks_per_question": 1}],
+    }
+    bad_res2 = client.post("/api/v1/papers/generate", json=partial_payload, headers=headers)
+    assert bad_res2.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    # 3. Valid payload (10% Easy, 20% Medium, 70% Hard)
+    valid_payload = {
+        "book_id": book["id"],
+        "selected_chapter_ids": [ch1["id"]],
+        "generation_mode": "CUSTOM",
+        "total_marks": 10,
+        "easy_percentage": 10,
+        "medium_percentage": 20,
+        "hard_percentage": 70,
+        "question_configs": [{"section_name": "Section A", "question_type": "MCQ", "question_count": 10, "marks_per_question": 1}],
+    }
+
+    mock_questions = [
+        {"question_text": f"MCQ Q{i}", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Sol"}
+        for i in range(1, 11)
+    ]
+    fake_json_resp = json.dumps({"sections": [{"section_name": "Section A", "questions": mock_questions}]})
+
+    with patch("app.services.paper.paper_generator_service.GeminiService.generate_response", return_value=fake_json_resp), \
+         patch("app.services.paper.paper_generator_service.RetrievalService.retrieve_context", return_value=[]):
+        ok_res = client.post("/api/v1/papers/generate", json=valid_payload, headers=headers)
+
+    assert ok_res.status_code == status.HTTP_201_CREATED
+    data = ok_res.json()
+    assert data["easy_percentage"] == 10
+    assert data["medium_percentage"] == 20
+    assert data["hard_percentage"] == 70
+    assert len(data["questions"]) == 10
+
+
 
 
 

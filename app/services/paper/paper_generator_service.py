@@ -166,6 +166,9 @@ class PaperGeneratorService:
             title=request_data.title,
             topic_focus=request_data.topic_focus,
             reference_paper_id=request_data.reference_paper_id,
+            easy_percentage=request_data.easy_percentage,
+            medium_percentage=request_data.medium_percentage,
+            hard_percentage=request_data.hard_percentage,
         )
 
 
@@ -265,6 +268,9 @@ class PaperGeneratorService:
                 difficulty=request_data.difficulty,
                 generation_mode=request_data.generation_mode,
                 sample_questions=blueprint.sample_questions,
+                easy_pct=request_data.easy_percentage,
+                med_pct=request_data.medium_percentage,
+                hard_pct=request_data.hard_percentage,
             )
 
             # 6. Save Questions to DB
@@ -462,6 +468,9 @@ class PaperGeneratorService:
         difficulty: DifficultyLevel,
         generation_mode: GenerationMode,
         sample_questions: Optional[List[Dict[str, Any]]],
+        easy_pct: Optional[int] = None,
+        med_pct: Optional[int] = None,
+        hard_pct: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         Generate the ENTIRE examination paper in ONE single Gemini API request.
@@ -478,6 +487,9 @@ class PaperGeneratorService:
             difficulty=difficulty,
             generation_mode=generation_mode,
             sample_questions=sample_questions,
+            easy_pct=easy_pct,
+            med_pct=med_pct,
+            hard_pct=hard_pct,
         )
 
         # Actual Gemini SDK Token Capacity Check (1,000,000 token limit minus output headroom allowance)
@@ -524,7 +536,7 @@ class PaperGeneratorService:
                     candidates = raw_sections[sec_idx].get("questions", [])
 
             sec_questions = []
-            sec_difficulties = self._calculate_difficulty_distribution(difficulty, sec.question_count)
+            sec_difficulties = self._calculate_difficulty_distribution(difficulty, sec.question_count, easy_pct, med_pct, hard_pct)
 
             for cand in candidates:
                 if len(sec_questions) >= needed_items:
@@ -689,6 +701,9 @@ Return ONLY valid JSON matching this schema:
         difficulty: DifficultyLevel,
         generation_mode: GenerationMode,
         sample_questions: Optional[List[Dict[str, Any]]] = None,
+        easy_pct: Optional[int] = None,
+        med_pct: Optional[int] = None,
+        hard_pct: Optional[int] = None,
     ) -> str:
         """
         Construct a single complete-paper generation prompt asking Gemini to generate all sections
@@ -698,7 +713,7 @@ Return ONLY valid JSON matching this schema:
         start_q_num = 1
         for sec in blueprint.sections:
             alts_per_q = sec.alternatives_per_question if (sec.has_internal_choice and sec.alternatives_per_question > 1) else 1
-            sec_difficulties = self._calculate_difficulty_distribution(difficulty, sec.question_count)
+            sec_difficulties = self._calculate_difficulty_distribution(difficulty, sec.question_count, easy_pct, med_pct, hard_pct)
 
             choice_str = "None"
             if sec.has_internal_choice and sec.alternatives_per_question > 1:
@@ -929,7 +944,24 @@ SOURCE EDUCATIONAL MATERIAL:
 
         return False
 
-    def _calculate_difficulty_distribution(self, difficulty: DifficultyLevel, count: int) -> List[str]:
+    def _calculate_difficulty_distribution(
+        self,
+        difficulty: DifficultyLevel,
+        count: int,
+        easy_pct: Optional[int] = None,
+        med_pct: Optional[int] = None,
+        hard_pct: Optional[int] = None,
+    ) -> List[str]:
+        if easy_pct is not None and med_pct is not None and hard_pct is not None:
+            easy_cnt = int(round(count * (easy_pct / 100.0)))
+            hard_cnt = int(round(count * (hard_pct / 100.0)))
+            med_cnt = max(0, count - easy_cnt - hard_cnt)
+
+            dist = (["EASY"] * easy_cnt) + (["MEDIUM"] * med_cnt) + (["HARD"] * hard_cnt)
+            if len(dist) < count:
+                dist.extend(["MEDIUM"] * (count - len(dist)))
+            return dist[:count]
+
         if difficulty != DifficultyLevel.MIXED:
             return [difficulty.value] * count
 
@@ -1150,6 +1182,9 @@ SOURCE EDUCATIONAL MATERIAL:
             time_allowed_minutes=time_allowed,
             class_name=cls_name,
             difficulty=DifficultyLevel(paper.difficulty),
+            easy_percentage=getattr(paper, "easy_percentage", None),
+            medium_percentage=getattr(paper, "medium_percentage", None),
+            hard_percentage=getattr(paper, "hard_percentage", None),
 
 
 

@@ -1,5 +1,5 @@
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -34,7 +34,10 @@ def register(data: UserRegister, db: Session = Depends(get_db)) -> TokenResponse
 
 
 @router.post("/login", response_model=TokenResponse, status_code=status.HTTP_200_OK)
-async def login(request: Request, db: Session = Depends(get_db)) -> TokenResponse:
+async def login(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> TokenResponse:
     """
     Authenticate user with email and password.
     Supports both JSON body (Flutter/API) and Form Data (Swagger UI Authorize modal).
