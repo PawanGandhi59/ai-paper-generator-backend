@@ -139,10 +139,17 @@ class PaperGeneratorService:
                     detail="Access denied: You do not have access to this reference paper.",
                 )
 
+            # Enforce strict subject scoping: reference_paper must belong to requested subject_id!
+            ref_sub_id = getattr(reference_paper, "subject_id", None)
+            if ref_sub_id and str(ref_sub_id) != str(subject_id):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Selected reference paper belongs to a different subject ({ref_sub_id}) than the requested paper generation subject ({subject_id}).",
+                )
+
 
 
         # 2. Create Initial Paper Record (PENDING)
-        ref_paper_fk = None if source_is_generated_paper else request_data.reference_paper_id
         paper = self.paper_repo.create_paper(
             user_id=current_user_id,
             workspace_id=workspace_id,
@@ -154,12 +161,11 @@ class PaperGeneratorService:
             class_name=request_data.class_name,
             difficulty=request_data.difficulty.value,
 
-
             selected_chapter_ids=request_data.selected_chapter_ids,
             include_answers=request_data.include_answers,
             title=request_data.title,
             topic_focus=request_data.topic_focus,
-            reference_paper_id=ref_paper_fk,
+            reference_paper_id=request_data.reference_paper_id,
         )
 
 
@@ -374,9 +380,19 @@ class PaperGeneratorService:
             if q.get("section_name") == sec.name and _qtype_str(q) == sec_qtype
         ]
         if exact_matches:
-            return exact_matches
+            import random
+            shuffled = list(exact_matches)
+            random.shuffle(shuffled)
+            return shuffled
 
-        return [q for q in sample_questions if _qtype_str(q) == sec_qtype]
+        type_matches = [q for q in sample_questions if _qtype_str(q) == sec_qtype]
+        if type_matches:
+            import random
+            shuffled_type = list(type_matches)
+            random.shuffle(shuffled_type)
+            return shuffled_type
+
+        return []
 
     def _retrieve_chapter_context(
         self,
@@ -516,30 +532,30 @@ class PaperGeneratorService:
 
                 if self._validate_question_structure(cand, sec):
                     if not self._is_duplicate_question(cand, all_validated_questions + sec_questions):
-                        cand_idx = len(sec_questions)
-                        group_idx = cand_idx // alts_per_q
-                        target_diff = sec_difficulties[group_idx] if group_idx < len(sec_difficulties) else "MEDIUM"
-
-                        order = current_q_order + group_idx
-                        cand["question_order"] = order
-                        cand["section_name"] = sec.name
-                        cand["question_type"] = sec.question_type.value
-                        cand["marks"] = sec.marks_per_question
-                        cand["difficulty"] = target_diff
-
-                        if alts_per_q > 1:
-                            cand["choice_group"] = f"Q{order}"
-                            cand["alternative_label"] = chr(ord("a") + (cand_idx % alts_per_q))
-                        else:
-                            cand["choice_group"] = None
-                            cand["alternative_label"] = None
+                        total_paper_items = sum(
+                            s.question_count * (s.alternatives_per_question if (s.has_internal_choice and s.alternatives_per_question > 1) else 1)
+                            for s in blueprint.sections
+                        )
+                        max_reused_allowed = max(1, int(0.20 * total_paper_items))
+                        max_variation_allowed = max(1, int(0.20 * total_paper_items))
 
                         if generation_mode == GenerationMode.CUSTOM or not sec_ref:
                             cand["source_type"] = "AI_GENERATED"
                         else:
                             cand_st = str(cand.get("source_type", "")).upper()
-                            if cand_st in ["REFERENCE_REUSED", "REFERENCE_VARIATION"]:
-                                cand["source_type"] = cand_st
+                            cur_reused = sum(1 for q in (all_validated_questions + sec_questions) if q.get("source_type") == "REFERENCE_REUSED")
+                            cur_variation = sum(1 for q in (all_validated_questions + sec_questions) if q.get("source_type") == "REFERENCE_VARIATION")
+
+                            if cand_st == "REFERENCE_REUSED":
+                                if cur_reused >= max_reused_allowed:
+                                    logger.info(f"Discarding excess REFERENCE_REUSED candidate beyond 20% quota ({cur_reused}/{max_reused_allowed}). Triggering fresh recovery.")
+                                    continue
+                                cand["source_type"] = "REFERENCE_REUSED"
+                            elif cand_st == "REFERENCE_VARIATION":
+                                if cur_variation >= max_variation_allowed:
+                                    logger.info(f"Discarding excess REFERENCE_VARIATION candidate beyond 20% quota ({cur_variation}/{max_variation_allowed}). Triggering fresh recovery.")
+                                    continue
+                                cand["source_type"] = "REFERENCE_VARIATION"
                             else:
                                 cand["source_type"] = "AI_GENERATED"
 
@@ -557,7 +573,6 @@ class PaperGeneratorService:
                     f"got {len(sec_questions)}/{needed_items} items, requesting {missing_cnt} remaining questions."
                 )
 
-                # Calculate remaining numerical questions required to maintain blueprint numerical percentage
                 sec_numerical_target = sec.numerical_question_count
                 current_numerical_cnt = sum(
                     1 for q in sec_questions
@@ -569,7 +584,6 @@ class PaperGeneratorService:
                 if remaining_numerical_cnt > 0:
                     num_instruction = f"\n- NUMERICAL REQUIREMENT: At least {remaining_numerical_cnt} of these {missing_cnt} questions MUST be calculation/numerical problems (set is_numerical: true)."
 
-                # Summary of already accepted questions for exclusion
                 existing_texts = [q.get("question_text", "") for q in (all_validated_questions + sec_questions)]
                 existing_summary = json.dumps(existing_texts[-30:]) if existing_texts else "None"
 
@@ -616,19 +630,14 @@ Return ONLY valid JSON matching this schema:
                             break
                         if self._validate_question_structure(cand, sec):
                             if not self._is_duplicate_question(cand, all_validated_questions + sec_questions):
-                                cand_idx = len(sec_questions)
-                                group_idx = cand_idx // alts_per_q
-                                target_diff = sec_difficulties[group_idx] if group_idx < len(sec_difficulties) else "MEDIUM"
-
-                                order = current_q_order + group_idx
-                                cand["question_order"] = order
-                                cand["section_name"] = sec.name
-                                cand["question_type"] = sec.question_type.value
-                                cand["marks"] = sec.marks_per_question
-                                cand["difficulty"] = target_diff
-                                cand["choice_group"] = f"Q{order}" if alts_per_q > 1 else None
-                                cand["alternative_label"] = chr(ord("a") + (cand_idx % alts_per_q)) if alts_per_q > 1 else None
-                                cand["source_type"] = "AI_GENERATED"
+                                if generation_mode == GenerationMode.REFERENCE:
+                                    cand_st = str(cand.get("source_type", "")).upper()
+                                    if cand_st in ["REFERENCE_REUSED", "REFERENCE_VARIATION"]:
+                                        cand["source_type"] = cand_st
+                                    else:
+                                        cand["source_type"] = "AI_GENERATED"
+                                else:
+                                    cand["source_type"] = "AI_GENERATED"
                                 sec_questions.append(cand)
                 except Exception as fill_err:
                     logger.warning(f"Supplemental recovery attempt {recovery_attempt} for section '{sec.name}' failed: {fill_err}")
@@ -642,6 +651,28 @@ Return ONLY valid JSON matching this schema:
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Generated paper section '{sec.name}' returned fewer valid questions ({len(sec_questions)}) than requested ({needed_items}). Please try again.",
                 )
+
+            # Randomly shuffle candidates to guarantee REFERENCE_REUSED items are scattered non-sequentially
+            if generation_mode == GenerationMode.REFERENCE:
+                import random
+                random.shuffle(sec_questions)
+
+            # Assign sequential question numbers and metadata to the scattered candidates
+            for cand_idx, cand in enumerate(sec_questions):
+                group_idx = cand_idx // alts_per_q
+                target_diff = sec_difficulties[group_idx] if group_idx < len(sec_difficulties) else "MEDIUM"
+                order = current_q_order + group_idx
+                cand["question_order"] = order
+                cand["section_name"] = sec.name
+                cand["question_type"] = sec.question_type.value
+                cand["marks"] = sec.marks_per_question
+                cand["difficulty"] = target_diff
+                if alts_per_q > 1:
+                    cand["choice_group"] = f"Q{order}"
+                    cand["alternative_label"] = chr(ord("a") + (cand_idx % alts_per_q))
+                else:
+                    cand["choice_group"] = None
+                    cand["alternative_label"] = None
 
             all_validated_questions.extend(sec_questions)
             current_q_order += sec.question_count
@@ -706,20 +737,53 @@ Check whether this concept exists in the SOURCE EDUCATIONAL MATERIAL.
 """
 
         ref_instruction_str = ""
-        if generation_mode == GenerationMode.REFERENCE and sample_questions:
-            samples_formatted = json.dumps(sample_questions, indent=2)
+        if generation_mode == GenerationMode.REFERENCE:
+            import random
+            shuffled_samples = list(sample_questions) if sample_questions else []
+            random.shuffle(shuffled_samples)
+            samples_formatted = json.dumps(shuffled_samples, indent=2) if shuffled_samples else "[]"
             ref_instruction_str = f"""
-REFERENCE PAPER SAMPLE QUESTIONS (STYLE & STRUCTURE ONLY):
+REFERENCE PAPER SAMPLE QUESTIONS & COGNITIVE STYLE PROFILE:
 {samples_formatted}
 
-STRICT RULE:
-Reference questions are STYLE, STRUCTURE, FORMAT, and PATTERN examples only.
-Do NOT treat reference questions as a factual source. Factual content MUST come strictly from the SOURCE EDUCATIONAL MATERIAL.
+CRITICAL: REFERENCE MODE SEMANTIC EXAMINATION STYLE & PEDAGOGICAL EMULATION:
+You are generating an examination paper in REFERENCE MODE. You MUST capture and emulate the DEEP SEMANTIC AND PEDAGOGICAL QUESTION-SETTING PHILOSOPHY of the reference examiner, NOT merely copy vocabulary, keywords, or surface phrasing.
+
+1. PEDAGOGICAL & COGNITIVE DEMAND EMULATION:
+   - Analyze HOW the reference paper converts textbook concepts into questions (the pattern: concept → physical scenario → given parameters → cognitive reasoning required → operation expected → answer depth).
+   - Match the examiner's cognitive burden: whether questions test direct recall, conceptual comprehension, scenario-based application, multi-step derivation, or numerical calculation.
+   - For numerical problems, replicate the reasoning depth (e.g. single-step direct formula substitution vs. multi-step parameter setup and derivation).
+   - For MCQs, emulate distractor construction strategy (targeting common student misconceptions or subtle conceptual errors rather than trivial options).
+   - Real difficulty must reflect actual reasoning burden, regardless of superficial terminology.
+
+2. CHAPTER ALIGNMENT & REUSE ELIGIBILITY RULE:
+   - Check if any sample questions in REFERENCE PAPER SAMPLE QUESTIONS belong to the concepts in SOURCE EDUCATIONAL MATERIAL (the selected chapters).
+   - IF MATCHING QUESTIONS EXIST in the reference paper for the selected chapters:
+     * You may directly reuse those matching questions as "REFERENCE_REUSED" (MAXIMUM 10% to 20% of total paper questions, never more).
+     * You may create parameter/scenario variations of those matching questions as "REFERENCE_VARIATION" (MAXIMUM 10% to 20% of total paper questions, never more).
+     * The remaining 60% to 80% MUST be fresh, newly authored questions ("AI_GENERATED") from SOURCE EDUCATIONAL MATERIAL in the examiner's cognitive style.
+   - IF NO MATCHING QUESTIONS EXIST in the reference paper for the selected chapters (e.g. reference paper covers Chapter 1, but requested paper is Chapter 2):
+     * DO NOT force any reuse or variation! DO NOT copy questions from unselected chapters!
+     * 100% of the paper MUST be fresh, newly authored questions ("AI_GENERATED") created strictly from SOURCE EDUCATIONAL MATERIAL, while emulating the reference examiner's question-setting style, cognitive demand, and formatting.
+
+3. STRICT ANTI-CLUSTERING & NON-SEQUENTIAL REUSE RULE:
+   - NEVER copy reference paper questions sequentially in order (e.g. DO NOT copy Reference Q1, Q2, Q3... as generated Q1, Q2, Q3...).
+   - NEVER cluster or place all reused/variation questions together in the first section or in a single block at the beginning of the paper.
+   - Randomly SCATTER any allowed REFERENCE_REUSED or REFERENCE_VARIATION questions across different question numbers throughout the paper, interspersing them evenly among fresh AI_GENERATED questions.
+
+4. ADAPTATION & TRACEABILITY (source_type):
+   For each generated question, set "source_type" as:
+   - "REFERENCE_REUSED": Use ONLY when a question from the reference paper matches the selected textbook chapters and is directly reused.
+   - "REFERENCE_VARIATION": Use ONLY when a question from the reference paper matches the selected textbook chapters and its parameters/scenario are modified.
+   - "AI_GENERATED": Use for ALL newly created questions derived from the SOURCE EDUCATIONAL MATERIAL (mandatory when chapter differs or when exceeding 20% reuse/variation).
+
+5. USER BLUEPRINT AUTHORITATIVENESS:
+   - The user's requested TOTAL EXAMINATION MARKS ({blueprint.total_marks}), section counts, question types, marks per question, requested difficulty ({difficulty.value}), and selected textbook chapters are AUTHORITATIVE and MUST be strictly respected.
 """
 
         source_type_desc = (
             '"source_type": "<AI_GENERATED | REFERENCE_REUSED | REFERENCE_VARIATION>"'
-            if generation_mode == GenerationMode.REFERENCE and sample_questions
+            if generation_mode == GenerationMode.REFERENCE
             else '"source_type": "AI_GENERATED"'
         )
 
@@ -961,14 +1025,33 @@ SOURCE EDUCATIONAL MATERIAL:
 
         try:
             res = json.loads(text_str)
-            if isinstance(res, dict):
-                return res
-            if isinstance(res, list):
-                return {"questions": res}
-            raise GeminiInvalidResponseError("Gemini output root is not a JSON object or array.")
-        except Exception as exc:
-            logger.error(f"Failed to parse Gemini output JSON: {exc}")
-            raise GeminiInvalidResponseError(f"The AI returned an invalid response while generating the paper: {str(exc)}")
+        except Exception:
+            # Fallback 1: Strip trailing commas before closing braces/brackets (e.g. ,} or ,])
+            sanitized = re.sub(r',\s*([\}\]])', r'\1', text_str)
+            # Fallback 2: Fix invalid \uXXXX escapes (e.g. \unit, \micro, LaTeX \theta)
+            sanitized = re.sub(r'\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})', r'\\\\', sanitized)
+            try:
+                res = json.loads(sanitized)
+            except Exception:
+                # Fallback 3: Balance unclosed braces/brackets if truncated near end
+                balanced = sanitized
+                open_braces = balanced.count("{") - balanced.count("}")
+                open_brackets = balanced.count("[") - balanced.count("]")
+                if open_brackets > 0:
+                    balanced += "]" * open_brackets
+                if open_braces > 0:
+                    balanced += "}" * open_braces
+                try:
+                    res = json.loads(balanced)
+                except Exception as json_err:
+                    logger.error(f"Failed to parse Gemini output JSON: {json_err}")
+                    raise GeminiInvalidResponseError(f"The AI returned an invalid response while generating the paper: {str(json_err)}")
+
+        if isinstance(res, dict):
+            return res
+        if isinstance(res, list):
+            return {"questions": res}
+        raise GeminiInvalidResponseError("Gemini output root is not a JSON object or array.")
 
     def _build_paper_response(
         self,

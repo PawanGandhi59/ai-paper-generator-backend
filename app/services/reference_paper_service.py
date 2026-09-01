@@ -139,8 +139,11 @@ class ReferencePaperService:
 
     def list_reference_papers(self, current_user_id: UUID, subject_id: Optional[UUID] = None):
         if subject_id:
-            # Verify subject ownership if subject_id passed
-            self.workspace_service.get_subject(subject_id, current_user_id)
+            subject = self.workspace_service.get_subject(subject_id, current_user_id)
+            return self.repo.list_reference_papers_by_subject(
+                workspace_id=subject.workspace_id,
+                subject_id=subject.id,
+            )
         return self.repo.list_reference_papers_by_user(current_user_id)
 
     def get_reference_paper(self, current_user_id: UUID, paper_id: UUID):

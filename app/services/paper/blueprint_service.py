@@ -55,6 +55,8 @@ Return ONLY a JSON object with this exact structure:
       "question_type": "<MCQ | VERY_SHORT_ANSWER | SHORT_ANSWER | LONG_ANSWER | NUMERICAL>",
       "question_text": "<Question text>",
       "marks": <marks>,
+      "cognitive_demand": "<RECALL | COMPREHENSION | APPLICATION | ANALYSIS | NUMERICAL_SOLVING>",
+      "reasoning_style": "<DIRECT_RECALL | CONCEPT_EXPLANATION | MULTI_STEP_NUMERICAL | SCENARIO_BASED | DERIVATION>",
       "choice_group": "<Question number like Q4 if internal choice exists, null otherwise>",
       "alternative_label": "<'a' or 'b' if internal choice exists, null otherwise>"
     }}
@@ -68,6 +70,7 @@ CRITICAL BLUEPRINT RULES:
 4. Total paper marks = sum of total_section_marks across all sections (e.g. Part A: 5x1=5, Part B: 5x4=20, Part C: 5x7=35 -> Total = 60).
 5. COMPLETE SECTION EXTRACTION: Read all pages carefully. Identify all sections from question numbering (e.g., Q1-Q5, Q6-Q10, Q11-Q15), even if explicit section header labels (such as Part C) are missing or faint in OCR text. In standard 60-mark examination papers with Part A (5x1=5) and Part B (5x4=20), Part C questions Q11 to Q15 are 7 marks each (5x7=35 marks; Total = 60).
 6. QUESTION TYPES: Classify question_type based on section style: 1 mark direct answers are VERY_SHORT_ANSWER, 2-4 mark questions are SHORT_ANSWER, 5+ mark questions are LONG_ANSWER. Part A (1m) is VERY_SHORT_ANSWER, Part B (4m) is SHORT_ANSWER, while Part C (7m) is LONG_ANSWER.
+7. FULL PAPER COVERAGE: Read the ENTIRE examination text from start to finish. Extract representative sample questions from EVERY section across the entire paper (beginning, middle, and end), capturing questions of varying types, marks, cognitive demands, and reasoning styles.
 
 Examination Paper Text:
 ---
@@ -99,27 +102,32 @@ class BlueprintService:
             if sec.question_count < 1:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid section '{sec.name}': question_count must be >= 1.",
+                    detail="Invalid blueprint: section question_count must be at least 1.",
                 )
             if sec.marks_per_question < 1:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid section '{sec.name}': marks_per_question must be >= 1.",
+                    detail="Invalid blueprint: section marks_per_question must be at least 1.",
                 )
             if sec.has_internal_choice and sec.alternatives_per_question != 2:
-                sec.alternatives_per_question = 2
-                sec.choice_rule = "answer_one_of_two"
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid blueprint: internal choice sections must have alternatives_per_question equal to 2.",
+                )
 
-            expected_sec_marks = sec.question_count * sec.marks_per_question
-            if sec.total_section_marks != expected_sec_marks:
-                sec.total_section_marks = expected_sec_marks
+            expected_section_marks = sec.question_count * sec.marks_per_question
+            if sec.total_section_marks != expected_section_marks:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid blueprint: section '{sec.name}' total_section_marks ({sec.total_section_marks}) does not match question_count * marks_per_question ({expected_section_marks}).",
+                )
 
             computed_total += sec.total_section_marks
 
         if computed_total != blueprint.total_marks:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid blueprint: sum of section total marks ({computed_total}) does not equal paper total marks ({blueprint.total_marks}).",
+                detail=f"Invalid blueprint: total_marks ({blueprint.total_marks}) does not match sum of section marks ({computed_total}).",
             )
 
     def build_custom_blueprint(
@@ -203,9 +211,8 @@ class BlueprintService:
                 detail="Reference paper has no extracted page content for structural analysis.",
             )
 
-        # Truncate combined text to prevent context overflow if paper is huge
-        truncated_text = combined_text[:12000]
-        prompt = REFERENCE_ANALYSIS_PROMPT.format(paper_text=truncated_text)
+        # Full paper analysis with zero character/page/text truncation
+        prompt = REFERENCE_ANALYSIS_PROMPT.format(paper_text=combined_text)
 
         try:
             raw_response = self.ai_service.generate_response(prompt=prompt)
@@ -630,4 +637,19 @@ class BlueprintService:
         try:
             return json.loads(text_str)
         except Exception:
-            return {}
+            sanitized = re.sub(r',\s*([\}\]])', r'\1', text_str)
+            sanitized = re.sub(r'\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})', r'\\\\', sanitized)
+            try:
+                return json.loads(sanitized)
+            except Exception:
+                balanced = sanitized
+                open_braces = balanced.count("{") - balanced.count("}")
+                open_brackets = balanced.count("[") - balanced.count("]")
+                if open_brackets > 0:
+                    balanced += "]" * open_brackets
+                if open_braces > 0:
+                    balanced += "}" * open_braces
+                try:
+                    return json.loads(balanced)
+                except Exception:
+                    return {}

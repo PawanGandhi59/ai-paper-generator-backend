@@ -73,6 +73,7 @@ class GeminiService(AIService):
         token_limit = max_output_tokens or settings.GEMINI_PAPER_MAX_OUTPUT_TOKENS
         config = types.GenerateContentConfig(
             system_instruction=sys_instruct,
+            response_mime_type="application/json",
             temperature=0.2,
             max_output_tokens=token_limit,
         )
