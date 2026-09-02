@@ -74,6 +74,7 @@ class GeneratedPaperQuestion(Base):
     marks = Column(Integer, nullable=False)
     difficulty = Column(String(50), nullable=False)
     source_type = Column(String(50), nullable=False)  # "AI_GENERATED", "REFERENCE_REUSED", "REFERENCE_VARIATION"
+    is_numerical = Column(Boolean, nullable=False, default=False)
 
     choice_group = Column(String(50), nullable=True)  # e.g., "Q4" or "4"
     alternative_label = Column(String(10), nullable=True)  # e.g., "a", "b"

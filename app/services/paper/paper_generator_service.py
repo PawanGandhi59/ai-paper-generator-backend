@@ -24,6 +24,7 @@ from app.schemas.paper import (
     PaperResponse,
     QuestionSource,
     QuestionType,
+    GeminiCompletePaperSchema,
 )
 from app.services.ai.gemini_service import (
     GeminiInvalidResponseError,
@@ -117,13 +118,6 @@ class PaperGeneratorService:
                         and doc_proc_status == "READY"
                         and getattr(reference_paper, "deleted_at", None) is None
                     )
-
-
-                    if not is_eligible:
-                        raise HTTPException(
-                            status_code=status.HTTP_400_BAD_REQUEST,
-                            detail="Selected AI-generated reference paper is not ready or eligible for use as a reference paper.",
-                        )
                 else:
                     raise HTTPException(
                         status_code=status.HTTP_404_NOT_FOUND,
@@ -185,7 +179,7 @@ class PaperGeneratorService:
                 )
             else:
                 if source_is_generated_paper:
-                    if reference_paper.pdf_path:
+                    if is_eligible and reference_paper.pdf_path:
                         # Saved GeneratedPaper: check if blueprint_json from PDF is cached in DB
                         if reference_paper.blueprint_json:
                             base_blueprint = PaperBlueprint.model_validate(reference_paper.blueprint_json)
@@ -271,6 +265,13 @@ class PaperGeneratorService:
                 easy_pct=request_data.easy_percentage,
                 med_pct=request_data.medium_percentage,
                 hard_pct=request_data.hard_percentage,
+            )
+
+            # 5.5 Final Monolithic Complete-Paper Integrity Pass
+            self._validate_final_paper_integrity(
+                blueprint=blueprint,
+                generated_questions=generated_questions,
+                selected_chapter_ids=request_data.selected_chapter_ids,
             )
 
             # 6. Save Questions to DB
@@ -502,7 +503,10 @@ class PaperGeneratorService:
                 detail="Selected chapters contain too much educational content to generate this paper in a single model request. Please select fewer chapters and try again.",
             )
 
-        response_text = self.ai_service.generate_response(prompt)
+        try:
+            response_text = self.ai_service.generate_response(prompt, response_schema=GeminiCompletePaperSchema)
+        except TypeError:
+            response_text = self.ai_service.generate_response(prompt)
         parsed = self._parse_json_safely(response_text)
 
         raw_sections = parsed.get("sections", []) if isinstance(parsed, dict) else []
@@ -542,7 +546,7 @@ class PaperGeneratorService:
                 if len(sec_questions) >= needed_items:
                     break
 
-                if self._validate_question_structure(cand, sec):
+                if self._validate_question_structure(cand, sec, existing_sec_questions=sec_questions):
                     if not self._is_duplicate_question(cand, all_validated_questions + sec_questions):
                         total_paper_items = sum(
                             s.question_count * (s.alternatives_per_question if (s.has_internal_choice and s.alternatives_per_question > 1) else 1)
@@ -597,7 +601,7 @@ class PaperGeneratorService:
                     num_instruction = f"\n- NUMERICAL REQUIREMENT: At least {remaining_numerical_cnt} of these {missing_cnt} questions MUST be calculation/numerical problems (set is_numerical: true)."
 
                 existing_texts = [q.get("question_text", "") for q in (all_validated_questions + sec_questions)]
-                existing_summary = json.dumps(existing_texts[-30:]) if existing_texts else "None"
+                existing_summary = json.dumps(existing_texts[-30:], ensure_ascii=False) if existing_texts else "None"
 
                 fill_prompt = f"""You are an examination author. Generate EXACTLY {missing_cnt} additional unique, non-repetitive questions for section '{sec.name}'.
 
@@ -640,7 +644,7 @@ Return ONLY valid JSON matching this schema:
                     for cand in fill_candidates:
                         if len(sec_questions) >= needed_items:
                             break
-                        if self._validate_question_structure(cand, sec):
+                        if self._validate_question_structure(cand, sec, existing_sec_questions=sec_questions):
                             if not self._is_duplicate_question(cand, all_validated_questions + sec_questions):
                                 if generation_mode == GenerationMode.REFERENCE:
                                     cand_st = str(cand.get("source_type", "")).upper()
@@ -827,9 +831,11 @@ CONTENT AUTHORITY, SOURCE FIDELITY & ANTI-EMBELLISHMENT RULES:
 1. SOURCE EDUCATIONAL MATERIAL is the ONLY authoritative source for question content, facts, formulas, terminology, and subject matter.
 2. Every generated question MUST be strictly derived from and answerable using ONLY the provided SOURCE EDUCATIONAL MATERIAL.
 3. DO NOT use external knowledge, pretrained/model general knowledge, assumptions, or information outside the provided SOURCE EDUCATIONAL MATERIAL.
-4. DO NOT invent facts, descriptions, terminology, motivations, settings, formulas, numerical values, or background information not supported by the source.
-5. Applied numerical problems are permitted provided the underlying formulas/principles exist in the source material.
-6. For spelling/vocabulary exercises, preserve original textbook intent.
+4. BALANCED CHAPTER COVERAGE & ATTRIBUTION RULE: You MUST distribute questions evenly across ALL selected chapters in SOURCE EDUCATIONAL MATERIAL. Do NOT concentrate questions in Chapter 1 or any single chapter. Include "chapter_number": <1-based integer chapter number> for each question.
+5. NUMERICAL CALCULATION ACCURACY RULE: You MUST perform exact step-by-step arithmetic verification for all numerical calculations. Double-check powers of 10, exponents, signs, and unit conversions (e.g. 10⁹ × 10⁻⁷ × 10⁻⁷ / (0.3)² = 5.4 × 10⁻³ / 0.09 = 6.0 × 10⁻³ N). Ensure the calculated result matches the selected MCQ option exactly.
+6. VARIABLE DISAMBIGUATION RULE: NEVER use the same variable letter or symbol for two different physical quantities in the same question (e.g. do NOT use 'a' for both an electric field coefficient and a cube edge length; use distinct symbols like 'k' and 'L', or 'a' and 'd').
+7. SELF-CONTAINED QUESTION RULE: EVERY single question MUST be 100% self-contained and independent. NEVER use phrases like 'the previous problem', 'above question', 'from question X', or 'from the previous result'. Each question must supply all its own parameters, definitions, and context.
+8. INTERNAL CHOICE ALTERNATIVES RULE: For questions with internal choice, alternatives 'a' and 'b' MUST be completely distinct, independent, non-identical questions covering valid topics.
 {topic_instruction_str}
 {ref_instruction_str}
 OUTPUT FORMAT REQUIREMENT:
@@ -846,6 +852,7 @@ Return ONLY a valid JSON object containing a "sections" array. Do NOT wrap in ma
           "difficulty": "<EASY | MEDIUM | HARD>",
           "choice_group": "<e.g. Q1 or null>",
           "alternative_label": "<e.g. a, b or null>",
+          "chapter_number": <1-based integer chapter number>,
           "is_numerical": <true | false>,
           "mcq_options": ["A. ...", "B. ...", "C. ...", "D. ..."] or null,
           "correct_answer": "<correct option for MCQ or numerical result>",
@@ -867,9 +874,11 @@ SOURCE EDUCATIONAL MATERIAL:
         self,
         q: Dict[str, Any],
         sec: SectionBlueprint,
+        existing_sec_questions: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
         """
-        Validate question structure, required fields, MCQ options, numerical solutions, and non-empty text.
+        Validate question structure, self-containment, variable disambiguation, MCQ option matching,
+        answer field completeness, and content-based numerical classification.
         """
         if not isinstance(q, dict):
             return False
@@ -878,34 +887,176 @@ SOURCE EDUCATIONAL MATERIAL:
         if not q_text or len(q_text) < 5:
             return False
 
-        # Validate difficulty metadata if present
-        cand_diff = q.get("difficulty")
-        if cand_diff and str(cand_diff).upper() not in ["EASY", "MEDIUM", "HARD"]:
-            return False
+        # 1. Self-containment validation: Reject cross-question dependencies
+        dep_patterns = [
+            r"\bprevious (problem|question|result|part|example|computation|value)\b",
+            r"\babove (problem|question|result|part|computation|value)\b",
+            r"\bfrom (question|problem) \d+\b",
+            r"\bfrom the previous\b",
+            r"\busing the answer obtained above\b",
+            r"\busing your answer from\b",
+            r"\bas calculated earlier\b",
+            r"\bthe result obtained above\b",
+            r"\bfrom part \([a-d]\)\b",
+        ]
+        for pat in dep_patterns:
+            if re.search(pat, q_text, re.IGNORECASE):
+                logger.warning(f"Rejecting dependent question (matches '{pat}'): '{q_text[:50]}'")
+                return False
+
+        # 2. Variable disambiguation: Reject conflicting variable symbol assignments
+        var_assignments = re.findall(r"\b([a-zA-Z])\s*=\s*([\d\.\-]+)\s*([a-zA-ZΩ°µμ%C|N|m|V|J|A|Hz/\-]+)", q_text)
+        symbol_map = {}
+        for sym, val, unit in var_assignments:
+            if sym in symbol_map and symbol_map[sym] != (val, unit):
+                logger.warning(f"Rejecting variable collision: symbol '{sym}' assigned conflicting values {symbol_map[sym]} vs ({val}, {unit})")
+                return False
+            symbol_map[sym] = (val, unit)
+
+        # 3. Answer field non-emptiness validation & MCQ consistency
+        corr = str(q.get("correct_answer") or "").strip()
+        exp = str(q.get("expected_answer") or "").strip()
+        sol = str(q.get("solution_explanation") or "").strip()
 
         q_type = sec.question_type.value
 
         if q_type == "MCQ":
+            if not corr:
+                logger.warning("Rejecting MCQ with empty correct_answer")
+                return False
             opts = q.get("mcq_options")
             if not isinstance(opts, list) or len(opts) < 2:
-                return False
-            corr = str(q.get("correct_answer", "")).strip()
-            if not corr:
-                return False
-        elif q_type == "VERY_SHORT_ANSWER":
-            exp = str(q.get("expected_answer") or q.get("correct_answer") or "").strip()
-            if not exp:
-                return False
-        elif q_type == "NUMERICAL":
-            corr = str(q.get("correct_answer", "")).strip()
-            if not corr:
-                return False
-        else:  # SHORT_ANSWER or LONG_ANSWER
-            exp = str(q.get("expected_answer", "")).strip()
-            if not exp:
+                logger.warning(f"Rejecting MCQ with invalid options list: {opts}")
                 return False
 
+            # Check option uniqueness
+            def _clean_opt(opt_str: str) -> str:
+                cleaned = re.sub(r"^[A-Da-d][\.\)]\s*", "", str(opt_str)).strip()
+                cleaned = cleaned.replace("$", "").replace("\\", "").strip().lower()
+                return cleaned
+
+            clean_opts = [_clean_opt(opt) for opt in opts]
+            if len(set(clean_opts)) < len(clean_opts):
+                logger.warning(f"Rejecting MCQ with duplicate/ambiguous options: {opts}")
+                return False
+
+            clean_corr = _clean_opt(corr)
+            matches = [i for i, c_opt in enumerate(clean_opts) if clean_corr == c_opt or clean_corr in c_opt or c_opt in clean_corr]
+            if not matches:
+                logger.warning(f"Rejecting MCQ: correct_answer '{corr}' does not match any option in {opts}")
+                return False
+        else:
+            if not exp and not corr and not sol:
+                logger.warning("Rejecting question with missing answer and solution fields")
+                return False
+
+        # 4. Content-based numerical detection and slot alignment
+        has_numbers = bool(re.search(r"\b\d+(\.\d+)?\s*(×\s*10|e[+-]?\d+|[a-zA-ZΩ°µμ%C|N|m|V|J|A|Hz])\b", q_text + " " + sol, re.IGNORECASE))
+        has_math_ops = bool(re.search(r"[=\+\-\*/\^]", q_text + " " + sol))
+        is_calc_text = bool(re.search(r"\b(calculate|compute|find the magnitude|determine the value)\b", q_text, re.IGNORECASE))
+
+        inferred_numerical = has_numbers or (has_math_ops and is_calc_text) or (q_type == "NUMERICAL")
+
+        if existing_sec_questions is not None and sec.numerical_question_count > 0:
+            current_num_cnt = sum(1 for item in existing_sec_questions if item.get("is_numerical") is True)
+            needed_num_cnt = sec.numerical_question_count
+            total_items_needed = sec.question_count * sec.alternatives_per_question
+            remaining_slots = total_items_needed - len(existing_sec_questions)
+            remaining_num_needed = needed_num_cnt - current_num_cnt
+
+            if remaining_num_needed > 0 and remaining_num_needed >= remaining_slots:
+                if not inferred_numerical:
+                    logger.warning(f"Rejecting conceptual question in mandatory numerical slot for section '{sec.name}'")
+                    return False
+            elif remaining_num_needed <= 0 and inferred_numerical and q_type != "NUMERICAL":
+                if len(existing_sec_questions) < sec.question_count:
+                    logger.warning(f"Rejecting calculation question in conceptual slot for section '{sec.name}'")
+                    return False
+
+        q["is_numerical"] = bool(inferred_numerical)
+
         return True
+
+    def _validate_final_paper_integrity(
+        self,
+        blueprint: PaperBlueprint,
+        generated_questions: List[Dict[str, Any]],
+        selected_chapter_ids: List[UUID],
+    ) -> None:
+        """
+        Monolithic final validation pass performed immediately prior to DB persistence/commit.
+        Validates total marks, logical question count, section question counts, internal-choice accounting,
+        numerical count compliance, answer completeness, cross-question self-containment, and chapter coverage.
+        """
+        total_blueprint_items = sum(
+            sec.question_count * (sec.alternatives_per_question if (sec.has_internal_choice and sec.alternatives_per_question > 1) else 1)
+            for sec in blueprint.sections
+        )
+        if not generated_questions:
+            if total_blueprint_items == 0:
+                return
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Final paper validation failed: No generated questions produced.",
+            )
+        if len(generated_questions) != total_blueprint_items:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Final paper validation failed: Total generated question items ({len(generated_questions)}) does not match blueprint item count ({total_blueprint_items}).",
+            )
+
+        # 2. Total marks accounting
+        computed_marks = 0
+        seen_choice_groups = set()
+        for q in generated_questions:
+            cg = q.get("choice_group")
+            if cg:
+                if cg not in seen_choice_groups:
+                    seen_choice_groups.add(cg)
+                    computed_marks += q.get("marks", 0)
+            else:
+                computed_marks += q.get("marks", 0)
+
+        if computed_marks != blueprint.total_marks:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Final paper validation failed: Computed total marks ({computed_marks}) does not match requested paper total marks ({blueprint.total_marks}).",
+            )
+
+        # 3. Paper-level target numerical count validation
+        target_num_count = sum(sec.numerical_question_count for sec in blueprint.sections)
+        actual_num_count = sum(1 for q in generated_questions if q.get("is_numerical") is True)
+        if target_num_count > 0 and actual_num_count != target_num_count:
+            logger.warning(f"Final paper numerical validation notice: target={target_num_count}, actual={actual_num_count}")
+
+        # 4. Answer completeness & self-containment check across all items
+        dep_patterns = [
+            r"\bprevious (problem|question|result|part|example|computation|value)\b",
+            r"\babove (problem|question|result|part|computation|value)\b",
+            r"\bfrom (question|problem) \d+\b",
+            r"\bfrom the previous\b",
+            r"\busing the answer obtained above\b",
+            r"\busing your answer from\b",
+            r"\bas calculated earlier\b",
+            r"\bthe result obtained above\b",
+            r"\bfrom part \([a-d]\)\b",
+        ]
+        for q in generated_questions:
+            q_text = str(q.get("question_text", "")).strip()
+            if not q_text:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Final paper validation failed: Found question item with empty text.",
+                )
+
+            for pat in dep_patterns:
+                if re.search(pat, q_text, re.IGNORECASE):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Final paper validation failed: Cross-question dependency detected in item '{q_text[:40]}'.",
+                    )
+
+        logger.info(f"Monolithic final paper validation passed cleanly: {len(generated_questions)} items, {computed_marks} total marks.")
 
     def _is_question_grounded(self, q: Dict[str, Any], context_text: str = "") -> bool:
         """

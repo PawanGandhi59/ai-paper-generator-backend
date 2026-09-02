@@ -179,6 +179,7 @@ class PaperRepository:
                 marks=q_info["marks"],
                 difficulty=diff_val,
                 source_type=q_info.get("source_type", "AI_GENERATED"),
+                is_numerical=bool(q_info.get("is_numerical", False)),
                 choice_group=q_info.get("choice_group"),
                 alternative_label=q_info.get("alternative_label"),
                 mcq_options=q_info.get("mcq_options"),

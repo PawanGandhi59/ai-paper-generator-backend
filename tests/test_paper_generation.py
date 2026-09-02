@@ -1,5 +1,5 @@
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -290,9 +290,9 @@ def test_reference_mode_paper_generation_and_adaptation():
         }
 
         def mock_ref_complete_paper(*args, **kwargs):
-            sec_a = [{"question_text": f"MCQ {i}", "marks": 1, "question_type": "MCQ", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp", "section_name": "Section A", "choice_group": None, "alternative_label": None, "source_type": "AI_GENERATED", "question_order": i, "difficulty": "MEDIUM"} for i in range(1, 11)]
-            sec_b = [{"question_text": f"Short {i}", "marks": 2, "question_type": "SHORT_ANSWER", "expected_answer": "Ans", "solution_explanation": "Exp", "section_name": "Section B", "choice_group": None, "alternative_label": None, "source_type": "AI_GENERATED", "question_order": 10 + i, "difficulty": "MEDIUM"} for i in range(1, 11)]
-            sec_c = [{"question_text": f"Long {i}", "marks": 5, "question_type": "LONG_ANSWER", "expected_answer": "Ans", "solution_explanation": "Exp", "section_name": "Section C", "choice_group": None, "alternative_label": None, "source_type": "AI_GENERATED", "question_order": 20 + i, "difficulty": "MEDIUM"} for i in range(1, 5)]
+            sec_a = [{"question_text": f"MCQ {i}", "marks": 1, "question_type": "MCQ", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp", "section_name": "Section A", "choice_group": None, "alternative_label": None, "source_type": "AI_GENERATED", "question_order": i, "difficulty": "MEDIUM"} for i in range(1, 7)]
+            sec_b = [{"question_text": f"Short {i}", "marks": 2, "question_type": "SHORT_ANSWER", "expected_answer": "Ans", "solution_explanation": "Exp", "section_name": "Section B", "choice_group": None, "alternative_label": None, "source_type": "AI_GENERATED", "question_order": 6 + i, "difficulty": "MEDIUM"} for i in range(1, 8)]
+            sec_c = [{"question_text": f"Long {i}", "marks": 5, "question_type": "LONG_ANSWER", "expected_answer": "Ans", "solution_explanation": "Exp", "section_name": "Section C", "choice_group": None, "alternative_label": None, "source_type": "AI_GENERATED", "question_order": 13 + i, "difficulty": "MEDIUM"} for i in range(1, 7)]
             return sec_a + sec_b + sec_c
 
         with patch.object(BlueprintService, "analyze_reference_paper", return_value=adapted_bp), \
@@ -436,7 +436,7 @@ def test_custom_mode_forces_ai_generated_source_type():
     }
     """
 
-    def mock_generate_response(prompt: str) -> str:
+    def mock_generate_response(prompt: str, *args, **kwargs) -> str:
         return json.dumps({
             "sections": [
                 {
@@ -1221,7 +1221,7 @@ def test_reference_mode_internal_choice_paper_generation():
         "include_answers": True,
     }
 
-    def mock_generate_paper(prompt: str) -> str:
+    def mock_generate_paper(prompt: str, *args, **kwargs) -> str:
         sec_a = [{"question_text": f"Short A {i}", "expected_answer": "Ans", "solution_explanation": "Exp"} for i in range(1, 4)]
         sec_b = [{"question_text": f"Short B {i}", "expected_answer": "Ans", "solution_explanation": "Exp"} for i in range(1, 11)]
         sec_c = [{"question_text": f"Long C {i}", "expected_answer": "Ans", "solution_explanation": "Exp"} for i in range(1, 11)]
@@ -1954,10 +1954,10 @@ def test_very_short_answer_question_type_and_numerical_percentage_blueprint():
     assert sec_b.numerical_question_count == 1
     assert sec_b.numerical_percentage == 20
 
-    # Section C: 2 LONG_ANSWER questions -> 20% of 2 = 1 numerical question
+    # Section C: 2 LONG_ANSWER questions -> proportional share = 0 numerical questions
     sec_c = bp.sections[2]
     assert sec_c.question_type == QuestionType.LONG_ANSWER
-    assert sec_c.numerical_question_count == 1
+    assert sec_c.numerical_question_count == 0
     assert sec_c.numerical_percentage == 20
 
 
@@ -2619,7 +2619,7 @@ def test_polymorphic_reference_paper_lookup_generated_paper():
 
     # Mock RAG & question generation
     with patch.object(pg_svc, "_retrieve_chapter_context", return_value="Context text"), \
-         patch.object(pg_svc, "_generate_complete_paper", return_value=[]), \
+         patch.object(pg_svc, "_generate_complete_paper", return_value=[{"question_text": f"Question {i} text here", "marks": 2, "correct_answer": "A. 1", "mcq_options": ["A. 1", "B. 2"]} for i in range(1, 6)]), \
          patch.object(pg_svc.paper_repo, "save_questions"):
 
         req = PaperGenerateRequest(
@@ -2736,7 +2736,7 @@ def test_uploaded_reference_paper_blueprint_caching():
 
     with patch.object(pg_svc.blueprint_service, "analyze_reference_paper", return_value=mock_blueprint) as mock_analyze, \
          patch.object(pg_svc, "_retrieve_chapter_context", return_value="Context text"), \
-         patch.object(pg_svc, "_generate_complete_paper", return_value=[]), \
+         patch.object(pg_svc, "_generate_complete_paper", return_value=[{"question_text": f"Question {i} text here", "marks": 2, "correct_answer": "A. 1", "mcq_options": ["A. 1", "B. 2"]} for i in range(1, 6)]), \
          patch.object(pg_svc.paper_repo, "save_questions"):
 
         req = PaperGenerateRequest(
@@ -3474,6 +3474,304 @@ def test_custom_difficulty_percentages_validation_and_generation():
     assert data["medium_percentage"] == 20
     assert data["hard_percentage"] == 70
     assert len(data["questions"]) == 10
+
+
+def test_proportional_numerical_percentage_allocation_without_ceil_drift():
+    from app.schemas.paper import QuestionConfigItem, QuestionType
+    from app.services.paper.blueprint_service import BlueprintService
+
+    service = BlueprintService()
+    configs = [
+        QuestionConfigItem(section_name="Section A", question_type=QuestionType.MCQ, question_count=14, marks_per_question=1),
+        QuestionConfigItem(section_name="Section B", question_type=QuestionType.VERY_SHORT_ANSWER, question_count=5, marks_per_question=2),
+        QuestionConfigItem(section_name="Section C", question_type=QuestionType.SHORT_ANSWER, question_count=7, marks_per_question=3),
+        QuestionConfigItem(section_name="Section D", question_type=QuestionType.LONG_ANSWER, question_count=5, marks_per_question=5, alternatives_per_question=2),
+    ]
+
+    # Total logical questions: 14 + 5 + 7 + 5 = 31 questions.
+    # 30% of 31 = round(9.3) = 9 numerical questions globally across the paper.
+    bp = service.build_custom_blueprint(
+        total_marks=70,
+        question_configs=configs,
+        enable_numerical_percentage=True,
+        numerical_percentage=30,
+    )
+
+    total_num_slots = sum(sec.numerical_question_count for sec in bp.sections)
+    assert total_num_slots == 9  # EXACTLY 9 questions (29.0% ~= 30%), NOT 12!
+
+
+def test_validate_question_structure_rejections():
+    from app.schemas.paper import QuestionType
+    from app.services.paper.blueprint_service import SectionBlueprint
+    from app.services.paper.paper_generator_service import PaperGeneratorService
+
+    svc = PaperGeneratorService(db=None)
+    sec_mcq = SectionBlueprint(
+        name="Section A",
+        question_type=QuestionType.MCQ,
+        question_count=5,
+        marks_per_question=1,
+        total_section_marks=5,
+    )
+
+    # 1. Cross-question dependency rejection
+    dep_q = {
+        "question_text": "What is the total charge inside the cube from the previous problem?",
+        "mcq_options": ["A. 1 C", "B. 2 C", "C. 3 C", "D. 4 C"],
+        "correct_answer": "A. 1 C",
+        "solution_explanation": "Sol",
+    }
+    assert svc._validate_question_structure(dep_q, sec_mcq) is False
+
+    # 2. Variable symbol collision rejection
+    var_q = {
+        "question_text": "Consider a field with a = 800 N/C and cube side length a = 0.1 m.",
+        "mcq_options": ["A. 1 C", "B. 2 C", "C. 3 C", "D. 4 C"],
+        "correct_answer": "A. 1 C",
+        "solution_explanation": "Sol",
+    }
+    assert svc._validate_question_structure(var_q, sec_mcq) is False
+
+    # 3. MCQ correct_answer not matching options
+    mismatch_q = {
+        "question_text": "What is Coulomb force?",
+        "mcq_options": ["A. 1.0 N", "B. 2.0 N", "C. 3.0 N", "D. 4.0 N"],
+        "correct_answer": "E. 5.0 N",
+        "solution_explanation": "Sol",
+    }
+    assert svc._validate_question_structure(mismatch_q, sec_mcq) is False
+
+    # 4. Valid self-contained MCQ with calculation
+    valid_q = {
+        "question_text": "Calculate the force between charges q₁ = 2 × 10⁻⁷ C and q₂ = 3 × 10⁻⁷ C at distance r = 0.3 m in vacuum.",
+        "mcq_options": ["A. 6.0 × 10⁻³ N", "B. 5.4 × 10⁻³ N", "C. 6.0 × 10⁻⁵ N", "D. 1.8 × 10⁻² N"],
+        "correct_answer": "A. 6.0 × 10⁻³ N",
+        "solution_explanation": "F = (9 × 10⁹ × 2 × 10⁻⁷ × 3 × 10⁻⁷) / (0.3)² = 6.0 × 10⁻³ N.",
+    }
+    assert svc._validate_question_structure(valid_q, sec_mcq) is True
+    assert valid_q["is_numerical"] is True
+
+
+def test_gemini_native_response_schema_pass_through():
+    from app.schemas.paper import GeminiCompletePaperSchema
+    from app.services.ai.gemini_service import GeminiService
+
+    svc = GeminiService(api_key="test-key")
+    with patch.object(svc.client.models, "generate_content") as mock_gen:
+        mock_gen.return_value = MagicMock(text='{"sections": []}', candidates=[])
+        svc.generate_response("prompt", response_schema=GeminiCompletePaperSchema)
+
+        mock_gen.assert_called_once()
+        config_arg = mock_gen.call_args.kwargs.get("config")
+        assert config_arg.response_schema == GeminiCompletePaperSchema
+        assert config_arg.response_mime_type == "application/json"
+
+
+def test_numerical_percentage_allocation_edge_cases():
+    from app.schemas.paper import QuestionConfigItem, QuestionType
+    from app.services.paper.blueprint_service import BlueprintService
+
+    service = BlueprintService()
+    configs = [
+        QuestionConfigItem(section_name="Section A", question_type=QuestionType.MCQ, question_count=10, marks_per_question=1),
+        QuestionConfigItem(section_name="Section B", question_type=QuestionType.SHORT_ANSWER, question_count=5, marks_per_question=2),
+    ]
+
+    # 1. 0% numerical percentage -> 0 numerical slots
+    bp_0 = service.build_custom_blueprint(total_marks=20, question_configs=configs, enable_numerical_percentage=True, numerical_percentage=0)
+    assert sum(s.numerical_question_count for s in bp_0.sections) == 0
+
+    # 2. 100% numerical percentage -> 15 numerical slots
+    bp_100 = service.build_custom_blueprint(total_marks=20, question_configs=configs, enable_numerical_percentage=True, numerical_percentage=100)
+    assert sum(s.numerical_question_count for s in bp_100.sections) == 15
+
+    # 3. 50% numerical percentage -> 8 numerical slots (round(15 * 0.5) = 8)
+    bp_50 = service.build_custom_blueprint(total_marks=20, question_configs=configs, enable_numerical_percentage=True, numerical_percentage=50)
+    assert sum(s.numerical_question_count for s in bp_50.sections) == 8
+
+
+def test_mcq_duplicate_or_ambiguous_options_rejection():
+    from app.schemas.paper import QuestionType
+    from app.services.paper.blueprint_service import SectionBlueprint
+    from app.services.paper.paper_generator_service import PaperGeneratorService
+
+    svc = PaperGeneratorService(db=None)
+    sec_mcq = SectionBlueprint(name="Section A", question_type=QuestionType.MCQ, question_count=5, marks_per_question=1, total_section_marks=5)
+
+    ambiguous_q = {
+        "question_text": "What is the charge of an electron?",
+        "mcq_options": ["A. 1.6 × 10⁻¹⁹ C", "B. 1.6 × 10⁻¹⁹ C", "C. 3.2 × 10⁻¹⁹ C", "D. Zero"],
+        "correct_answer": "A. 1.6 × 10⁻¹⁹ C",
+        "solution_explanation": "Charge is 1.6e-19 C.",
+    }
+    assert svc._validate_question_structure(ambiguous_q, sec_mcq) is False
+
+
+def test_cross_question_dependency_phrase_variations():
+    from app.schemas.paper import QuestionType
+    from app.services.paper.blueprint_service import SectionBlueprint
+    from app.services.paper.paper_generator_service import PaperGeneratorService
+
+    svc = PaperGeneratorService(db=None)
+    sec_mcq = SectionBlueprint(name="Section A", question_type=QuestionType.MCQ, question_count=5, marks_per_question=1, total_section_marks=5)
+
+    phrases = [
+        "as calculated earlier in Q2",
+        "using your answer from question 5",
+        "using the answer obtained above",
+        "the result obtained above",
+    ]
+    for ph in phrases:
+        q = {
+            "question_text": f"Find the total flux {ph} for the given sphere.",
+            "mcq_options": ["A. 1 N m² C⁻¹", "B. 2 N m² C⁻¹", "C. 3 N m² C⁻¹", "D. 4 N m² C⁻¹"],
+            "correct_answer": "A. 1 N m² C⁻¹",
+            "solution_explanation": "Sol",
+        }
+        assert svc._validate_question_structure(q, sec_mcq) is False, f"Failed to reject phrase: {ph}"
+
+
+def test_validate_final_paper_integrity_pass_and_failure():
+    from fastapi import HTTPException
+    from app.schemas.paper import QuestionType, QuestionConfigItem
+    from app.services.paper.blueprint_service import BlueprintService
+    from app.services.paper.paper_generator_service import PaperGeneratorService
+
+    svc = PaperGeneratorService(db=None)
+    bp_svc = BlueprintService()
+    cfgs = [
+        QuestionConfigItem(section_name="Section A", question_type=QuestionType.MCQ, question_count=5, marks_per_question=1),
+    ]
+    bp = bp_svc.build_custom_blueprint(total_marks=5, question_configs=cfgs)
+
+    valid_questions = [
+        {"question_text": f"Question {i} text here", "marks": 1, "section_name": "Section A", "correct_answer": "A. 1", "mcq_options": ["A. 1", "B. 2"]}
+        for i in range(1, 6)
+    ]
+
+    # Should pass cleanly
+    svc._validate_final_paper_integrity(blueprint=bp, generated_questions=valid_questions, selected_chapter_ids=[])
+
+    # Should raise HTTP 400 when question count mismatch
+    incomplete_questions = valid_questions[:4]
+    with pytest.raises(HTTPException) as exc_info:
+        svc._validate_final_paper_integrity(blueprint=bp, generated_questions=incomplete_questions, selected_chapter_ids=[])
+    assert exc_info.value.status_code == 400
+    assert "Total generated question items" in exc_info.value.detail
+
+
+def test_unicode_json_response_serialization():
+    from app.main import app
+    from fastapi.testclient import TestClient
+
+    tc = TestClient(app)
+
+    @app.get("/api/v1/test-unicode")
+    def dummy_unicode_route():
+        return {"temperature": "27°C", "force": "5.4 × 10⁻³ N", "resistance": "100 Ω"}
+
+    res = tc.get("/api/v1/test-unicode")
+    assert res.status_code == 200
+    raw_content = res.content.decode("utf-8")
+    assert "27°C" in raw_content
+    assert "5.4 × 10⁻³ N" in raw_content
+    assert "100 Ω" in raw_content
+    assert "\\u00b0" not in raw_content.lower()
+    assert "\\u03a9" not in raw_content.lower()
+
+
+def test_non_eligible_generated_paper_fallback_to_json_blueprint():
+    from uuid import uuid4
+    from unittest.mock import MagicMock, patch
+    from app.schemas.paper import PaperGenerateRequest, GenerationMode
+    from app.services.paper.paper_generator_service import PaperGeneratorService
+
+    book_id = uuid4()
+    ch_id = uuid4()
+    subject_id = uuid4()
+    workspace_id = uuid4()
+    user_id = uuid4()
+    ref_gen_paper_id = uuid4()
+
+    mock_db = MagicMock()
+    pg_svc = PaperGeneratorService(db=mock_db)
+
+    mock_book = MagicMock(id=book_id, subject_id=subject_id)
+    mock_subject = MagicMock(id=subject_id, workspace_id=workspace_id)
+    mock_ch = MagicMock(id=ch_id)
+
+    pg_svc.workspace_service.get_book = MagicMock(return_value=mock_book)
+    pg_svc.workspace_service.get_subject = MagicMock(return_value=mock_subject)
+    pg_svc.workspace_service.get_workspace = MagicMock(return_value=MagicMock(id=workspace_id))
+    pg_svc.workspace_service.list_chapters = MagicMock(return_value=[mock_ch])
+    pg_svc.ref_paper_repo.get_reference_paper = MagicMock(return_value=None)
+
+    non_eligible_paper = MagicMock()
+    non_eligible_paper.id = ref_gen_paper_id
+    non_eligible_paper.subject_id = subject_id
+    non_eligible_paper.workspace_id = workspace_id
+    non_eligible_paper.total_marks = 10
+    non_eligible_paper.generation_mode = "CUSTOM"
+    non_eligible_paper.pdf_path = None
+    non_eligible_paper.document_id = None
+    non_eligible_paper.processing_status = "NOT_SAVED"
+    non_eligible_paper.deleted_at = None
+    non_eligible_paper.blueprint_json = {
+        "total_marks": 10,
+        "sections": [
+            {
+                "name": "Section A",
+                "question_type": "SHORT_ANSWER",
+                "question_count": 5,
+                "marks_per_question": 2,
+                "total_section_marks": 10,
+                "has_internal_choice": False,
+                "alternatives_per_question": 1,
+            }
+        ],
+        "sample_questions": [],
+    }
+    non_eligible_paper.questions = []
+
+    created_paper = MagicMock()
+    created_paper.id = uuid4()
+    created_paper.user_id = user_id
+    created_paper.workspace_id = workspace_id
+    created_paper.subject_id = subject_id
+    created_paper.book_id = book_id
+    created_paper.reference_paper_id = None
+    created_paper.title = "Fallback Paper Test"
+    created_paper.generation_mode = "REFERENCE"
+    created_paper.status = "COMPLETED"
+    created_paper.total_marks = 10
+    created_paper.difficulty = "MIXED"
+    created_paper.topic_focus = None
+    created_paper.selected_chapter_ids = [str(ch_id)]
+    created_paper.include_answers = True
+    created_paper.blueprint_json = non_eligible_paper.blueprint_json
+    created_paper.error_message = None
+    created_paper.questions = []
+
+    pg_svc.paper_repo.get_paper = MagicMock(side_effect=[non_eligible_paper, created_paper])
+    pg_svc.paper_repo.create_paper = MagicMock(return_value=created_paper)
+    pg_svc.paper_repo.update_status = MagicMock()
+
+    with patch.object(pg_svc, "_retrieve_chapter_context", return_value="Context text"), \
+         patch.object(pg_svc, "_generate_complete_paper", return_value=[{"question_text": f"Question {i}", "marks": 2, "correct_answer": "Ans", "solution_explanation": "Exp"} for i in range(1, 6)]), \
+         patch.object(pg_svc.paper_repo, "save_questions"):
+
+        req = PaperGenerateRequest(
+            book_id=book_id,
+            selected_chapter_ids=[ch_id],
+            generation_mode=GenerationMode.REFERENCE,
+            total_marks=10,
+            reference_paper_id=ref_gen_paper_id,
+        )
+
+        res = pg_svc.generate_paper(current_user_id=user_id, request_data=req)
+        assert res.generation_mode == GenerationMode.REFERENCE
+        assert res.total_marks == 10
 
 
 
