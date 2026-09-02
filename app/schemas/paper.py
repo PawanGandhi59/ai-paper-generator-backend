@@ -225,3 +225,24 @@ class PaperResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+
+class GeminiGeneratedQuestionSchema(BaseModel):
+    question_text: str = Field(..., description="Full text of the question item")
+    mcq_options: Optional[List[str]] = Field(None, description="Exactly 4 option strings for MCQs ('A. ...', 'B. ...', 'C. ...', 'D. ...')")
+    correct_answer: str = Field(..., description="Unambiguously correct option or short answer")
+    expected_answer: Optional[str] = Field(None, description="Detailed expected answer or model solution")
+    solution_explanation: str = Field(..., description="Step-by-step solution, derivation, or explanation")
+    is_numerical: bool = Field(False, description="Whether question involves quantitative calculation")
+    chapter_number: Optional[int] = Field(None, description="1-based integer chapter number for chapter attribution")
+    difficulty: Optional[str] = Field(None, description="'EASY', 'MEDIUM', or 'HARD'")
+    source_type: Optional[str] = Field(None, description="'AI_GENERATED', 'REFERENCE_REUSED', or 'REFERENCE_VARIATION'")
+
+
+class GeminiSectionQuestionsSchema(BaseModel):
+    section_name: str = Field(..., description="Name of the blueprint section")
+    questions: List[GeminiGeneratedQuestionSchema] = Field(default_factory=list)
+
+
+class GeminiCompletePaperSchema(BaseModel):
+    sections: List[GeminiSectionQuestionsSchema] = Field(default_factory=list)
+

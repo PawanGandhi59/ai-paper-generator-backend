@@ -151,6 +151,29 @@ class BlueprintService:
                 detail="CUSTOM mode paper generation requires non-empty question_configs.",
             )
 
+        total_logical_questions = sum(cfg.question_count for cfg in question_configs)
+        total_target_numerical = 0
+        if enable_numerical_percentage and numerical_percentage and numerical_percentage > 0:
+            total_target_numerical = int(round(total_logical_questions * (numerical_percentage / 100.0)))
+            if numerical_percentage > 0 and total_logical_questions > 0:
+                total_target_numerical = max(0, min(total_logical_questions, total_target_numerical))
+
+        sec_num_counts = [0] * len(question_configs)
+        if total_target_numerical > 0 and total_logical_questions > 0:
+            raw_counts = [(cfg.question_count * total_target_numerical) / float(total_logical_questions) for cfg in question_configs]
+            floor_counts = [int(math.floor(rc)) for rc in raw_counts]
+            remainders = [(rc - fc, i) for i, (rc, fc) in enumerate(zip(raw_counts, floor_counts))]
+            remainders.sort(key=lambda x: x[0], reverse=True)
+
+            assigned = sum(floor_counts)
+            unassigned = total_target_numerical - assigned
+            for k in range(min(unassigned, len(question_configs))):
+                sec_idx = remainders[k][1]
+                floor_counts[sec_idx] += 1
+
+            for i, cfg in enumerate(question_configs):
+                sec_num_counts[i] = min(cfg.question_count, floor_counts[i])
+
         sections: List[SectionBlueprint] = []
         for idx, cfg in enumerate(question_configs):
             sec_name = cfg.section_name or f"Section {chr(65 + idx)}"
@@ -160,15 +183,8 @@ class BlueprintService:
             has_choice = alts_per_q > 1
             c_rule = "answer_one_of_two" if has_choice else None
 
-            num_count = 0
-            num_pct = None
-            if enable_numerical_percentage and numerical_percentage and numerical_percentage > 0:
-                num_pct = numerical_percentage
-                # Calculate required numerical questions in section based on percentage
-                calc_val = (cfg.question_count * numerical_percentage) / 100.0
-                num_count = max(1, math.ceil(calc_val)) if calc_val > 0 else 0
-                if num_count > cfg.question_count:
-                    num_count = cfg.question_count
+            num_count = sec_num_counts[idx]
+            num_pct = numerical_percentage if (enable_numerical_percentage and numerical_percentage and numerical_percentage > 0) else None
 
             sections.append(
                 SectionBlueprint(

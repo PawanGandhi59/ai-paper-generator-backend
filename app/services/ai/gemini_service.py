@@ -65,6 +65,7 @@ class GeminiService(AIService):
         prompt: str,
         system_instruction: Optional[str] = None,
         max_output_tokens: Optional[int] = None,
+        response_schema: Optional[Any] = None,
     ) -> str:
         if not self.client:
             raise RuntimeError("GeminiService client is not initialized.")
@@ -74,6 +75,7 @@ class GeminiService(AIService):
         config = types.GenerateContentConfig(
             system_instruction=sys_instruct,
             response_mime_type="application/json",
+            response_schema=response_schema,
             temperature=0.2,
             max_output_tokens=token_limit,
         )
