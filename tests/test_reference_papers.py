@@ -537,7 +537,7 @@ def test_subject_scoped_reference_paper_isolation_and_cross_subject_rejection():
     # 3. Physics reference + Mathematics paper generation request -> MUST REJECT (HTTP 400 Bad Request)
     cross_gen_payload = {
         "book_id": math_book["id"],
-        "selected_chapter_ids": [math_ch["id"]],
+        "selected_chapters": [{"chapter_id": math_ch["id"]}],
         "generation_mode": "REFERENCE",
         "reference_paper_id": phys_ref["id"],
         "total_marks": 20,
@@ -549,7 +549,7 @@ def test_subject_scoped_reference_paper_isolation_and_cross_subject_rejection():
     # 4. Physics reference + Physics paper generation request -> MUST SUCCEED (HTTP 201 Created)
     same_gen_payload = {
         "book_id": phys_book["id"],
-        "selected_chapter_ids": [phys_ch["id"]],
+        "selected_chapters": [{"chapter_id": phys_ch["id"]}],
         "generation_mode": "REFERENCE",
         "reference_paper_id": phys_ref["id"],
         "total_marks": 20,
@@ -632,7 +632,7 @@ def test_reference_mode_source_type_traceability():
 
     gen_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch["id"]],
+        "selected_chapters": [{"chapter_id": ch["id"]}],
         "generation_mode": "REFERENCE",
         "reference_paper_id": ref_paper["id"],
         "total_marks": 6,

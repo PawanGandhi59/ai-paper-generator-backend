@@ -33,6 +33,7 @@ class PaperRepository:
         easy_percentage: Optional[int] = None,
         medium_percentage: Optional[int] = None,
         hard_percentage: Optional[int] = None,
+        chapter_weightages: Optional[List[Dict[str, Any]]] = None,
     ) -> GeneratedPaper:
         paper_title = title or f"Generated Paper ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')})"
         paper = GeneratedPaper(
@@ -54,6 +55,7 @@ class PaperRepository:
             hard_percentage=hard_percentage,
             topic_focus=topic_focus,
             selected_chapter_ids=[str(cid) for cid in selected_chapter_ids],
+            chapter_weightages=chapter_weightages,
             include_answers=include_answers,
             blueprint_json=blueprint_json,
         )
@@ -168,6 +170,29 @@ class PaperRepository:
                 paper = self.db.get(GeneratedPaper, paper_id)
                 diff_val = paper.difficulty if (paper and paper.difficulty) else "MEDIUM"
 
+            # Visual fields extraction
+            vis_info = q_info.get("visual")
+            vis_req = False
+            vis_type = None
+            vis_title = None
+            vis_caption = None
+            vis_spec = None
+
+            if isinstance(vis_info, dict):
+                vis_req = bool(vis_info.get("required", False))
+                vis_type = vis_info.get("type")
+                vis_title = vis_info.get("title")
+                vis_caption = vis_info.get("caption")
+                vis_spec = vis_info.get("spec")
+            elif hasattr(vis_info, "required"):
+                vis_req = bool(vis_info.required)
+                vis_type = vis_info.type
+                vis_title = vis_info.title
+                vis_caption = vis_info.caption
+                vis_spec = vis_info.spec
+
+            vis_svg = q_info.get("visual_svg")
+
             question = GeneratedPaperQuestion(
                 id=uuid.uuid4(),
                 paper_id=paper_id,
@@ -188,6 +213,12 @@ class PaperRepository:
                 numerical_values=q_info.get("numerical_values"),
                 solution_explanation=q_info.get("solution_explanation"),
                 unit=q_info.get("unit"),
+                visual_required=vis_req,
+                visual_type=vis_type,
+                visual_title=vis_title,
+                visual_caption=vis_caption,
+                visual_spec=vis_spec,
+                visual_svg=vis_svg,
             )
             self.db.add(question)
             created_questions.append(question)

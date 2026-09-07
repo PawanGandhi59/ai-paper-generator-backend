@@ -58,7 +58,7 @@ class ChartData(BaseModel):
 
 class VisualSpec(BaseModel):
     id: str = Field(..., description="Unique visual identifier")
-    type: Literal["diagram", "chart"] = Field(..., description="Visual classification: diagram or chart")
+    type: str = Field(..., description="Visual classification: diagram, chart, geometry, etc.")
     format: str = Field("flowchart", description="Format identifier: flowchart, tree, classification, sequence, bar, line, pie")
     title: str = Field(..., description="Title of the visual")
     caption: Optional[str] = Field(None, description="Caption or explanation")
@@ -437,14 +437,54 @@ class SVGRenderer:
     @classmethod
     def _render_chart(cls, spec: VisualSpec) -> str:
         data_raw = spec.data or {}
-        try:
-            chart_data = ChartData(**data_raw) if isinstance(data_raw, dict) else data_raw
-        except Exception:
+        
+        # Support Gemini ChartDataSpec payload with 'series' and axis labels
+        categories = []
+        values = []
+        x_label = ""
+        y_label = ""
+        fmt = spec.format or "bar"
+
+        if isinstance(data_raw, dict):
+            if "format" in data_raw and data_raw["format"]:
+                fmt = data_raw["format"]
+            if "x_axis_label" in data_raw and data_raw["x_axis_label"]:
+                x_label = str(data_raw["x_axis_label"])
+            elif "x_label" in data_raw and data_raw["x_label"]:
+                x_label = str(data_raw["x_label"])
+            if "y_axis_label" in data_raw and data_raw["y_axis_label"]:
+                y_label = str(data_raw["y_axis_label"])
+            elif "y_label" in data_raw and data_raw["y_label"]:
+                y_label = str(data_raw["y_label"])
+
+            categories = data_raw.get("categories", []) or []
+
+            # Handle series array e.g. [{"name": "Marks", "values": [...]}]
+            if "series" in data_raw and isinstance(data_raw["series"], list) and len(data_raw["series"]) > 0:
+                first_series = data_raw["series"][0]
+                if isinstance(first_series, dict) and "values" in first_series:
+                    raw_vals = first_series["values"]
+                elif hasattr(first_series, "values"):
+                    raw_vals = first_series.values
+                else:
+                    raw_vals = []
+                values = [float(v) for v in raw_vals if v is not None]
+            elif "values" in data_raw and isinstance(data_raw["values"], list):
+                values = [float(v) for v in data_raw["values"] if v is not None]
+
+            chart_data = ChartData(
+                x_label=x_label,
+                y_label=y_label,
+                categories=categories,
+                values=values,
+            )
+        elif isinstance(data_raw, ChartData):
+            chart_data = data_raw
+            categories = chart_data.categories or []
+            values = chart_data.values or []
+        else:
             chart_data = ChartData()
 
-        categories = chart_data.categories or []
-        values = chart_data.values or []
-        fmt = spec.format
         title_escaped = html.escape(spec.title or "Chart")
 
         if not categories or not values or len(categories) != len(values):

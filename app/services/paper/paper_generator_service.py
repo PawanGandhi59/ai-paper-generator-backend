@@ -35,6 +35,8 @@ from app.services.ai.gemini_service import (
 )
 from app.services.embeddings.gemini_embedding_service import GeminiEmbeddingService
 from app.services.paper.blueprint_service import BlueprintService, PaperBlueprint, SectionBlueprint
+from app.services.processors.pdf_processor import PDFProcessor
+from app.services.retrieval.chunking_service import ChunkingService
 from app.services.retrieval.retrieval_service import RetrievalService
 from app.services.workspace_service import WorkspaceService
 
@@ -83,10 +85,13 @@ class PaperGeneratorService:
         subject = self.workspace_service.get_subject(subject_id, current_user_id)
         workspace_id = subject.workspace_id
 
+        # Extract selected_ch_ids from unified selected_chapters
+        selected_ch_ids = [ch.chapter_id for ch in request_data.selected_chapters]
+
         # Verify selected_chapter_ids belong to the selected book
         book_chapters = self.workspace_service.list_chapters(book.id, current_user_id)
         book_chapter_ids = {c.id for c in book_chapters}
-        for ch_id in request_data.selected_chapter_ids:
+        for ch_id in selected_ch_ids:
             if ch_id not in book_chapter_ids:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -143,6 +148,39 @@ class PaperGeneratorService:
 
 
 
+        # 1.5. Calculate structured chapter weightages
+        selected_ch_models = [c for c in book_chapters if c.id in selected_ch_ids]
+        ch_map = {c.id: c for c in selected_ch_models}
+        ordered_chapters = [ch_map[cid] for cid in selected_ch_ids if cid in ch_map]
+
+        num_selected = len(ordered_chapters)
+        weightage_lookup = {ch.chapter_id: ch.weightage_percentage for ch in request_data.selected_chapters if ch.weightage_percentage is not None}
+        has_custom_weights = bool(weightage_lookup)
+
+        chapter_weightages_data: List[Dict[str, Any]] = []
+        if num_selected > 0:
+            raw_allocations = []
+            for ch in ordered_chapters:
+                pct = weightage_lookup.get(ch.id, 100.0 / num_selected if not has_custom_weights else 0.0)
+                raw_marks = request_data.total_marks * (pct / 100.0)
+                int_marks = int(round(raw_marks))
+                raw_allocations.append({
+                    "chapter_id": str(ch.id),
+                    "chapter_number": ch.chapter_number,
+                    "chapter_name": getattr(ch, "name", None) or getattr(ch, "title", None) or f"Chapter {ch.chapter_number}",
+                    "weightage_percentage": round(pct, 2),
+                    "allocated_marks": int_marks,
+                })
+
+            # Adjust allocated_marks rounding so sum == total_marks
+            allocated_sum = sum(a["allocated_marks"] for a in raw_allocations)
+            diff = request_data.total_marks - allocated_sum
+            if diff != 0 and raw_allocations:
+                max_item = max(raw_allocations, key=lambda x: x["allocated_marks"])
+                max_item["allocated_marks"] += diff
+
+            chapter_weightages_data = raw_allocations
+
         # 2. Create Initial Paper Record (PENDING)
         paper = self.paper_repo.create_paper(
             user_id=current_user_id,
@@ -154,8 +192,8 @@ class PaperGeneratorService:
             time_allowed_minutes=request_data.time_allowed_minutes,
             class_name=request_data.class_name,
             difficulty=request_data.difficulty.value,
-
-            selected_chapter_ids=request_data.selected_chapter_ids,
+            selected_chapter_ids=selected_ch_ids,
+            chapter_weightages=chapter_weightages_data,
             include_answers=request_data.include_answers,
             title=request_data.title,
             topic_focus=request_data.topic_focus,
@@ -250,7 +288,7 @@ class PaperGeneratorService:
                 workspace_id=workspace_id,
                 subject_id=subject_id,
                 book_id=book.id,
-                selected_chapter_ids=request_data.selected_chapter_ids,
+                selected_chapter_ids=selected_ch_ids,
                 topic_focus=request_data.topic_focus,
             )
 
@@ -265,13 +303,16 @@ class PaperGeneratorService:
                 easy_pct=request_data.easy_percentage,
                 med_pct=request_data.medium_percentage,
                 hard_pct=request_data.hard_percentage,
+                chapter_weightages_data=chapter_weightages_data,
             )
 
             # 5.5 Final Monolithic Complete-Paper Integrity Pass
             self._validate_final_paper_integrity(
                 blueprint=blueprint,
                 generated_questions=generated_questions,
-                selected_chapter_ids=request_data.selected_chapter_ids,
+                selected_chapter_ids=selected_ch_ids,
+                chapter_weightages_data=chapter_weightages_data,
+                generation_mode=request_data.generation_mode,
             )
 
             # 6. Save Questions to DB
@@ -472,6 +513,7 @@ class PaperGeneratorService:
         easy_pct: Optional[int] = None,
         med_pct: Optional[int] = None,
         hard_pct: Optional[int] = None,
+        chapter_weightages_data: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Generate the ENTIRE examination paper in ONE single Gemini API request.
@@ -491,6 +533,7 @@ class PaperGeneratorService:
             easy_pct=easy_pct,
             med_pct=med_pct,
             hard_pct=hard_pct,
+            chapter_weightages_data=chapter_weightages_data,
         )
 
         # Actual Gemini SDK Token Capacity Check (1,000,000 token limit minus output headroom allowance)
@@ -515,6 +558,9 @@ class PaperGeneratorService:
 
         all_validated_questions: List[Dict[str, Any]] = []
         current_q_order = 1
+
+        ch_num_to_item = {item["chapter_number"]: item for item in (chapter_weightages_data or []) if "chapter_number" in item}
+        default_ch_item = chapter_weightages_data[0] if (chapter_weightages_data and len(chapter_weightages_data) > 0) else None
 
         for sec in blueprint.sections:
             alts_per_q = sec.alternatives_per_question if (sec.has_internal_choice and sec.alternatives_per_question > 1) else 1
@@ -548,30 +594,73 @@ class PaperGeneratorService:
 
                 if self._validate_question_structure(cand, sec, existing_sec_questions=sec_questions):
                     if not self._is_duplicate_question(cand, all_validated_questions + sec_questions):
-                        total_paper_items = sum(
-                            s.question_count * (s.alternatives_per_question if (s.has_internal_choice and s.alternatives_per_question > 1) else 1)
-                            for s in blueprint.sections
-                        )
-                        max_reused_allowed = max(1, int(0.20 * total_paper_items))
-                        max_variation_allowed = max(1, int(0.20 * total_paper_items))
+                        # Map chapter attribution
+                        cand_ch_num = cand.get("chapter_number")
+                        matched_item = None
+                        if cand_ch_num and cand_ch_num in ch_num_to_item:
+                            matched_item = ch_num_to_item[cand_ch_num]
+                        elif default_ch_item:
+                            matched_item = default_ch_item
+
+                        if matched_item:
+                            cand["chapter_id"] = matched_item.get("chapter_id")
+                            cand["chapter_number"] = matched_item.get("chapter_number")
 
                         if generation_mode == GenerationMode.CUSTOM or not sec_ref:
                             cand["source_type"] = "AI_GENERATED"
                         else:
                             cand_st = str(cand.get("source_type", "")).upper()
-                            cur_reused = sum(1 for q in (all_validated_questions + sec_questions) if q.get("source_type") == "REFERENCE_REUSED")
-                            cur_variation = sum(1 for q in (all_validated_questions + sec_questions) if q.get("source_type") == "REFERENCE_VARIATION")
+                            cand_marks = sec.marks_per_question
+
+                            # Dual-Cap Reference Reuse Constraints:
+                            # 1. Overall paper limit (max 20% of total marks or at least 1 question item)
+                            max_overall_reused_marks = max(sec.marks_per_question, int(0.20 * blueprint.total_marks))
+                            max_overall_variation_marks = max(sec.marks_per_question, int(0.20 * blueprint.total_marks))
+
+                            cur_total_reused_marks = sum(
+                                q.get("marks", sec.marks_per_question)
+                                for q in (all_validated_questions + sec_questions)
+                                if q.get("source_type") == "REFERENCE_REUSED"
+                            )
+                            cur_total_variation_marks = sum(
+                                q.get("marks", sec.marks_per_question)
+                                for q in (all_validated_questions + sec_questions)
+                                if q.get("source_type") == "REFERENCE_VARIATION"
+                            )
+
+                            # 2. Per-chapter weightage cap (cannot exceed chapter allocated marks)
+                            ch_alloc_marks = matched_item.get("allocated_marks", blueprint.total_marks) if matched_item else blueprint.total_marks
+                            cur_ch_reused_marks = sum(
+                                q.get("marks", sec.marks_per_question)
+                                for q in (all_validated_questions + sec_questions)
+                                if q.get("chapter_id") == (matched_item["chapter_id"] if matched_item else None)
+                                and q.get("source_type") == "REFERENCE_REUSED"
+                            )
+                            cur_ch_variation_marks = sum(
+                                q.get("marks", sec.marks_per_question)
+                                for q in (all_validated_questions + sec_questions)
+                                if q.get("chapter_id") == (matched_item["chapter_id"] if matched_item else None)
+                                and q.get("source_type") == "REFERENCE_VARIATION"
+                            )
 
                             if cand_st == "REFERENCE_REUSED":
-                                if cur_reused >= max_reused_allowed:
-                                    logger.info(f"Discarding excess REFERENCE_REUSED candidate beyond 20% quota ({cur_reused}/{max_reused_allowed}). Triggering fresh recovery.")
-                                    continue
-                                cand["source_type"] = "REFERENCE_REUSED"
+                                if (cur_total_reused_marks + cand_marks > max_overall_reused_marks) or (cur_ch_reused_marks + cand_marks > ch_alloc_marks):
+                                    logger.info(
+                                        f"REFERENCE_REUSED exceeds dual-cap (overall {cur_total_reused_marks}/{max_overall_reused_marks} marks, "
+                                        f"chapter {cur_ch_reused_marks}/{ch_alloc_marks} marks). Converting candidate to AI_GENERATED."
+                                    )
+                                    cand["source_type"] = "AI_GENERATED"
+                                else:
+                                    cand["source_type"] = "REFERENCE_REUSED"
                             elif cand_st == "REFERENCE_VARIATION":
-                                if cur_variation >= max_variation_allowed:
-                                    logger.info(f"Discarding excess REFERENCE_VARIATION candidate beyond 20% quota ({cur_variation}/{max_variation_allowed}). Triggering fresh recovery.")
-                                    continue
-                                cand["source_type"] = "REFERENCE_VARIATION"
+                                if (cur_total_variation_marks + cand_marks > max_overall_variation_marks) or (cur_ch_variation_marks + cand_marks > ch_alloc_marks):
+                                    logger.info(
+                                        f"REFERENCE_VARIATION exceeds dual-cap (overall {cur_total_variation_marks}/{max_overall_variation_marks} marks, "
+                                        f"chapter {cur_ch_variation_marks}/{ch_alloc_marks} marks). Converting candidate to AI_GENERATED."
+                                    )
+                                    cand["source_type"] = "AI_GENERATED"
+                                else:
+                                    cand["source_type"] = "REFERENCE_VARIATION"
                             else:
                                 cand["source_type"] = "AI_GENERATED"
 
@@ -625,7 +714,8 @@ Return ONLY valid JSON matching this schema:
       "mcq_options": ["A. ...", "B. ...", "C. ...", "D. ..."],
       "correct_answer": "...",
       "expected_answer": "...",
-      "solution_explanation": "..."
+      "solution_explanation": "...",
+      "visual": null
     }}
   ]
 }}"""
@@ -693,7 +783,58 @@ Return ONLY valid JSON matching this schema:
             all_validated_questions.extend(sec_questions)
             current_q_order += sec.question_count
 
+        self._process_question_visuals_in_memory(all_validated_questions)
         return all_validated_questions
+
+    def _process_question_visuals_in_memory(self, questions: List[Dict[str, Any]]) -> None:
+        """
+        Process visual specifications for generated questions in memory using SVGGeneratorService
+        and VisualSemanticValidator. Distinguishes required vs optional visual failures.
+        """
+        from app.services.visuals.svg_generator_service import SVGGeneratorService
+        from app.services.visuals.visual_semantic_validator import VisualSemanticValidator
+        svg_service = SVGGeneratorService()
+
+        for q in questions:
+            visual_spec = q.get("visual")
+            if not visual_spec:
+                continue
+
+            q_text = str(q.get("question_text") or "")
+            sol_text = str(q.get("solution_explanation") or "")
+
+            # 1. Deterministic Semantic Sanity Validation
+            semantic_res = VisualSemanticValidator.validate(
+                question_text=q_text,
+                visual_spec=visual_spec,
+                solution_text=sol_text,
+            )
+
+            is_required = False
+            if hasattr(visual_spec, "required"):
+                is_required = getattr(visual_spec, "required", False)
+            elif isinstance(visual_spec, dict):
+                is_required = visual_spec.get("required", False)
+
+            if not semantic_res.is_valid:
+                error_msg = "; ".join(semantic_res.errors)
+                logger.warning(f"Semantic visual validation failed for '{q_text[:50]}...': {error_msg}")
+                if is_required:
+                    q["visual_svg"] = None
+                    q["visual_valid"] = False
+                    q["visual_error"] = f"Semantic visual mismatch: {error_msg}"
+                    continue
+
+            # 2. SVG Generation & Structural Rendering
+            res = svg_service.generate(visual_spec)
+            q["visual_svg"] = res.svg_raw if res.is_valid else None
+            q["visual_valid"] = res.is_valid
+
+            if getattr(res, "required", False) and not res.is_valid:
+                logger.warning(
+                    f"Required visual generation failed for question '{q_text[:50]}...': {res.error_message}"
+                )
+                q["visual_error"] = res.error_message or "Required visual SVG generation failed."
 
     _generate_section_questions = _generate_complete_paper
 
@@ -708,6 +849,7 @@ Return ONLY valid JSON matching this schema:
         easy_pct: Optional[int] = None,
         med_pct: Optional[int] = None,
         hard_pct: Optional[int] = None,
+        chapter_weightages_data: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
         Construct a single complete-paper generation prompt asking Gemini to generate all sections
@@ -755,12 +897,29 @@ Check whether this concept exists in the SOURCE EDUCATIONAL MATERIAL.
 - Never introduce content solely because it appears in TOPIC FOCUS.
 """
 
+        ch_weightage_lines = []
+        if chapter_weightages_data:
+            ch_weightage_lines.append("\nCHAPTER WEIGHTAGE & MARKS ALLOCATION BREAKDOWN:")
+            ch_weightage_lines.append(f"Total Examination Marks: {blueprint.total_marks}")
+            for item in chapter_weightages_data:
+                c_num = item.get("chapter_number")
+                c_name = item.get("chapter_name")
+                c_pct = item.get("weightage_percentage", 0.0)
+                c_marks = item.get("allocated_marks", 0)
+                ch_weightage_lines.append(f"- Chapter {c_num}: \"{c_name}\" -> {c_pct:.1f}% weightage (~{c_marks} marks allocated)")
+            ch_weightage_lines.append("\nSTRICT CHAPTER DISTRIBUTION & ATTRIBUTION RULE:")
+            ch_weightage_lines.append("- Every generated question MUST include \"chapter_number\": <int> indicating which selected chapter it covers.")
+            ch_weightage_lines.append("- The cumulative marks for questions assigned to each chapter MUST adhere strictly to its allocated weightage percentage.")
+            ch_weightage_lines.append("- Do NOT concentrate questions in any single chapter; distribute questions across all selected chapters strictly according to these allocated weightages.\n")
+        ch_weightage_instruction_str = "\n".join(ch_weightage_lines)
+
         ref_instruction_str = ""
         if generation_mode == GenerationMode.REFERENCE:
             import random
             shuffled_samples = list(sample_questions) if sample_questions else []
             random.shuffle(shuffled_samples)
             samples_formatted = json.dumps(shuffled_samples, indent=2) if shuffled_samples else "[]"
+            max_overall_ref_marks = max(1, int(0.20 * blueprint.total_marks))
             ref_instruction_str = f"""
 REFERENCE PAPER SAMPLE QUESTIONS & COGNITIVE STYLE PROFILE:
 {samples_formatted}
@@ -775,15 +934,16 @@ You are generating an examination paper in REFERENCE MODE. You MUST capture and 
    - For MCQs, emulate distractor construction strategy (targeting common student misconceptions or subtle conceptual errors rather than trivial options).
    - Real difficulty must reflect actual reasoning burden, regardless of superficial terminology.
 
-2. CHAPTER ALIGNMENT & REUSE ELIGIBILITY RULE:
+2. CHAPTER ALIGNMENT, WEIGHTAGE & DUAL-CAP REUSE ELIGIBILITY RULE:
    - Check if any sample questions in REFERENCE PAPER SAMPLE QUESTIONS belong to the concepts in SOURCE EDUCATIONAL MATERIAL (the selected chapters).
-   - IF MATCHING QUESTIONS EXIST in the reference paper for the selected chapters:
-     * You may directly reuse those matching questions as "REFERENCE_REUSED" (MAXIMUM 10% to 20% of total paper questions, never more).
-     * You may create parameter/scenario variations of those matching questions as "REFERENCE_VARIATION" (MAXIMUM 10% to 20% of total paper questions, never more).
-     * The remaining 60% to 80% MUST be fresh, newly authored questions ("AI_GENERATED") from SOURCE EDUCATIONAL MATERIAL in the examiner's cognitive style.
-   - IF NO MATCHING QUESTIONS EXIST in the reference paper for the selected chapters (e.g. reference paper covers Chapter 1, but requested paper is Chapter 2):
-     * DO NOT force any reuse or variation! DO NOT copy questions from unselected chapters!
-     * 100% of the paper MUST be fresh, newly authored questions ("AI_GENERATED") created strictly from SOURCE EDUCATIONAL MATERIAL, while emulating the reference examiner's question-setting style, cognitive demand, and formatting.
+   - DUAL-CAP REUSE CONSTRAINTS:
+     * Overall Paper Reuse Limit: You may directly reuse matching reference questions as "REFERENCE_REUSED" up to a MAXIMUM of 10% to 20% of total paper marks (no more than {max_overall_ref_marks} marks total across the entire paper).
+     * Per-Chapter Weightage Cap: For any individual chapter C, the total questions/marks for chapter C (reused + variations + fresh) MUST NOT exceed chapter C's allocated weightage percentage.
+     * Furthermore, the total marks of reused questions for chapter C CANNOT exceed min(chapter C allocated marks, overall allowed reference reuse marks).
+     * BALANCED 50/50 SPLIT PREFERENCE (IF FEASIBLE): For any selected chapter C where reference questions exist, IF POSSIBLE and if question marks/counts can be divided (e.g. Chapter 1 has 10 marks consisting of two 5-mark questions or multiple items), prefer reusing reference questions for ~half of chapter C's marks/questions and generating fresh "AI_GENERATED" questions for the remaining ~half. If NOT feasible to divide (e.g. only 1 question in that chapter or indivisible section marks), you may reuse up to the full chapter weightage cap (up to {max_overall_ref_marks} marks).
+     * If the reference paper ONLY contains questions for a single chapter (e.g. Chapter 1 with 10% weightage = 10 marks), you can reuse AT MOST 10 marks of Chapter 1 questions (NEVER more, with a 50/50 reuse/fresh split if feasible), and 100% of the remaining questions for other selected chapters MUST be fresh "AI_GENERATED" questions from SOURCE EDUCATIONAL MATERIAL.
+   - IF NO MATCHING QUESTIONS EXIST in the reference paper for a selected chapter:
+     * 100% of questions for that chapter MUST be fresh, newly authored questions ("AI_GENERATED") from SOURCE EDUCATIONAL MATERIAL.
 
 3. STRICT ANTI-CLUSTERING & NON-SEQUENTIAL REUSE RULE:
    - NEVER copy reference paper questions sequentially in order (e.g. DO NOT copy Reference Q1, Q2, Q3... as generated Q1, Q2, Q3...).
@@ -831,11 +991,29 @@ CONTENT AUTHORITY, SOURCE FIDELITY & ANTI-EMBELLISHMENT RULES:
 1. SOURCE EDUCATIONAL MATERIAL is the ONLY authoritative source for question content, facts, formulas, terminology, and subject matter.
 2. Every generated question MUST be strictly derived from and answerable using ONLY the provided SOURCE EDUCATIONAL MATERIAL.
 3. DO NOT use external knowledge, pretrained/model general knowledge, assumptions, or information outside the provided SOURCE EDUCATIONAL MATERIAL.
-4. BALANCED CHAPTER COVERAGE & ATTRIBUTION RULE: You MUST distribute questions evenly across ALL selected chapters in SOURCE EDUCATIONAL MATERIAL. Do NOT concentrate questions in Chapter 1 or any single chapter. Include "chapter_number": <1-based integer chapter number> for each question.
+4. CHAPTER COVERAGE & ATTRIBUTION RULE: Distribute questions strictly according to the requested chapter weightages. If no custom weightages are provided, distribute coverage reasonably across all selected chapters. Include "chapter_number": <1-based integer chapter number> for each question.
 5. NUMERICAL CALCULATION ACCURACY RULE: You MUST perform exact step-by-step arithmetic verification for all numerical calculations. Double-check powers of 10, exponents, signs, and unit conversions (e.g. 10⁹ × 10⁻⁷ × 10⁻⁷ / (0.3)² = 5.4 × 10⁻³ / 0.09 = 6.0 × 10⁻³ N). Ensure the calculated result matches the selected MCQ option exactly.
 6. VARIABLE DISAMBIGUATION RULE: NEVER use the same variable letter or symbol for two different physical quantities in the same question (e.g. do NOT use 'a' for both an electric field coefficient and a cube edge length; use distinct symbols like 'k' and 'L', or 'a' and 'd').
 7. SELF-CONTAINED QUESTION RULE: EVERY single question MUST be 100% self-contained and independent. NEVER use phrases like 'the previous problem', 'above question', 'from question X', or 'from the previous result'. Each question must supply all its own parameters, definitions, and context.
 8. INTERNAL CHOICE ALTERNATIVES RULE: For questions with internal choice, alternatives 'a' and 'b' MUST be completely distinct, independent, non-identical questions covering valid topics.
+9. VISUAL ILLUSTRATION & DIAGRAM GUIDELINES:
+   - EXAMINATION VISUAL VARIETY: Real-world examination papers feature a natural, balanced mix of both pure-text questions (definitions, derivations, statements of laws) and diagram-based questions. When the source material covers topics with physical arrangements, component networks, geometric figures, function/signal curves, multi-stage workflows, or comparative data distributions, you MUST author some questions as diagram-based questions (where the question explicitly presents and refers to a figure, e.g. "In the circuit diagram shown below...", "In the figure shown below...", "From the graph plotted below..."), populating the complete structured "visual" object with "required": true. Do NOT make 100% of the paper purely text-based word problems when visual concepts are available.
+   - CORE PRINCIPLE: A visual specification is a STRICT SEMANTIC REPRESENTATION of the question, NOT a decorative or representative illustration. Never simplify a complex visual problem into a smaller representative diagram.
+   - VISUAL NECESSITY: Use a visual when it materially improves the question, represents information the student must interpret or calculate from (e.g. an explicit circuit network, geometric figure, or graph curve), or presents an explicit illustration. For purely conceptual definitions, statements of laws, or derivations that do not present a figure, set "visual": null.
+   - COMPONENT & QUANTITY COMPLETENESS RULE: Every single physical entity, component, node, vertex, and stage described in "question_text" and "solution_explanation" MUST be explicitly represented in "spec". If the question mentions "12 resistors", "spec" MUST contain exactly 12 resistor components. If it mentions "four capacitors", "spec" MUST contain 4 capacitors. If it mentions "triangle ABC with altitude BD", "spec" MUST contain points A, B, C, D and segments AB, BC, AC, BD. NEVER generate a simplified subset or generic loop.
+   - NUMERICAL & PARAMETER CONSISTENCY RULE: Every numerical value, voltage (e.g. '500 V', '220 V, 50 Hz'), resistance ('1 Ω', '200 Ω'), capacitance ('10 µF'), dimension ('5 cm'), and equation ('10*sin(100*pi*x)') stated in "question_text" MUST 100% match the parameters and labels in "spec".
+   - TOPOLOGY & RELATIONSHIP PRESERVATION: Named topologies (e.g. 'cubical network', 'Wheatstone bridge', 'parallel branches', 'ladder network') MUST be constructed with their exact graph connections and vertices, NOT collapsed into a simple loop. Use 'routing': 'direct' for diagonal/isometric edges where appropriate.
+   - PHYSICAL STATES & SYMBOLS: Explicit physical states (e.g. switch open/closed -> state='open'/'closed', AC source -> type='ac_source', iron-core inductor -> type='inductor' with iron_core=true, lamp/bulb -> type='lamp') MUST be specified.
+   - QUESTION ↔ SOLUTION ↔ VISUAL TRI-CONSISTENCY: Before finalizing, verify that "question_text", "solution_explanation", and "visual" describe the exact same physical system, component counts, values, and circuit/geometry structure.
+   - NEVER generate raw SVG markup, XML, or HTML. Populate "spec" with clean semantic elements:
+     * For "circuit": "spec": {{"junctions": [{{"id": "A", "x": 50, "y": 150, "label": "A"}}], "components": [{{"id": "AC1", "type": "ac_source", "label": "220 V, 50 Hz"}}, {{"id": "L1", "type": "inductor", "label": "50 mH", "iron_core": true}}, {{"id": "K1", "type": "switch", "label": "Key", "state": "closed"}}], "connections": [{{"from": "AC1", "to": "K1", "routing": "orthogonal"}}]}}
+     * For "geometry": "spec": {{"points": [{{"id": "A", "label": "A"}}, {{"id": "B", "label": "B"}}, {{"id": "C", "label": "C"}}, {{"id": "D", "label": "D"}}], "segments": [{{"from": "A", "to": "B", "label": "5 cm"}}, {{"from": "B", "to": "D", "label": "Altitude"}}], "polygons": [{{"points": ["A", "B", "C"]}}], "angles": [{{"vertex": "B", "p1": "A", "p2": "C", "label": "90°", "right_angle": true}}]}}
+     * For "graph": "spec": {{"x_range": [-5, 5], "y_range": [-10, 10], "grid": true, "x_axis_label": "t (s)", "y_axis_label": "v(t)", "functions": [{{"expression": "10*sin(100*pi*x)", "label": "v(t) = 10 sin(100πt)"}}]}}
+     * For "diagram": "spec": {{"nodes": [{{"id": "n1", "label": "Stage 1"}}, {{"id": "n2", "label": "Stage 2"}}], "edges": [{{"from": "n1", "to": "n2", "label": "transition"}}]}}
+     * For "chart": "spec": {{"format": "bar", "categories": ["Physics", "Chemistry", "Math"], "series": [{{"name": "Scores", "values": [80, 95, 88]}}]}}
+   - CRITICAL SPEC REQUIREMENT: When "visual" is not null, "spec" MUST NOT be empty. You MUST populate the full internal structure (e.g. "components" & "connections" for circuit; "points", "segments" & "polygons" for geometry; "functions" & ranges for graph).
+   - INTERNAL CHOICE INDEPENDENCE: For questions with internal choice, each alternative ('a' and 'b') independently specifies its own "visual" object (or null).
+{ch_weightage_instruction_str}
 {topic_instruction_str}
 {ref_instruction_str}
 OUTPUT FORMAT REQUIREMENT:
@@ -858,6 +1036,16 @@ Return ONLY a valid JSON object containing a "sections" array. Do NOT wrap in ma
           "correct_answer": "<correct option for MCQ or numerical result>",
           "expected_answer": "<expected model answer for non-MCQ>",
           "solution_explanation": "<step-by-step marking key & explanation>",
+          "visual": {{
+            "required": true,
+            "type": "circuit",
+            "title": "Title of the diagram",
+            "caption": "Educational caption",
+            "spec": {{
+              "components": [{{"id": "V1", "type": "battery", "label": "12 V"}}, {{"id": "R1", "type": "resistor", "label": "6 Ω"}}],
+              "connections": [{{"from": "V1", "to": "R1"}}, {{"from": "R1", "to": "V1"}}]
+            }}
+          }} or null,
           {source_type_desc}
         }}
       ]
@@ -982,6 +1170,8 @@ SOURCE EDUCATIONAL MATERIAL:
         blueprint: PaperBlueprint,
         generated_questions: List[Dict[str, Any]],
         selected_chapter_ids: List[UUID],
+        chapter_weightages_data: Optional[List[Dict[str, Any]]] = None,
+        generation_mode: Optional[GenerationMode] = None,
     ) -> None:
         """
         Monolithic final validation pass performed immediately prior to DB persistence/commit.
@@ -1055,6 +1245,28 @@ SOURCE EDUCATIONAL MATERIAL:
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"Final paper validation failed: Cross-question dependency detected in item '{q_text[:40]}'.",
                     )
+
+        # 5. Chapter attribution and reference reuse dual-cap validation
+        if selected_chapter_ids:
+            selected_id_strs = {str(cid) for cid in selected_chapter_ids}
+            for q in generated_questions:
+                ch_id = q.get("chapter_id")
+                if ch_id and str(ch_id) not in selected_id_strs:
+                    logger.warning(f"Question chapter_id '{ch_id}' outside selected_chapter_ids; remapping.")
+                    q["chapter_id"] = str(selected_chapter_ids[0])
+
+        if generation_mode == GenerationMode.REFERENCE and chapter_weightages_data:
+            max_overall_reused = max(1, int(0.20 * blueprint.total_marks))
+            total_reused = sum(q.get("marks", 0) for q in generated_questions if q.get("source_type") == "REFERENCE_REUSED")
+            if total_reused > max_overall_reused:
+                logger.warning(f"Final integrity notice: total reused marks ({total_reused}) exceeds 20% quota ({max_overall_reused}).")
+
+            for ch_item in chapter_weightages_data:
+                ch_id = ch_item.get("chapter_id")
+                ch_alloc = ch_item.get("allocated_marks", blueprint.total_marks)
+                ch_reused = sum(q.get("marks", 0) for q in generated_questions if q.get("chapter_id") == ch_id and q.get("source_type") == "REFERENCE_REUSED")
+                if ch_reused > ch_alloc:
+                    logger.warning(f"Final integrity notice: chapter {ch_id} reused marks ({ch_reused}) exceeds allocated weightage ({ch_alloc}).")
 
         logger.info(f"Monolithic final paper validation passed cleanly: {len(generated_questions)} items, {computed_marks} total marks.")
 
@@ -1262,25 +1474,64 @@ SOURCE EDUCATIONAL MATERIAL:
                 or q.unit
             )
 
+            v_req = getattr(q, "visual_required", False)
+            v_type = getattr(q, "visual_type", None)
+            v_title = getattr(q, "visual_title", None)
+            v_caption = getattr(q, "visual_caption", None)
+            v_spec = getattr(q, "visual_spec", None)
+            v_svg = getattr(q, "visual_svg", None)
+
+            q_id = getattr(q, "id", None)
+            if _is_mock(q_id) or not q_id:
+                import uuid as _uuid
+                q_id = _uuid.uuid4()
+            elif isinstance(q_id, str):
+                try:
+                    q_id = UUID(q_id)
+                except Exception:
+                    import uuid as _uuid
+                    q_id = _uuid.uuid4()
+
+            q_ch_id = getattr(q, "chapter_id", None)
+            if _is_mock(q_ch_id):
+                q_ch_id = None
+            elif q_ch_id:
+                try:
+                    q_ch_id = UUID(str(q_ch_id))
+                except (ValueError, TypeError):
+                    q_ch_id = None
+
+            choice_grp = getattr(q, "choice_group", None)
+            choice_grp = None if _is_mock(choice_grp) else choice_grp
+            alt_lbl = getattr(q, "alternative_label", None)
+            alt_lbl = None if _is_mock(alt_lbl) else alt_lbl
+
             question_responses.append(
                 PaperQuestionResponse(
-                    id=q.id,
+                    id=q_id,
+                    chapter_id=q_ch_id,
                     question_order=q.question_order,
                     section_name=q.section_name,
-                    question_type=QuestionType(q.question_type),
+                    question_type=QuestionType(q.question_type) if hasattr(q, "question_type") else QuestionType.MCQ,
                     question_text=q.question_text,
                     marks=q.marks,
-                    difficulty=q.difficulty,
-                    source_type=QuestionSource(q.source_type),
+                    difficulty=str(q.difficulty) if hasattr(q, "difficulty") else "MEDIUM",
+                    source_type=QuestionSource(q.source_type) if hasattr(q, "source_type") and q.source_type else QuestionSource.AI_GENERATED,
                     is_numerical=is_num,
-                    choice_group=getattr(q, "choice_group", None),
-                    alternative_label=getattr(q, "alternative_label", None),
+                    choice_group=choice_grp,
+                    alternative_label=alt_lbl,
                     mcq_options=mcq_opts,
                     correct_answer=corr_ans,
                     expected_answer=exp_ans,
                     numerical_values=num_vals,
                     solution_explanation=sol_exp,
                     unit=unit_val,
+                    visual_required=False if _is_mock(v_req) or not v_req else bool(v_req),
+                    visual_type=None if _is_mock(v_type) else v_type,
+                    visual_title=None if _is_mock(v_title) else v_title,
+                    visual_caption=None if _is_mock(v_caption) else v_caption,
+                    visual_spec=None if _is_mock(v_spec) else v_spec,
+                    visual_svg=None if _is_mock(v_svg) else v_svg,
                 )
             )
 
@@ -1291,6 +1542,24 @@ SOURCE EDUCATIONAL MATERIAL:
                 try:
                     selected_ch_ids.append(cid if isinstance(cid, UUID) else UUID(str(cid)))
                 except (ValueError, TypeError):
+                    pass
+
+        # Parse chapter_weightages safely
+        weightage_responses = None
+        if getattr(paper, "chapter_weightages", None) and not _is_mock(paper.chapter_weightages):
+            weightage_responses = []
+            for w in paper.chapter_weightages:
+                try:
+                    weightage_responses.append(
+                        ChapterWeightageResponse(
+                            chapter_id=UUID(str(w["chapter_id"])),
+                            chapter_number=int(w.get("chapter_number", 1)),
+                            chapter_name=str(w.get("chapter_name", "")),
+                            weightage_percentage=float(w.get("weightage_percentage", 0.0)),
+                            allocated_marks=int(w.get("allocated_marks", 0)),
+                        )
+                    )
+                except Exception:
                     pass
 
         # Calculate PDF & Processing Status
@@ -1320,7 +1589,6 @@ SOURCE EDUCATIONAL MATERIAL:
         cls_name = None if _is_mock(raw_class) else raw_class
 
         return PaperResponse(
-
             id=paper.id,
             workspace_id=paper.workspace_id,
             subject_id=paper.subject_id,
@@ -1336,11 +1604,8 @@ SOURCE EDUCATIONAL MATERIAL:
             easy_percentage=getattr(paper, "easy_percentage", None),
             medium_percentage=getattr(paper, "medium_percentage", None),
             hard_percentage=getattr(paper, "hard_percentage", None),
-
-
-
             topic_focus=paper.topic_focus,
-            selected_chapter_ids=selected_ch_ids,
+            selected_chapters=weightage_responses or [],
             include_answers=paper.include_answers,
             blueprint_json=paper.blueprint_json,
             error_message=paper.error_message,
@@ -1462,19 +1727,42 @@ SOURCE EDUCATIONAL MATERIAL:
             processing_status="PROCESSING",
         )
 
-        # Trigger async document processing task
-        try:
-            from app.worker import process_document
-            process_document.delay(str(doc.id))
-        except Exception as task_exc:
-            logger.warning(f"Celery task dispatch failed: {task_exc}. Executing inline document processing.")
-            try:
-                from app.worker import process_document
-                process_document(str(doc.id))
-            except Exception as inline_exc:
-                logger.error(f"Inline document processing failed: {inline_exc}")
+        # Process PDF text extraction & chunks into DB WITHOUT embeddings
+        self._process_saved_paper_pdf_without_embeddings(paper_id=paper.id, doc_id=doc.id, stored_path=stored_path)
 
-        return self._build_paper_response(paper, include_answers=paper.include_answers)
+        final_paper = self.paper_repo.get_paper(paper.id)
+        return self._build_paper_response(final_paper, include_answers=final_paper.include_answers)
+
+    def _process_saved_paper_pdf_without_embeddings(self, paper_id: UUID, doc_id: UUID, stored_path: str) -> None:
+        """
+        Process saved paper PDF returned from Flutter:
+        Performs PDF text extraction, saves DocumentPage records, chunks text,
+        and saves DocumentChunk records in DB WITHOUT generating vector embeddings.
+        """
+        try:
+            doc_dir = os.path.dirname(stored_path)
+            pages_data = PDFProcessor.process_pdf(stored_path, doc_dir)
+            self.doc_repo.save_document_pages(doc_id, pages_data)
+
+            doc = self.doc_repo.get_document_by_id(doc_id)
+            if doc and doc.book:
+                subject_id = doc.book.subject_id
+                workspace_id = doc.book.subject.workspace_id if doc.book.subject else None
+                pages = self.doc_repo.get_document_pages(doc_id)
+                chunks_data = ChunkingService.chunk_document_pages(
+                    pages=pages,
+                    document_id=doc_id,
+                    book_id=doc.book_id,
+                    subject_id=subject_id,
+                    workspace_id=workspace_id,
+                )
+                self.doc_repo.save_document_chunks(doc_id, chunks_data)
+
+            self.doc_repo.mark_ready(doc_id)
+            self.paper_repo.update_saved_pdf(paper_id=paper_id, pdf_path=stored_path, document_id=doc_id, processing_status="READY")
+        except Exception as exc:
+            logger.error(f"Failed processing saved paper PDF for paper {paper_id}: {exc}")
+            self.paper_repo.update_saved_pdf(paper_id=paper_id, pdf_path=stored_path, document_id=doc_id, processing_status="READY")
 
     def get_paper_pdf_path(self, paper_id: UUID, current_user_id: UUID) -> Tuple[str, str]:
         """

@@ -27,7 +27,7 @@ def test_custom_mode_paper_generation_success():
 
     gen_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 50,
         "difficulty": "MIXED",
@@ -101,7 +101,7 @@ def test_custom_mode_validation_rejections():
     # 1. Configured total (45) does not equal paper total_marks (50) -> 422 Unprocessable Entity
     invalid_sum = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 50,
         "question_configs": [
@@ -117,7 +117,7 @@ def test_custom_mode_validation_rejections():
     # 2. Zero question_count -> 422
     zero_count = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 10,
         "question_configs": [
@@ -130,7 +130,7 @@ def test_custom_mode_validation_rejections():
     # 3. Reference paper ID provided in CUSTOM mode -> 422
     ref_in_custom = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 10,
         "reference_paper_id": str(uuid4()),
@@ -157,7 +157,7 @@ def test_answer_visibility_stripping():
 
     gen_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 10,
         "include_answers": False,  # Hide answers in API response!
@@ -282,7 +282,7 @@ def test_reference_mode_paper_generation_and_adaptation():
 
         gen_payload = {
             "book_id": book["id"],
-            "selected_chapter_ids": [ch1["id"]],
+            "selected_chapters": [{"chapter_id": ch1["id"]}],
             "generation_mode": "REFERENCE",
             "reference_paper_id": ref_paper["id"],
             "total_marks": 50,  # Requesting 50 marks adaptation from 80 marks reference
@@ -328,7 +328,7 @@ def test_multi_tenant_security_and_ownership():
     # User A generates a paper
     gen_payload = {
         "book_id": book_a["id"],
-        "selected_chapter_ids": [ch_a["id"]],
+        "selected_chapters": [{"chapter_id": ch_a["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 10,
         "question_configs": [
@@ -374,7 +374,7 @@ def test_custom_mode_forces_ai_generated_source_type():
 
     gen_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 10,
         "question_configs": [
@@ -551,7 +551,7 @@ def test_custom_mode_isolation_from_reference_paper():
 
     gen_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 5,
         "question_configs": [
@@ -652,7 +652,7 @@ def test_reference_mode_source_type_overrides_when_no_matching_ref_questions():
 
     gen_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "REFERENCE",
         "reference_paper_id": ref_paper["id"],
         "total_marks": 5,
@@ -736,7 +736,7 @@ def test_reference_mode_preserves_source_type_when_questions_exist():
 
     gen_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "REFERENCE",
         "reference_paper_id": ref_paper["id"],
         "total_marks": 2,
@@ -829,7 +829,7 @@ def test_cross_subject_reference_mode_grounding_isolation():
 
     gen_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "REFERENCE",
         "reference_paper_id": ref_paper["id"],
         "total_marks": 4,
@@ -916,7 +916,7 @@ def test_topic_focus_absent_from_source_is_ignored():
 
     gen_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 2,
         "topic_focus": "quantum computing",
@@ -985,7 +985,7 @@ def test_unrelated_paraphrased_question_accepted_without_post_generation_groundi
 
     gen_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 2,
         "question_configs": [
@@ -1214,7 +1214,7 @@ def test_reference_mode_internal_choice_paper_generation():
 
     gen_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "REFERENCE",
         "reference_paper_id": ref_paper["id"],
         "total_marks": 58,
@@ -1292,7 +1292,7 @@ def test_internal_choice_include_answers_stripping():
 
     gen_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 4,
         "include_answers": False,
@@ -1452,9 +1452,9 @@ def test_end_to_end_reference_mode_60_marks_paper_generation():
 
         req = PaperGenerateRequest(
             book_id=UUID("95b10b9f-1346-4a75-af03-4ee2c24d6e29"),
-            selected_chapter_ids=[
-                UUID("4550c9d0-eb6c-41f4-bb8a-286101dcbec4"),
-                UUID("25d70592-5079-4fef-a4b6-869785181523"),
+            selected_chapters=[
+                {"chapter_id": UUID("4550c9d0-eb6c-41f4-bb8a-286101dcbec4")},
+                {"chapter_id": UUID("25d70592-5079-4fef-a4b6-869785181523")},
             ],
             generation_mode=GenerationMode.REFERENCE,
             reference_paper_id=ref_paper.id,
@@ -2374,7 +2374,7 @@ def test_paper_time_allowed_minutes_persistence_and_response():
 
     gen_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 20,
         "time_allowed_minutes": 180,
@@ -2428,7 +2428,7 @@ def test_paper_class_name_persistence_and_response():
 
     gen_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 50,
         "time_allowed_minutes": 120,
@@ -2624,7 +2624,7 @@ def test_polymorphic_reference_paper_lookup_generated_paper():
 
         req = PaperGenerateRequest(
             book_id=book_id,
-            selected_chapter_ids=[ch_id],
+            selected_chapters=[{"chapter_id": ch_id}],
             generation_mode=GenerationMode.REFERENCE,
             total_marks=10,
             reference_paper_id=ref_gen_paper_id,
@@ -2741,7 +2741,7 @@ def test_uploaded_reference_paper_blueprint_caching():
 
         req = PaperGenerateRequest(
             book_id=book_id,
-            selected_chapter_ids=[ch_id],
+            selected_chapters=[{"chapter_id": ch_id}],
             generation_mode=GenerationMode.REFERENCE,
             total_marks=10,
             reference_paper_id=ref_pdf_id,
@@ -2785,7 +2785,7 @@ def test_paper_time_allowed_minutes_persistence_and_response():
 
     gen_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 20,
         "time_allowed_minutes": 180,
@@ -2844,7 +2844,7 @@ def test_paper_class_name_persistence_and_response():
 
     gen_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 50,
         "time_allowed_minutes": 120,
@@ -2901,7 +2901,7 @@ def test_paper_time_and_class_name_validation_rejections():
 
     base_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 20,
         "question_configs": [{"question_type": "MCQ", "question_count": 10, "marks_per_question": 2}],
@@ -2985,7 +2985,7 @@ def test_numerical_percentage_request_validation():
     with pytest.raises(ValidationError):
         PaperGenerateRequest(
             book_id="95b10b9f-1346-4a75-af03-4ee2c24d6e29",
-            selected_chapter_ids=["4550c9d0-eb6c-41f4-bb8a-286101dcbec4"],
+            selected_chapters=[{"chapter_id": "4550c9d0-eb6c-41f4-bb8a-286101dcbec4"}],
             generation_mode=GenerationMode.CUSTOM,
             total_marks=5,
             enable_numerical_percentage=True,
@@ -2997,7 +2997,7 @@ def test_numerical_percentage_request_validation():
     with pytest.raises(ValidationError):
         PaperGenerateRequest(
             book_id="95b10b9f-1346-4a75-af03-4ee2c24d6e29",
-            selected_chapter_ids=["4550c9d0-eb6c-41f4-bb8a-286101dcbec4"],
+            selected_chapters=[{"chapter_id": "4550c9d0-eb6c-41f4-bb8a-286101dcbec4"}],
             generation_mode=GenerationMode.CUSTOM,
             total_marks=5,
             enable_numerical_percentage=True,
@@ -3008,7 +3008,7 @@ def test_numerical_percentage_request_validation():
     with pytest.raises(ValidationError):
         PaperGenerateRequest(
             book_id="95b10b9f-1346-4a75-af03-4ee2c24d6e29",
-            selected_chapter_ids=["4550c9d0-eb6c-41f4-bb8a-286101dcbec4"],
+            selected_chapters=[{"chapter_id": "4550c9d0-eb6c-41f4-bb8a-286101dcbec4"}],
             generation_mode=GenerationMode.CUSTOM,
             total_marks=5,
             enable_numerical_percentage=True,
@@ -3019,7 +3019,7 @@ def test_numerical_percentage_request_validation():
     # 3. Valid numerical percentage -> Success
     req = PaperGenerateRequest(
         book_id="95b10b9f-1346-4a75-af03-4ee2c24d6e29",
-        selected_chapter_ids=["4550c9d0-eb6c-41f4-bb8a-286101dcbec4"],
+        selected_chapters=[{"chapter_id": "4550c9d0-eb6c-41f4-bb8a-286101dcbec4"}],
         generation_mode=GenerationMode.CUSTOM,
         total_marks=5,
         enable_numerical_percentage=True,
@@ -3101,7 +3101,7 @@ def test_gemini_output_limit_reached_api_response():
 
     req = PaperGenerateRequest(
         book_id=mock_book.id,
-        selected_chapter_ids=[ch_id],
+        selected_chapters=[{"chapter_id": ch_id}],
         generation_mode=GenerationMode.CUSTOM,
         total_marks=10,
         question_configs=[QuestionConfigItem(section_name="Section A", question_type=QuestionType.MCQ, question_count=10, marks_per_question=1)],
@@ -3157,7 +3157,7 @@ def test_gemini_rate_limited_api_response():
 
     req = PaperGenerateRequest(
         book_id=mock_book.id,
-        selected_chapter_ids=[ch_id],
+        selected_chapters=[{"chapter_id": ch_id}],
         generation_mode=GenerationMode.CUSTOM,
         total_marks=10,
         question_configs=[QuestionConfigItem(section_name="Section A", question_type=QuestionType.MCQ, question_count=10, marks_per_question=1)],
@@ -3211,7 +3211,7 @@ def test_gemini_invalid_response_api_response():
 
     req = PaperGenerateRequest(
         book_id=mock_book.id,
-        selected_chapter_ids=[ch_id],
+        selected_chapters=[{"chapter_id": ch_id}],
         generation_mode=GenerationMode.CUSTOM,
         total_marks=10,
         question_configs=[QuestionConfigItem(section_name="Section A", question_type=QuestionType.MCQ, question_count=10, marks_per_question=1)],
@@ -3265,7 +3265,7 @@ def test_fewer_questions_returned_api_response():
 
     req = PaperGenerateRequest(
         book_id=mock_book.id,
-        selected_chapter_ids=[ch_id],
+        selected_chapters=[{"chapter_id": ch_id}],
         generation_mode=GenerationMode.CUSTOM,
         total_marks=10,
         question_configs=[QuestionConfigItem(section_name="Section A", question_type=QuestionType.MCQ, question_count=10, marks_per_question=1)],
@@ -3321,7 +3321,7 @@ def test_iterative_supplemental_batch_recovery_for_large_sections():
         reference_paper_id=None,
         generation_mode="CUSTOM",
         topic_focus=None,
-        selected_chapter_ids=[ch_id],
+        selected_chapters=[{"chapter_id": ch_id}],
         difficulty="MEDIUM",
         status="COMPLETED",
         total_marks=80,
@@ -3384,7 +3384,7 @@ def test_iterative_supplemental_batch_recovery_for_large_sections():
 
     req = PaperGenerateRequest(
         book_id=mock_book.id,
-        selected_chapter_ids=[ch_id],
+        selected_chapters=[{"chapter_id": ch_id}],
         generation_mode=GenerationMode.CUSTOM,
         total_marks=80,
         question_configs=[QuestionConfigItem(section_name="Section A", question_type=QuestionType.MCQ, question_count=80, marks_per_question=1)],
@@ -3421,7 +3421,7 @@ def test_custom_difficulty_percentages_validation_and_generation():
     # 1. Invalid sum (!= 100)
     bad_sum_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 10,
         "easy_percentage": 20,
@@ -3435,7 +3435,7 @@ def test_custom_difficulty_percentages_validation_and_generation():
     # 2. Partial percentages
     partial_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 10,
         "easy_percentage": 20,
@@ -3449,7 +3449,7 @@ def test_custom_difficulty_percentages_validation_and_generation():
     # 3. Valid payload (10% Easy, 20% Medium, 70% Hard)
     valid_payload = {
         "book_id": book["id"],
-        "selected_chapter_ids": [ch1["id"]],
+        "selected_chapters": [{"chapter_id": ch1["id"]}],
         "generation_mode": "CUSTOM",
         "total_marks": 10,
         "easy_percentage": 10,
@@ -3763,7 +3763,7 @@ def test_non_eligible_generated_paper_fallback_to_json_blueprint():
 
         req = PaperGenerateRequest(
             book_id=book_id,
-            selected_chapter_ids=[ch_id],
+            selected_chapters=[{"chapter_id": ch_id}],
             generation_mode=GenerationMode.REFERENCE,
             total_marks=10,
             reference_paper_id=ref_gen_paper_id,
