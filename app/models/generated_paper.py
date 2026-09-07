@@ -33,6 +33,7 @@ class GeneratedPaper(Base):
 
     topic_focus = Column(Text, nullable=True)
     selected_chapter_ids = Column(JSONB, nullable=False)  # List[str] of chapter UUIDs
+    chapter_weightages = Column(JSONB, nullable=True)  # List[Dict[str, Any]] of chapter weightage configurations
     include_answers = Column(Boolean, nullable=False, default=True)
     blueprint_json = Column(JSONB, nullable=True)
     error_message = Column(Text, nullable=True)
@@ -85,6 +86,13 @@ class GeneratedPaperQuestion(Base):
     numerical_values = Column(JSONB, nullable=True)
     solution_explanation = Column(Text, nullable=True)
     unit = Column(String(50), nullable=True)
+
+    visual_required = Column(Boolean, nullable=False, default=False)
+    visual_type = Column(String(50), nullable=True)
+    visual_title = Column(String(255), nullable=True)
+    visual_caption = Column(Text, nullable=True)
+    visual_spec = Column(JSONB, nullable=True)
+    visual_svg = Column(Text, nullable=True)
 
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
 

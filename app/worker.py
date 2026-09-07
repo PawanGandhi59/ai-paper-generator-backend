@@ -250,19 +250,22 @@ def generate_document_embeddings(self, document_id_str: str) -> dict:
         created_chunks = doc_repo.save_document_chunks(doc_id, chunks_data)
 
         # 3. Resumable Vector Embedding Generation
-        embedding_service = GeminiEmbeddingService()
-        chunks_needing_embeddings = [c for c in created_chunks if not c.embedding]
+        try:
+            embedding_service = GeminiEmbeddingService()
+            chunks_needing_embeddings = [c for c in created_chunks if not c.embedding]
 
-        if chunks_needing_embeddings:
-            chunk_texts = [c.content for c in chunks_needing_embeddings]
-            embeddings = embedding_service.generate_embeddings_batch(chunk_texts)
+            if chunks_needing_embeddings:
+                chunk_texts = [c.content for c in chunks_needing_embeddings]
+                embeddings = embedding_service.generate_embeddings_batch(chunk_texts)
 
-            for chunk_obj, vec in zip(chunks_needing_embeddings, embeddings):
-                doc_repo.update_chunk_embedding(chunk_obj.id, vec)
+                for chunk_obj, vec in zip(chunks_needing_embeddings, embeddings):
+                    doc_repo.update_chunk_embedding(chunk_obj.id, vec)
+        except Exception as embed_exc:
+            logger.warning(f"Embedding generation failed for document_id={document_id_str}: {embed_exc}. Chunks preserved in DB.")
 
         # 4. Mark Document status READY
         doc_repo.mark_ready(doc_id)
-        logger.info(f"Successfully generated embeddings for document_id={document_id_str}, total_chunks={len(created_chunks)}")
+        logger.info(f"Successfully processed document_id={document_id_str}, total_chunks={len(created_chunks)}")
         return {
             "status": "READY",
             "document_id": document_id_str,

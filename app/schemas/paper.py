@@ -7,6 +7,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.schemas.visuals import GeminiVisualRequirementSchema
+
 
 class GenerationMode(str, Enum):
     CUSTOM = "CUSTOM"
@@ -47,9 +49,31 @@ class QuestionConfigItem(BaseModel):
 
 
 
+class ChapterSelectionConfig(BaseModel):
+    chapter_id: UUID = Field(..., description="UUID of the selected chapter")
+    weightage_percentage: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=100.0,
+        description="Optional percentage contribution of this chapter (0-100%). If omitted, defaults to equal distribution.",
+    )
+
+
+class ChapterWeightageResponse(BaseModel):
+    chapter_id: UUID
+    chapter_number: int
+    chapter_name: str
+    weightage_percentage: float
+    allocated_marks: int
+
+
 class PaperGenerateRequest(BaseModel):
     book_id: UUID
-    selected_chapter_ids: List[UUID] = Field(..., min_length=1, description="Selected chapter IDs (HARD content boundary)")
+    selected_chapters: List[ChapterSelectionConfig] = Field(
+        ...,
+        min_length=1,
+        description="List of selected chapters with optional custom weightage percentages. If weightage is omitted, marks are distributed equally.",
+    )
     generation_mode: GenerationMode
     total_marks: int = Field(..., ge=1, le=1000, description="Total paper marks")
     time_allowed_minutes: Optional[int] = Field(None, ge=1, le=1440, description="Time allowed for paper in minutes (e.g. 180 for 3 hours)")
@@ -59,7 +83,6 @@ class PaperGenerateRequest(BaseModel):
     easy_percentage: Optional[int] = Field(None, ge=0, le=100, description="Optional percentage of Easy questions (0-100%)")
     medium_percentage: Optional[int] = Field(None, ge=0, le=100, description="Optional percentage of Medium questions (0-100%)")
     hard_percentage: Optional[int] = Field(None, ge=0, le=100, description="Optional percentage of Hard questions (0-100%)")
-
 
     topic_focus: Optional[str] = Field(None, max_length=1000, description="Optional natural language topic focus/preference")
     include_answers: bool = Field(True, description="Whether to include answer keys in API response")
@@ -162,18 +185,38 @@ class PaperGenerateRequest(BaseModel):
             if self.question_configs and len(self.question_configs) > 0:
                 raise ValueError("question_configs must not be provided for REFERENCE generation mode.")
 
+        # Validate selected_chapters
+        if not self.selected_chapters or len(self.selected_chapters) == 0:
+            raise ValueError("selected_chapters is required and must contain at least one chapter.")
+
+        seen_ids = set()
+        total_pct = 0.0
+        has_pct = False
+        for ch in self.selected_chapters:
+            if ch.chapter_id in seen_ids:
+                raise ValueError(f"Duplicate chapter_id '{ch.chapter_id}' in selected_chapters")
+            seen_ids.add(ch.chapter_id)
+            if ch.weightage_percentage is not None:
+                has_pct = True
+                total_pct += ch.weightage_percentage
+
+        if has_pct:
+            if abs(total_pct - 100.0) > 0.5:
+                raise ValueError(f"Total chapter weightage percentage in selected_chapters must sum to 100%, got {total_pct:.1f}%")
+
         return self
 
 
 class PaperQuestionResponse(BaseModel):
     id: UUID
+    chapter_id: Optional[UUID] = None
     question_order: int
     section_name: str
     question_type: QuestionType
     question_text: str
     marks: int
     difficulty: str
-    source_type: QuestionSource
+    source_type: QuestionSource = QuestionSource.AI_GENERATED
     is_numerical: bool = False
 
     choice_group: Optional[str] = None
@@ -186,6 +229,14 @@ class PaperQuestionResponse(BaseModel):
     numerical_values: Optional[Dict[str, Any]] = None
     solution_explanation: Optional[str] = None
     unit: Optional[str] = None
+
+    # Visual fields
+    visual_required: bool = False
+    visual_type: Optional[str] = None
+    visual_title: Optional[str] = None
+    visual_caption: Optional[str] = None
+    visual_spec: Optional[Dict[str, Any]] = None
+    visual_svg: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -207,9 +258,8 @@ class PaperResponse(BaseModel):
     medium_percentage: Optional[int] = None
     hard_percentage: Optional[int] = None
 
-
     topic_focus: Optional[str] = None
-    selected_chapter_ids: List[UUID]
+    selected_chapters: List[ChapterWeightageResponse] = Field(default_factory=list)
     include_answers: bool
     blueprint_json: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
@@ -234,8 +284,11 @@ class GeminiGeneratedQuestionSchema(BaseModel):
     solution_explanation: str = Field(..., description="Step-by-step solution, derivation, or explanation")
     is_numerical: bool = Field(False, description="Whether question involves quantitative calculation")
     chapter_number: Optional[int] = Field(None, description="1-based integer chapter number for chapter attribution")
+    choice_group: Optional[str] = Field(None, description="Internal choice group identifier e.g. 'Q4'")
+    alternative_label: Optional[str] = Field(None, description="Internal choice alternative label e.g. 'a', 'b'")
     difficulty: Optional[str] = Field(None, description="'EASY', 'MEDIUM', or 'HARD'")
     source_type: Optional[str] = Field(None, description="'AI_GENERATED', 'REFERENCE_REUSED', or 'REFERENCE_VARIATION'")
+    visual: Optional[GeminiVisualRequirementSchema] = Field(None, description="Optional structured visual specification if question requires a diagram, circuit, geometry, graph, or chart")
 
 
 class GeminiSectionQuestionsSchema(BaseModel):

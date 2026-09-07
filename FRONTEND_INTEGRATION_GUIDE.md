@@ -214,3 +214,157 @@ The backend enforces a sliding window rate limit (10 RAG queries per 60 seconds 
 ### Service Errors (`HTTP 503 Service Unavailable`)
 If the AI service experiences a transient outage or quota issue, HTTP status `503` is returned.
 - Frontend should handle `503` gracefully by allowing the user to tap *"Retry Query"*.
+
+---
+
+## 📝 6. Generated Examination Paper Visuals (`PaperQuestionResponse`)
+
+In addition to tutor RAG queries, examination papers generated via `POST /api/v1/papers/generate` or retrieved via `GET /api/v1/papers/{paper_id}` contain structured question objects with deterministic SVG visuals.
+
+### 6.1 Backend API Fields in Each Question
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `visual_required` | `bool` | `true` if the question depends on a visual diagram/figure; `false` otherwise. |
+| `visual_type` | `String?` | Visual classification (`"circuit"`, `"geometry"`, `"graph"`, `"diagram"`, `"chart"`). |
+| `visual_title` | `String?` | Human-readable title for the figure (e.g. `"Simple DC Circuit"`). |
+| `visual_caption` | `String?` | Optional explanatory caption for the visual. |
+| `visual_spec` | `Map<String, dynamic>?` | Semantic JSON specification (points, nodes, connections, series). |
+| `visual_svg` | `String?` | Deterministic SVG XML markup string ready for rendering. `null` if no visual or if generation failed. |
+
+---
+
+### 6.2 Complete Flutter Dart Data Model
+
+```dart
+class PaperQuestionModel {
+  final String id;
+  final int questionOrder;
+  final String sectionName;
+  final String questionType; // "MCQ", "SHORT_ANSWER", "LONG_ANSWER", "NUMERICAL"
+  final String questionText;
+  final int marks;
+  final String difficulty; // "EASY", "MEDIUM", "HARD"
+  final String sourceType; // "AI_GENERATED", "REFERENCE_REUSED", "REFERENCE_VARIATION"
+  final bool isNumerical;
+
+  // Internal choice grouping
+  final String? choiceGroup; // e.g. "Q4"
+  final String? alternativeLabel; // e.g. "a", "b"
+
+  // Answer & solution fields
+  final List<String>? mcqOptions;
+  final String? correctAnswer;
+  final String? expectedAnswer;
+  final Map<String, dynamic>? numericalValues;
+  final String? solutionExplanation;
+  final String? unit;
+
+  // Deterministic visual fields (Phase 3E/4A)
+  final bool visualRequired;
+  final String? visualType;
+  final String? visualTitle;
+  final String? visualCaption;
+  final Map<String, dynamic>? visualSpec;
+  final String? visualSvg;
+
+  PaperQuestionModel({
+    required this.id,
+    required this.questionOrder,
+    required this.sectionName,
+    required this.questionType,
+    required this.questionText,
+    required this.marks,
+    required this.difficulty,
+    required this.sourceType,
+    this.isNumerical = false,
+    this.choiceGroup,
+    this.alternativeLabel,
+    this.mcqOptions,
+    this.correctAnswer,
+    this.expectedAnswer,
+    this.numericalValues,
+    this.solutionExplanation,
+    this.unit,
+    this.visualRequired = false,
+    this.visualType,
+    this.visualTitle,
+    this.visualCaption,
+    this.visualSpec,
+    this.visualSvg,
+  });
+
+  factory PaperQuestionModel.fromJson(Map<String, dynamic> json) {
+    return PaperQuestionModel(
+      id: json['id'] as String,
+      questionOrder: json['question_order'] as int? ?? 1,
+      sectionName: json['section_name'] as String? ?? 'Section A',
+      questionType: json['question_type'] as String? ?? 'SHORT_ANSWER',
+      questionText: json['question_text'] as String? ?? '',
+      marks: json['marks'] as int? ?? 1,
+      difficulty: json['difficulty'] as String? ?? 'MEDIUM',
+      sourceType: json['source_type'] as String? ?? 'AI_GENERATED',
+      isNumerical: json['is_numerical'] as bool? ?? false,
+      choiceGroup: json['choice_group'] as String?,
+      alternativeLabel: json['alternative_label'] as String?,
+      mcqOptions: (json['mcq_options'] as List<dynamic>?)
+          ?.map((e) => e.toString())
+          .toList(),
+      correctAnswer: json['correct_answer'] as String?,
+      expectedAnswer: json['expected_answer'] as String?,
+      numericalValues: json['numerical_values'] is Map<String, dynamic>
+          ? json['numerical_values'] as Map<String, dynamic>
+          : null,
+      solutionExplanation: json['solution_explanation'] as String?,
+      unit: json['unit'] as String?,
+      visualRequired: json['visual_required'] as bool? ?? false,
+      visualType: json['visual_type'] as String?,
+      visualTitle: json['visual_title'] as String?,
+      visualCaption: json['visual_caption'] as String?,
+      visualSpec: json['visual_spec'] is Map<String, dynamic>
+          ? json['visual_spec'] as Map<String, dynamic>
+          : null,
+      visualSvg: json['visual_svg'] as String?,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'question_order': questionOrder,
+      'section_name': sectionName,
+      'question_type': questionType,
+      'question_text': questionText,
+      'marks': marks,
+      'difficulty': difficulty,
+      'source_type': sourceType,
+      'is_numerical': isNumerical,
+      'choice_group': choiceGroup,
+      'alternative_label': alternativeLabel,
+      'mcq_options': mcqOptions,
+      'correct_answer': correctAnswer,
+      'expected_answer': expectedAnswer,
+      'numerical_values': numericalValues,
+      'solution_explanation': solutionExplanation,
+      'unit': unit,
+      'visual_required': visualRequired,
+      'visual_type': visualType,
+      'visual_title': visualTitle,
+      'visual_caption': visualCaption,
+      'visual_spec': visualSpec,
+      'visual_svg': visualSvg,
+    };
+  }
+}
+```
+
+---
+
+### 6.3 Internal-Choice Alternatives Independence
+
+When internal choice is configured (e.g. `Q4(a)` and `Q4(b)`), each alternative is received as a distinct `PaperQuestionModel` with:
+- `choiceGroup == "Q4"`
+- `alternativeLabel == "a"` vs `alternativeLabel == "b"`
+- Each alternative possesses its own independent `visualType`, `visualSpec`, and `visualSvg`.
+
+Frontend UI state should group by `choiceGroup` and render the specific visual attached to the active selected alternative.

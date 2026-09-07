@@ -73,14 +73,15 @@ def test_ai_generation_returns_structured_json_without_pdf():
     pg_svc.paper_repo.get_paper = MagicMock(return_value=created_paper)
     pg_svc.paper_repo.update_status = MagicMock()
 
+    mock_5_qs = [{"question_text": f"Q{i}", "question_type": "MCQ", "marks": 1, "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp", "source_type": "AI_GENERATED", "section_name": "Section A", "question_order": i} for i in range(1, 6)]
     with patch.object(pg_svc, "_retrieve_chapter_context", return_value="Context"), \
-         patch.object(pg_svc, "_generate_complete_paper", return_value=[]), \
-         patch.object(pg_svc, "_generate_section_questions", return_value=[]), \
+         patch.object(pg_svc, "_generate_complete_paper", return_value=mock_5_qs), \
+         patch.object(pg_svc, "_generate_section_questions", return_value=mock_5_qs), \
          patch.object(pg_svc.paper_repo, "save_questions"):
 
         req = PaperGenerateRequest(
             book_id=book_id,
-            selected_chapter_ids=[ch_id],
+            selected_chapters=[{"chapter_id": ch_id}],
             generation_mode=GenerationMode.CUSTOM,
             total_marks=5,
             question_configs=[
@@ -191,7 +192,7 @@ def test_save_pdf_validation_magic_bytes_and_second_save_conflict(tmp_path):
 
 
     pg_svc.paper_repo.update_saved_pdf = MagicMock(return_value=updated_paper)
-    pg_svc.paper_repo.get_paper = MagicMock(return_value=paper)
+    pg_svc.paper_repo.get_paper = MagicMock(side_effect=[paper, updated_paper])
 
     with patch("app.core.config.settings.LOCAL_STORAGE_PATH", str(tmp_path)), \
          patch("app.worker.process_document.delay"):
@@ -418,9 +419,9 @@ def test_saved_pdf_blueprint_override_original_json():
 
 
     pg_svc.blueprint_service.analyze_reference_paper = MagicMock(return_value=analyzed_blueprint)
-    pg_svc._retrieve_chapter_context = MagicMock(return_value="Context")
-    pg_svc._generate_complete_paper = MagicMock(return_value=[])
-    pg_svc._generate_section_questions = MagicMock(return_value=[])
+    mock_15_qs = [{"question_text": f"Q{i}", "question_type": "MCQ", "marks": 5, "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp", "source_type": "AI_GENERATED", "section_name": "Part A", "question_order": i} for i in range(1, 4)]
+    pg_svc._generate_complete_paper = MagicMock(return_value=mock_15_qs)
+    pg_svc._generate_section_questions = MagicMock(return_value=mock_15_qs)
 
     ch_id = uuid4()
     book_mock = MagicMock(id=paper.book_id, subject_id=paper.subject_id)
@@ -432,7 +433,7 @@ def test_saved_pdf_blueprint_override_original_json():
     req = PaperGenerateRequest(
         subject_id=paper.subject_id,
         book_id=paper.book_id,
-        selected_chapter_ids=[ch_id],
+        selected_chapters=[{"chapter_id": ch_id}],
         generation_mode=GenerationMode.REFERENCE,
         reference_paper_id=paper_id,
         title="New Reference Paper",
@@ -563,7 +564,7 @@ def test_saved_pdf_blueprint_caching():
     req = PaperGenerateRequest(
         subject_id=paper.subject_id,
         book_id=paper.book_id,
-        selected_chapter_ids=[ch_id],
+        selected_chapters=[{"chapter_id": ch_id}],
         generation_mode=GenerationMode.REFERENCE,
         reference_paper_id=paper_id,
         title="New Ref Paper",
@@ -572,6 +573,10 @@ def test_saved_pdf_blueprint_caching():
     )
 
 
+
+    mock_10_qs = [{"question_text": f"Q{i}", "question_type": "MCQ", "marks": 2, "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp", "source_type": "AI_GENERATED", "section_name": "Sec A", "question_order": i} for i in range(1, 11)]
+    pg_svc._generate_complete_paper = MagicMock(return_value=mock_10_qs)
+    pg_svc._generate_section_questions = MagicMock(return_value=mock_10_qs)
 
     with patch("os.path.exists", return_value=True):
         pg_svc.generate_paper(current_user_id=user_id, request_data=req)
