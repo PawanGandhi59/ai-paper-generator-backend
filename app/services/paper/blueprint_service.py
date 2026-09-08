@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from app.schemas.paper import QuestionConfigItem, QuestionType
 from app.services.ai.gemini_service import GeminiService
+from app.services.ai.prompts.blueprint_prompt import BLUEPRINT_ANALYSIS_SYSTEM_INSTRUCTION
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ class PaperBlueprint(BaseModel):
 
 
 REFERENCE_ANALYSIS_PROMPT = """
-You are an expert academic examination parser. Analyze the following past examination paper text and extract its complete structural blueprint as written in the paper.
+Analyze the following past examination paper text and extract its complete structural blueprint as written in the paper.
 
 Return ONLY a JSON object with this exact structure:
 {{
@@ -231,7 +232,13 @@ class BlueprintService:
         prompt = REFERENCE_ANALYSIS_PROMPT.format(paper_text=combined_text)
 
         try:
-            raw_response = self.ai_service.generate_response(prompt=prompt)
+            try:
+                raw_response = self.ai_service.generate_response(
+                    prompt=prompt,
+                    system_instruction=BLUEPRINT_ANALYSIS_SYSTEM_INSTRUCTION,
+                )
+            except TypeError:
+                raw_response = self.ai_service.generate_response(prompt=prompt)
             parsed_json = self._parse_json_safely(raw_response)
 
             raw_sections = parsed_json.get("sections", [])

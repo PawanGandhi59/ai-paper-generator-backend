@@ -81,9 +81,7 @@ def test_chapter_detection_toc_stage():
     ]
 
     mock_gemini = MagicMock()
-    mock_response = MagicMock()
-    mock_response.text = '{"chapters": [{"chapter_number": 1, "name": "Introduction", "start_page": 1}, {"chapter_number": 2, "name": "Architecture", "start_page": 3}]}'
-    mock_gemini.client.models.generate_content.return_value = mock_response
+    mock_gemini.generate_response.return_value = '{"chapters": [{"chapter_number": 1, "name": "Introduction", "start_page": 1}, {"chapter_number": 2, "name": "Architecture", "start_page": 3}]}'
     mock_gemini.model_name = "gemini-2.5-flash"
 
     service = ChapterDetectionService(gemini_service=mock_gemini)
@@ -109,9 +107,7 @@ def test_chapter_detection_toc_after_page_35():
         pages.append(DocumentPage(document_id=uuid.uuid4(), page_number=p, text_content=txt))
 
     mock_gemini = MagicMock()
-    mock_response = MagicMock()
-    mock_response.text = '{"chapters": [{"chapter_number": 1, "name": "Papa\'s Spectacles", "start_page": 1}, {"chapter_number": 2, "name": "Gone with the Scooter", "start_page": 11}, {"chapter_number": 7, "name": "Gilli Danda", "start_page": 65}]}'
-    mock_gemini.client.models.generate_content.return_value = mock_response
+    mock_gemini.generate_response.return_value = '{"chapters": [{"chapter_number": 1, "name": "Papa\'s Spectacles", "start_page": 1}, {"chapter_number": 2, "name": "Gone with the Scooter", "start_page": 11}, {"chapter_number": 7, "name": "Gilli Danda", "start_page": 65}]}'
     mock_gemini.model_name = "gemini-2.5-flash"
 
     service = ChapterDetectionService(gemini_service=mock_gemini)
@@ -135,9 +131,7 @@ def test_chapter_detection_heading_candidate_stage():
             pages.append(DocumentPage(document_id=uuid.uuid4(), page_number=p, text_content=f"Page {p} content"))
 
     mock_gemini = MagicMock()
-    mock_response = MagicMock()
-    mock_response.text = '{"chapters": [{"chapter_number": 1, "name": "Fundamentals", "start_page": 5}, {"chapter_number": 2, "name": "Advanced Concepts", "start_page": 25}]}'
-    mock_gemini.client.models.generate_content.return_value = mock_response
+    mock_gemini.generate_response.return_value = '{"chapters": [{"chapter_number": 1, "name": "Fundamentals", "start_page": 5}, {"chapter_number": 2, "name": "Advanced Concepts", "start_page": 25}]}'
     mock_gemini.model_name = "gemini-2.5-flash"
 
     service = ChapterDetectionService(gemini_service=mock_gemini)
@@ -152,7 +146,7 @@ def test_chapter_detection_gemini_failure_fallback():
     pages = [DocumentPage(document_id=uuid.uuid4(), page_number=1, text_content="Chapter 1 Sample")]
 
     mock_gemini = MagicMock()
-    mock_gemini.client.models.generate_content.side_effect = Exception("API rate limit error")
+    mock_gemini.generate_response.side_effect = Exception("API rate limit error")
 
     service = ChapterDetectionService(gemini_service=mock_gemini)
     results = service.detect_chapters(pages)
