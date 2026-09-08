@@ -1,4 +1,6 @@
+import logging
 import os
+import sys
 import typing
 import json
 from fastapi import FastAPI
@@ -7,6 +9,14 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api.router import api_router
 from app.core.config import settings
+
+# Ensure application logs at INFO level to console stdout
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logging.getLogger("app").setLevel(logging.INFO)
 
 
 class UnicodeJSONResponse(JSONResponse):

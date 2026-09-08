@@ -419,7 +419,7 @@ def test_saved_pdf_blueprint_override_original_json():
 
 
     pg_svc.blueprint_service.analyze_reference_paper = MagicMock(return_value=analyzed_blueprint)
-    mock_15_qs = [{"question_text": f"Q{i}", "question_type": "MCQ", "marks": 5, "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp", "source_type": "AI_GENERATED", "section_name": "Part A", "question_order": i} for i in range(1, 4)]
+    mock_15_qs = [{"question_text": f"Q{i}", "question_type": "MCQ", "marks": 5, "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"], "correct_answer": "A. 1", "solution_explanation": "Exp", "source_type": "AI_GENERATED", "section_name": "Sec A", "question_order": i} for i in range(1, 4)]
     pg_svc._generate_complete_paper = MagicMock(return_value=mock_15_qs)
     pg_svc._generate_section_questions = MagicMock(return_value=mock_15_qs)
 
@@ -641,5 +641,140 @@ def test_original_ai_json_preserved_after_save():
     # Original questions remain preserved and unchanged
     assert paper.questions[0].question_text == "Original AI Question Text"
     assert paper.blueprint_json is None
+
+
+def test_unsaved_generated_paper_uses_original_ai_json_as_reference():
+    """
+    Verify that an unsaved GeneratedPaper (pdf_path=None, processing_status='NOT_SAVED')
+    can be used as a reference paper, falling back to build_blueprint_from_generated_paper.
+    """
+    mock_db = MagicMock()
+    pg_svc = PaperGeneratorService(db=mock_db)
+
+    user_id = uuid4()
+    ws_id = uuid4()
+    ref_paper_id = uuid4()
+    new_paper_id = uuid4()
+    book_id = uuid4()
+    subject_id = uuid4()
+    ch_id = uuid4()
+    now_dt = datetime.now(timezone.utc)
+
+    orig_q = MagicMock()
+    orig_q.section_name = "Section A"
+    orig_q.question_type = "MCQ"
+    orig_q.question_text = "What is gravity?"
+    orig_q.marks = 2
+    orig_q.choice_group = None
+    orig_q.alternative_label = None
+
+    ref_paper = GeneratedPaper(
+        id=ref_paper_id,
+        user_id=user_id,
+        workspace_id=ws_id,
+        subject_id=subject_id,
+        book_id=book_id,
+        pdf_path=None,
+        document_id=None,
+        processing_status="NOT_SAVED",
+        deleted_at=None,
+        title="Unsaved AI Paper",
+        generation_mode="CUSTOM",
+        status="COMPLETED",
+        total_marks=10,
+        difficulty="MEDIUM",
+        selected_chapter_ids=[str(ch_id)],
+        include_answers=True,
+        blueprint_json={
+            "total_marks": 10,
+            "sections": [
+                {
+                    "name": "Section A",
+                    "question_type": "MCQ",
+                    "question_count": 5,
+                    "marks_per_question": 2,
+                    "total_section_marks": 10,
+                    "has_internal_choice": False,
+                    "alternatives_per_question": 1,
+                }
+            ],
+            "sample_questions": [],
+        },
+        questions=[orig_q],
+        created_at=now_dt,
+        updated_at=now_dt,
+    )
+
+    new_paper = GeneratedPaper(
+        id=new_paper_id,
+        user_id=user_id,
+        workspace_id=ws_id,
+        subject_id=subject_id,
+        book_id=book_id,
+        reference_paper_id=ref_paper_id,
+        pdf_path=None,
+        document_id=None,
+        processing_status="NOT_SAVED",
+        deleted_at=None,
+        title="Derived Paper",
+        generation_mode="REFERENCE",
+        status="COMPLETED",
+        total_marks=10,
+        difficulty="MEDIUM",
+        selected_chapter_ids=[str(ch_id)],
+        include_answers=True,
+        blueprint_json=ref_paper.blueprint_json,
+        questions=[],
+        created_at=now_dt,
+        updated_at=now_dt,
+    )
+
+    pg_svc.paper_repo.get_paper = MagicMock(side_effect=lambda pid: ref_paper if str(pid) == str(ref_paper_id) else new_paper)
+    pg_svc.ref_paper_repo.get_reference_paper = MagicMock(return_value=None)
+    pg_svc.paper_repo.create_paper = MagicMock(return_value=new_paper)
+    pg_svc.paper_repo.update_status = MagicMock()
+    pg_svc.paper_repo.save_questions = MagicMock()
+    pg_svc.workspace_service.get_workspace = MagicMock()
+    pg_svc.workspace_service.get_book = MagicMock(return_value=MagicMock(id=book_id, subject_id=subject_id))
+    pg_svc.workspace_service.get_subject = MagicMock(return_value=MagicMock(id=subject_id, workspace_id=ws_id))
+    pg_svc.workspace_service.list_chapters = MagicMock(return_value=[MagicMock(id=ch_id)])
+
+    mock_qs = [
+        {
+            "question_text": f"Question {i} text here",
+            "question_type": "MCQ",
+            "marks": 2,
+            "mcq_options": ["A. Opt 1", "B. Opt 2", "C. Opt 3", "D. Opt 4"],
+            "correct_answer": "A. Opt 1",
+            "solution_explanation": "Solution explanation text",
+            "source_type": "AI_GENERATED",
+            "section_name": "Section A",
+            "question_order": i,
+        }
+        for i in range(1, 6)
+    ]
+    pg_svc._retrieve_chapter_context = MagicMock(return_value="Context")
+    pg_svc._generate_complete_paper = MagicMock(return_value=mock_qs)
+
+    with patch.object(pg_svc.blueprint_service, "build_blueprint_from_generated_paper", wraps=pg_svc.blueprint_service.build_blueprint_from_generated_paper) as spy_build_bp:
+        req = PaperGenerateRequest(
+            subject_id=subject_id,
+            book_id=book_id,
+            selected_chapters=[{"chapter_id": ch_id}],
+            generation_mode=GenerationMode.REFERENCE,
+            reference_paper_id=ref_paper_id,
+            title="Derived Paper",
+            total_marks=10,
+            difficulty=DifficultyLevel.MEDIUM,
+        )
+        res = pg_svc.generate_paper(current_user_id=user_id, request_data=req)
+
+        # Assert build_blueprint_from_generated_paper was called with ref_paper
+        spy_build_bp.assert_called_once_with(
+            paper=ref_paper,
+            requested_total_marks=10,
+        )
+        assert res.status == "COMPLETED"
+
 
 

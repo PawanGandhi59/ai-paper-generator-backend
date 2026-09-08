@@ -277,11 +277,10 @@ class PaperResponse(BaseModel):
 
 
 class GeminiGeneratedQuestionSchema(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     question_text: str = Field(..., description="Full text of the question item")
     mcq_options: Optional[List[str]] = Field(None, description="Exactly 4 option strings for MCQs ('A. ...', 'B. ...', 'C. ...', 'D. ...')")
-    correct_answer: str = Field(..., description="Unambiguously correct option or short answer")
-    expected_answer: Optional[str] = Field(None, description="Detailed expected answer or model solution")
-    solution_explanation: str = Field(..., description="Step-by-step solution, derivation, or explanation")
     is_numerical: bool = Field(False, description="Whether question involves quantitative calculation")
     chapter_number: Optional[int] = Field(None, description="1-based integer chapter number for chapter attribution")
     choice_group: Optional[str] = Field(None, description="Internal choice group identifier e.g. 'Q4'")

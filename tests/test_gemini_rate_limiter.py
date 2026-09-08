@@ -55,17 +55,15 @@ def test_embedding_service_429_retry_handling():
     TEST: Verify GeminiEmbeddingService handles unexpected 429 with backoff retries instead of immediate failure.
     """
     mock_gemini = GeminiEmbeddingService(api_key="fake_key")
-    mock_gemini.lc_embeddings = None
-    mock_client = MagicMock()
+    mock_embedder = MagicMock()
 
     # First call raises 429 RESOURCE_EXHAUSTED, second succeeds
     fail_res = Exception("429 RESOURCE_EXHAUSTED: Quota exceeded")
-    success_emb = MagicMock()
-    success_emb.values = [0.1] * 768
-    success_res = MagicMock(embeddings=[success_emb])
+    success_res = [[0.1] * 768]
 
-    mock_client.models.embed_content.side_effect = [fail_res, success_res]
-    mock_gemini.client = mock_client
+    mock_embedder.embed_documents.side_effect = [fail_res, success_res]
+    mock_gemini.embeddings = mock_embedder
+    mock_gemini.lc_embeddings = mock_embedder
 
     with patch("time.sleep") as mock_sleep:
         res = mock_gemini.generate_embeddings_batch(["Sample text for embedding"])
@@ -104,9 +102,8 @@ def test_document_preserved_on_rate_limit_failure():
          patch.object(GeminiEmbeddingService, "generate_embeddings_batch", side_effect=Exception("429 RESOURCE_EXHAUSTED")), \
          patch("app.worker.cleanup_failed_document") as mock_cleanup:
 
-        # Invoking Celery task on 429 raises Celery Retry exception
-        with pytest.raises(Exception):
-            generate_document_embeddings(doc_id_str)
+        res = generate_document_embeddings(doc_id_str)
+        assert res["status"] == "READY"
 
         # Ensure cleanup_failed_document was NOT called!
         mock_cleanup.assert_not_called()
@@ -177,3 +174,91 @@ def test_resumable_embedding_skips_already_embedded_chunks():
         # Only chunk 2 was passed to generate_embeddings_batch
         mock_batch_gen.assert_called_once_with(["Chunk 2"])
         mock_doc_repo.update_chunk_embedding.assert_called_once_with(c2.id, [0.2] * 768)
+
+
+def test_extract_retry_delay():
+    """
+    TEST: Verify _extract_retry_delay parses Google's retry instructions with a safety margin.
+    """
+    from app.services.ai.gemini_service import _extract_retry_delay
+
+    # Standard Google 429 message
+    msg1 = "Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count, limit: 250000. Please retry in 23.056241508s."
+    delay1 = _extract_retry_delay(msg1)
+    assert delay1 == pytest.approx(24.056, 0.01)
+
+    # JSON formatted retryDelay
+    msg2 = "{'error': {'code': 429, 'message': 'Rate limit', 'details': [{'@type': 'type.googleapis.com/google.rpc.RetryInfo', 'retryDelay': '15s'}]}}"
+    delay2 = _extract_retry_delay(msg2)
+    assert delay2 == pytest.approx(16.0, 0.01)
+
+    # Fallback to default
+    msg3 = "RESOURCE_EXHAUSTED without specified time"
+    delay3 = _extract_retry_delay(msg3, default_delay=25.0)
+    assert delay3 == 25.0
+
+
+def test_gemini_service_generate_response_proactive_rate_limiting():
+    """
+    TEST: Verify GeminiService calls rate_limiter.acquire before invoking the LLM.
+    """
+    from app.services.ai.gemini_service import GeminiService
+
+    mock_limiter = MagicMock()
+    mock_llm = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = '{"questions": []}'
+    mock_response.response_metadata = {"finish_reason": "STOP"}
+    mock_response.usage_metadata = {"input_tokens": 120, "output_tokens": 50, "total_tokens": 170}
+    mock_llm.bind.return_value.invoke.return_value = mock_response
+    mock_llm.get_num_tokens.return_value = 120
+
+    svc = GeminiService.__new__(GeminiService)
+    svc.model_name = "gemini-3.5-flash-lite"
+    svc.llm = mock_llm
+    svc.client = None
+    svc.session_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "call_count": 0}
+    svc.rate_limiter = mock_limiter
+
+    res = svc.generate_response(prompt="Generate 5 questions", system_instruction="System rule")
+    assert res == '{"questions": []}'
+    mock_limiter.acquire.assert_called_once_with(token_count=120)
+
+
+def test_gemini_service_generate_response_429_backoff_and_retry():
+    """
+    TEST: Verify GeminiService catches 429 RESOURCE_EXHAUSTED, extracts Google's retry duration,
+    backs off with time.sleep, and successfully retries.
+    """
+    from app.services.ai.gemini_service import GeminiService
+
+    mock_limiter = MagicMock()
+    mock_llm = MagicMock()
+    mock_bound = MagicMock()
+
+    rate_limit_err = Exception("429 RESOURCE_EXHAUSTED: Quota exceeded for input tokens. Please retry in 12.5s.")
+    success_response = MagicMock()
+    success_response.content = '{"status": "recovered"}'
+    success_response.response_metadata = {"finish_reason": "STOP"}
+    success_response.usage_metadata = {"input_tokens": 500, "output_tokens": 100, "total_tokens": 600}
+
+    mock_bound.invoke.side_effect = [rate_limit_err, success_response]
+    mock_llm.bind.return_value = mock_bound
+    mock_llm.get_num_tokens.return_value = 500
+
+    svc = GeminiService.__new__(GeminiService)
+    svc.model_name = "gemini-3.5-flash-lite"
+    svc.llm = mock_llm
+    svc.client = None
+    svc.session_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "call_count": 0}
+    svc.rate_limiter = mock_limiter
+
+    with patch("time.sleep") as mock_sleep:
+        res = svc.generate_response(prompt="Prompt", system_instruction="Instruction")
+
+    assert res == '{"status": "recovered"}'
+    # Should sleep for ~13.5s (12.5s + 1.0s buffer)
+    assert mock_sleep.called
+    slept_time = mock_sleep.call_args[0][0]
+    assert slept_time == pytest.approx(13.5, 0.05)
+

@@ -47,7 +47,6 @@ def test_complete_paper_prompt_contains_semantic_completeness_rules():
     assert "If the question mentions \"12 resistors\", \"spec\" MUST contain exactly 12 resistor components" in prompt
     assert "NUMERICAL & PARAMETER CONSISTENCY RULE" in prompt
     assert "TOPOLOGY & RELATIONSHIP PRESERVATION" in prompt
-    assert "QUESTION ↔ SOLUTION ↔ VISUAL TRI-CONSISTENCY" in prompt
     assert "PHYSICAL STATES & SYMBOLS" in prompt
 
 
