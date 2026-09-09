@@ -233,6 +233,8 @@ class WorkspaceRepository:
         name: Optional[str] = None,
         start_page: Optional[int] = None,
         end_page: Optional[int] = None,
+        exam_digest: Optional[str] = None,
+        clear_digest: bool = False,
     ) -> Chapter:
         if chapter_number is not None:
             chapter.chapter_number = chapter_number
@@ -242,9 +244,22 @@ class WorkspaceRepository:
             chapter.start_page = start_page
         if end_page is not None:
             chapter.end_page = end_page
+        if clear_digest:
+            chapter.exam_digest = None
+        elif exam_digest is not None:
+            chapter.exam_digest = exam_digest
         self.db.commit()
         self.db.refresh(chapter)
         return chapter
+
+    def update_chapter_digest(self, chapter_id: UUID, exam_digest: str) -> Optional[Chapter]:
+        chapter = self.get_chapter_by_id(chapter_id)
+        if chapter:
+            chapter.exam_digest = exam_digest
+            self.db.commit()
+            self.db.refresh(chapter)
+        return chapter
+
 
     def reassign_chunks_for_page_range(
         self,

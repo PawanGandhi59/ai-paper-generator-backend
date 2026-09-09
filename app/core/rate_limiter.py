@@ -30,14 +30,38 @@ local max_rpm = tonumber(ARGV[3])
 local max_tpm = tonumber(ARGV[4])
 local tokens = tonumber(ARGV[5])
 local req_id = ARGV[6]
+local req_count = tonumber(ARGV[7]) or 1
 local cutoff = now - window
 
--- 1. Purge expired entries older than window
+-- 0. Check global cluster-wide cooldown (if set due to a previous 429)
+local cooldown_key = KEYS[3]
+if cooldown_key and redis.call('EXISTS', cooldown_key) == 1 then
+    local pttl = redis.call('PTTL', cooldown_key)
+    if pttl and pttl > 0 then
+        local cooldown_wait = math.max(0.5, (pttl / 1000.0) + 0.2)
+        return {0, tostring(cooldown_wait), 0, 0}
+    end
+end
+
+-- 1. Purge expired entries older than rolling window
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', cutoff)
 redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', cutoff)
 
--- 2. Calculate current RPM
-local current_rpm = redis.call('ZCARD', KEYS[1])
+-- 2. Calculate current RPM (summing request counts from stored members)
+local rpm_members = redis.call('ZRANGE', KEYS[1], 0, -1)
+local current_rpm = 0
+for i = 1, #rpm_members do
+    local entry = rpm_members[i]
+    local colon_pos = string.find(entry, ":")
+    if colon_pos then
+        local r_val = tonumber(string.sub(entry, colon_pos + 1))
+        if r_val then
+            current_rpm = current_rpm + r_val
+        end
+    else
+        current_rpm = current_rpm + 1
+    end
+end
 
 -- 3. Calculate current TPM
 local tpm_members = redis.call('ZRANGE', KEYS[2], 0, -1)
@@ -53,24 +77,68 @@ for i = 1, #tpm_members do
     end
 end
 
--- 4. Check limits
-if current_rpm >= max_rpm or (current_tpm + tokens) > max_tpm then
-    local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
-    local oldest_time = now
-    if #oldest > 1 then
-        oldest_time = tonumber(oldest[2])
+-- 4. Check limits: both RPM and TPM must have capacity for this batch
+if (current_rpm + req_count) > max_rpm or (current_tpm + tokens) > max_tpm then
+    local wait_sec = 0.5
+    
+    -- Precise rolling window expiration calculation for RPM
+    local needed_rpm = (current_rpm + req_count) - max_rpm
+    if needed_rpm > 0 then
+        local rpm_scored = redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES')
+        local acc = 0
+        for i = 1, #rpm_scored, 2 do
+            local entry = rpm_scored[i]
+            local entry_score = tonumber(rpm_scored[i+1])
+            local r_val = 1
+            local colon_pos = string.find(entry, ":")
+            if colon_pos then
+                r_val = tonumber(string.sub(entry, colon_pos + 1)) or 1
+            end
+            acc = acc + r_val
+            if acc >= needed_rpm then
+                local expire_at = entry_score + window
+                if expire_at > now then
+                    wait_sec = math.max(wait_sec, (expire_at - now) + 0.2)
+                end
+                break
+            end
+        end
     end
-    local wait_sec = math.max(0.5, window - (now - oldest_time) + 0.5)
+    
+    -- Precise rolling window expiration calculation for TPM
+    local needed_tpm = (current_tpm + tokens) - max_tpm
+    if needed_tpm > 0 then
+        local tpm_scored = redis.call('ZRANGE', KEYS[2], 0, -1, 'WITHSCORES')
+        local acc = 0
+        for i = 1, #tpm_scored, 2 do
+            local entry = tpm_scored[i]
+            local entry_score = tonumber(tpm_scored[i+1])
+            local t_val = 0
+            local colon_pos = string.find(entry, ":")
+            if colon_pos then
+                t_val = tonumber(string.sub(entry, colon_pos + 1)) or 0
+            end
+            acc = acc + t_val
+            if acc >= needed_tpm then
+                local expire_at = entry_score + window
+                if expire_at > now then
+                    wait_sec = math.max(wait_sec, (expire_at - now) + 0.2)
+                end
+                break
+            end
+        end
+    end
+
     return {0, tostring(wait_sec), current_rpm, current_tpm}
 end
 
 -- 5. Record request
-redis.call('ZADD', KEYS[1], now, req_id)
+redis.call('ZADD', KEYS[1], now, req_id .. ":" .. tostring(req_count))
 redis.call('ZADD', KEYS[2], now, req_id .. ":" .. tostring(tokens))
 redis.call('EXPIRE', KEYS[1], math.ceil(window * 2))
 redis.call('EXPIRE', KEYS[2], math.ceil(window * 2))
 
-return {1, "0", current_rpm + 1, current_tpm + tokens}
+return {1, "0", current_rpm + req_count, current_tpm + tokens}
 """
 
 
@@ -83,8 +151,8 @@ class RedisGeminiRateLimiter:
 
     def __init__(
         self,
-        max_rpm: int = 90,
-        max_tpm: int = 55_000,
+        max_rpm: int = 100,
+        max_tpm: int = 30_000,
         window_seconds: float = 60.0,
         redis_client: Optional[redis.Redis] = None,
         key_prefix: str = "gemini:embedding",
@@ -94,8 +162,9 @@ class RedisGeminiRateLimiter:
         self.window_seconds = window_seconds
         self.key_prefix = key_prefix
         self._custom_redis = redis_client
-        self._fallback_history: List[Tuple[float, int]] = []
+        self._fallback_history: List[Tuple[float, int, int]] = []
         self._fallback_lock = threading.Lock()
+        self._cooldown_until: float = 0.0
 
     def _get_r(self):
         if self._custom_redis is not None:
@@ -105,24 +174,45 @@ class RedisGeminiRateLimiter:
         except Exception:
             return None
 
-    def acquire(self, token_count: int):
+    def set_cooldown(self, seconds: float):
         """
-        Proactively acquire capacity for `token_count` tokens.
+        Broadcast a global cooldown in Redis to pause all workers across all nodes.
+        Used when Google explicitly requests a cooldown (e.g. 429 with 'retry in X seconds').
+        """
+        cooldown_ms = max(500, int(seconds * 1000))
+        r = self._get_r()
+        if r is not None:
+            try:
+                r.set(f"{self.key_prefix}:cooldown", "1", px=cooldown_ms)
+                logger.warning(
+                    f"Broadcasted global Redis cooldown: {seconds:.2f}s for {self.key_prefix}"
+                )
+                return
+            except Exception as exc:
+                logger.warning(f"Failed to set Redis cooldown: {exc}")
+
+        with self._fallback_lock:
+            self._cooldown_until = max(self._cooldown_until, time.time() + seconds)
+
+    def acquire(self, token_count: int, request_count: int = 1):
+        """
+        Proactively acquire capacity for `token_count` tokens and `request_count` requests.
         If limits are reached, sleeps until capacity becomes available.
         """
         r = self._get_r()
         if r is not None:
             try:
-                self._acquire_redis(r, token_count)
+                self._acquire_redis(r, token_count, request_count)
                 return
             except Exception as exc:
                 logger.warning(f"Redis rate limiter exception ({exc}), falling back to in-memory rate limiter.")
 
-        self._acquire_in_memory(token_count)
+        self._acquire_in_memory(token_count, request_count)
 
-    def _acquire_redis(self, r, token_count: int):
+    def _acquire_redis(self, r, token_count: int, request_count: int = 1):
         rpm_key = f"{self.key_prefix}:rpm_zset"
         tpm_key = f"{self.key_prefix}:tpm_zset"
+        cooldown_key = f"{self.key_prefix}:cooldown"
 
         while True:
             now = time.time()
@@ -131,15 +221,17 @@ class RedisGeminiRateLimiter:
             try:
                 res = r.eval(
                     LUA_RATE_LIMITER_SCRIPT,
-                    2,
+                    3,
                     rpm_key,
                     tpm_key,
+                    cooldown_key,
                     str(now),
                     str(self.window_seconds),
                     str(self.max_rpm),
                     str(self.max_tpm),
                     str(token_count),
                     req_id,
+                    str(request_count),
                 )
             except Exception as eval_exc:
                 logger.warning(f"Failed to execute Redis Lua rate limit script: {eval_exc}")
@@ -161,24 +253,52 @@ class RedisGeminiRateLimiter:
             )
             time.sleep(wait_sec)
 
-    def _acquire_in_memory(self, token_count: int):
+    def _acquire_in_memory(self, token_count: int, request_count: int = 1):
         with self._fallback_lock:
             while True:
                 now = time.time()
-                self._fallback_history = [(t, count) for (t, count) in self._fallback_history if now - t < self.window_seconds]
+                if self._cooldown_until > now:
+                    wait_cooldown = max(0.5, (self._cooldown_until - now) + 0.1)
+                    time.sleep(wait_cooldown)
+                    continue
 
-                current_rpm = len(self._fallback_history)
-                current_tpm = sum(count for _, count in self._fallback_history)
+                self._fallback_history = [
+                    entry for entry in self._fallback_history
+                    if now - entry[0] < self.window_seconds
+                ]
 
-                rpm_exceeded = current_rpm >= self.max_rpm
+                current_rpm = sum(entry[2] if len(entry) > 2 else 1 for entry in self._fallback_history)
+                current_tpm = sum(entry[1] for entry in self._fallback_history)
+
+                rpm_exceeded = (current_rpm + request_count) > self.max_rpm
                 tpm_exceeded = (current_tpm + token_count) > self.max_tpm
 
                 if not rpm_exceeded and not tpm_exceeded:
-                    self._fallback_history.append((now, token_count))
+                    self._fallback_history.append((now, token_count, request_count))
                     break
 
-                oldest_time = self._fallback_history[0][0] if self._fallback_history else now
-                sleep_needed = max(0.5, self.window_seconds - (now - oldest_time) + 0.5)
+                sleep_needed = 0.5
+                needed_rpm = (current_rpm + request_count) - self.max_rpm
+                if needed_rpm > 0:
+                    acc = 0
+                    for entry in self._fallback_history:
+                        acc += entry[2] if len(entry) > 2 else 1
+                        if acc >= needed_rpm:
+                            expire_at = entry[0] + self.window_seconds
+                            if expire_at > now:
+                                sleep_needed = max(sleep_needed, (expire_at - now) + 0.2)
+                            break
+
+                needed_tpm = (current_tpm + token_count) - self.max_tpm
+                if needed_tpm > 0:
+                    acc = 0
+                    for entry in self._fallback_history:
+                        acc += entry[1]
+                        if acc >= needed_tpm:
+                            expire_at = entry[0] + self.window_seconds
+                            if expire_at > now:
+                                sleep_needed = max(sleep_needed, (expire_at - now) + 0.2)
+                            break
 
                 logger.info(
                     f"Gemini quota capacity reached ({self.key_prefix}, in-memory). "

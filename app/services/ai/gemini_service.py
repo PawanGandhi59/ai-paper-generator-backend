@@ -133,6 +133,7 @@ class GeminiService(AIService):
         system_instruction: str,
         max_output_tokens: int,
         response_schema: Optional[Any],
+        response_mime_type: str = "application/json",
     ) -> str:
         """Handles mock client compatibility for legacy tests."""
         class _LegacyConfig:
@@ -145,7 +146,7 @@ class GeminiService(AIService):
 
         config = _LegacyConfig(
             sys_inst=system_instruction,
-            mime="application/json",
+            mime=response_mime_type,
             schema=response_schema,
             temp=0.2,
             max_tokens=max_output_tokens,
@@ -174,7 +175,14 @@ class GeminiService(AIService):
         if not getattr(response, "text", None):
             raise GeminiInvalidResponseError("Gemini API returned an empty text response.")
 
+        self._apply_inter_request_pacing()
         return response.text
+
+    def _apply_inter_request_pacing(self):
+        """Smooth pacing between LLM requests to prevent burst-rate 429s."""
+        delay = getattr(settings, "GEMINI_INTER_REQUEST_DELAY_SECONDS", 0.5)
+        if delay > 0:
+            time.sleep(delay)
 
     def generate_response(
         self,
@@ -182,15 +190,17 @@ class GeminiService(AIService):
         system_instruction: Optional[str] = None,
         max_output_tokens: Optional[int] = None,
         response_schema: Optional[Any] = None,
+        response_mime_type: Optional[str] = None,
     ) -> str:
         if not self.llm and not (hasattr(self, "client") and self.client):
             raise RuntimeError("GeminiService client is not initialized.")
 
         sys_instruct = system_instruction
         token_limit = max_output_tokens or settings.GEMINI_PAPER_MAX_OUTPUT_TOKENS
+        mime_type = response_mime_type or "application/json"
 
         if hasattr(self, "client") and self.client is not None and hasattr(self.client, "models"):
-            return self._legacy_client_generate(prompt, sys_instruct, token_limit, response_schema)
+            return self._legacy_client_generate(prompt, sys_instruct, token_limit, response_schema, mime_type)
 
         messages: List[BaseMessage] = []
         if sys_instruct:
@@ -206,7 +216,7 @@ class GeminiService(AIService):
 
         invocation_kwargs: Dict[str, Any] = {
             "max_output_tokens": token_limit,
-            "response_mime_type": "application/json",
+            "response_mime_type": mime_type,
         }
         if schema_dict:
             invocation_kwargs["response_schema"] = schema_dict
@@ -285,8 +295,7 @@ class GeminiService(AIService):
                     f"Total Tokens: {t_tokens}"
                 )
                 logger.info(log_call_msg)
-                print(log_call_msg, flush=True)
-
+                self._apply_inter_request_pacing()
                 return str(res_text)
 
             except GeminiOutputTruncatedError:
@@ -358,6 +367,7 @@ class GeminiService(AIService):
             if not res_text or not str(res_text).strip():
                 raise RuntimeError("Gemini API returned an empty text response.")
 
+            self._apply_inter_request_pacing()
             return {
                 "answer": str(res_text),
                 "model_used": self.model_name,
@@ -410,6 +420,7 @@ class GeminiService(AIService):
             if not res_text or not str(res_text).strip():
                 raise RuntimeError("Gemini API returned an empty text response.")
 
+            self._apply_inter_request_pacing()
             return {
                 "answer": str(res_text),
                 "model_used": self.model_name,
