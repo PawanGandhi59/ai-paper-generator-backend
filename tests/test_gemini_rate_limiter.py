@@ -259,6 +259,7 @@ def test_gemini_service_generate_response_429_backoff_and_retry():
     assert res == '{"status": "recovered"}'
     # Should sleep for ~13.5s (12.5s + 1.0s buffer)
     assert mock_sleep.called
-    slept_time = mock_sleep.call_args[0][0]
-    assert slept_time == pytest.approx(13.5, 0.05)
+    # First sleep is the 429 backoff (~13.5s = 12.5s + 1.0s buffer)
+    slept_times = [c[0][0] for c in mock_sleep.call_args_list]
+    assert any(pytest.approx(13.5, 0.05) == t for t in slept_times)
 

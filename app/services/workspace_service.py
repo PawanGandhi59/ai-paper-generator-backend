@@ -282,12 +282,18 @@ class WorkspaceService:
                     detail="Cannot set start_page or end_page because no whole book document has been uploaded for this book.",
                 )
 
+        page_range_changed = (
+            (start_page is not None and start_page != chapter.start_page) or
+            (end_page is not None and end_page != chapter.end_page)
+        )
+
         updated_ch = self.repo.update_chapter(
             chapter,
             chapter_number=chapter_number,
             name=name,
             start_page=start_page,
             end_page=end_page,
+            clear_digest=page_range_changed,
         )
         if updated_ch.start_page is not None and updated_ch.end_page is not None:
             self.repo.reassign_chunks_for_page_range(

@@ -1,4 +1,5 @@
 import io
+import logging
 import os
 import re
 from typing import Any, Dict, List
@@ -8,6 +9,8 @@ from PIL import Image
 import pytesseract
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class PDFProcessor:
@@ -59,34 +62,19 @@ class PDFProcessor:
                     ocr_applied = True
                     best_ocr_text = ""
 
-                    # Method A: Try OCR on embedded image objects
+                    # Direct Full-Page OCR (Standard single pass at 150 DPI with automatic page segmentation)
                     try:
-                        embedded_imgs = page.get_images(full=True)
-                        for img_info in embedded_imgs:
-                            try:
-                                xref = img_info[0]
-                                base_image = pdf_doc.extract_image(xref)
-                                pil_img = Image.open(io.BytesIO(base_image["image"]))
-                                for psm_cfg in ["", "--psm 6"]:
-                                    t = pytesseract.image_to_string(pil_img, lang=settings.OCR_LANGUAGE, config=psm_cfg)
-                                    if t and len(t.strip()) > len(best_ocr_text):
-                                        best_ocr_text = t.strip()
-                            except Exception:
-                                pass
-                    except Exception as emb_exc:
-                        print(f"OCR embedded image warning on page {page_number}: {emb_exc}")
-
-                    # Method B: Try OCR on rendered pixmap
-                    try:
-                        pix = page.get_pixmap(dpi=200)
-                        img_bytes = pix.tobytes("png")
-                        pil_img = Image.open(io.BytesIO(img_bytes))
-                        for psm_cfg in ["", "--psm 6"]:
-                            t = pytesseract.image_to_string(pil_img, lang=settings.OCR_LANGUAGE, config=psm_cfg)
-                            if t and len(t.strip()) > len(best_ocr_text):
-                                best_ocr_text = t.strip()
+                        pix = page.get_pixmap(dpi=150)
+                        pil_img = Image.open(io.BytesIO(pix.tobytes("png")))
+                        ocr_text = pytesseract.image_to_string(
+                            pil_img,
+                            lang=settings.OCR_LANGUAGE,
+                            config="--psm 3",
+                        ).strip()
+                        if ocr_text:
+                            best_ocr_text = ocr_text
                     except Exception as pix_exc:
-                        print(f"OCR pixmap warning on page {page_number}: {pix_exc}")
+                        logger.warning(f"OCR pixmap warning on page {page_number}: {pix_exc}")
 
                     if best_ocr_text:
                         usable_text = best_ocr_text

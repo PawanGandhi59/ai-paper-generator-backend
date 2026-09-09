@@ -695,15 +695,62 @@ class PaperGeneratorService:
         from app.models.document import DocumentChunk
         from sqlalchemy import or_, select
 
-        # Query all active chunks matching selected chapter_ids or chapter page ranges
+        # Query all active chapters matching selected chapter_ids
         chapters = self.paper_repo.db.query(Chapter).filter(Chapter.id.in_(selected_chapter_ids), Chapter.deleted_at.is_(None)).all()
-        conditions = [DocumentChunk.chapter_id.in_(selected_chapter_ids)]
-        for ch in chapters:
-            if ch.start_page is not None and ch.end_page is not None:
+
+        # Categorize chapters by presence of valid precomputed Exam Knowledge Digest
+        chapters_with_digest = []
+        chapters_needing_chunks = []
+        if chapters and not _is_mock(chapters):
+            for ch in chapters:
+                raw_digest = getattr(ch, "exam_digest", None)
+                if (
+                    raw_digest
+                    and not _is_mock(raw_digest)
+                    and isinstance(raw_digest, str)
+                    and len(raw_digest.strip()) >= 50
+                    and raw_digest.strip().lower() not in ("none", "null", "n/a", "empty")
+                ):
+                    chapters_with_digest.append(ch)
+                else:
+                    chapters_needing_chunks.append(ch)
+
+        # FAST PATH: All selected chapters have high-density exam digests precomputed
+        if chapters and len(chapters_with_digest) == len(chapters) and len(chapters_needing_chunks) == 0:
+            context_lines = []
+            ch_contexts_map: Dict[str, List[str]] = {}
+            for ch in chapters_with_digest:
+                ch_num = getattr(ch, "chapter_number", "")
+                ch_name = getattr(ch, "name", "")
+                header = f"[Source Exam Knowledge Digest | Chapter {ch_num}: {ch_name} | Chapter ID: {ch.id}]:"
+                digest_block = f"{header}\n{ch.exam_digest.strip()}"
+                context_lines.append(digest_block)
+                ch_contexts_map[str(ch.id)] = [digest_block]
+
+            self._chapter_contexts_map = {
+                cid: "\n\n".join(blocks) for cid, blocks in ch_contexts_map.items()
+            }
+            raw_context = "\n\n".join(context_lines)
+            logger.info(
+                f"Structured exam digest context retrieval: selected_chapter_ids={selected_chapter_ids}, "
+                f"chapter_count={len(chapters_with_digest)}, sent_char_count={len(raw_context)}, "
+                f"mode='EXAM_KNOWLEDGE_DIGEST'"
+            )
+            return raw_context
+
+        # HYBRID / FALLBACK PATH: Query chunks for chapters lacking exam_digest
+        target_chunk_chapters = chapters_needing_chunks if chapters_needing_chunks else chapters
+        target_ch_ids = [ch.id for ch in target_chunk_chapters] if target_chunk_chapters else selected_chapter_ids
+
+        conditions = [DocumentChunk.chapter_id.in_(target_ch_ids)]
+        for ch in target_chunk_chapters:
+            sp = getattr(ch, "start_page", None)
+            ep = getattr(ch, "end_page", None)
+            if sp is not None and ep is not None and not _is_mock(sp) and not _is_mock(ep):
                 conditions.append(
                     (DocumentChunk.book_id == ch.book_id) &
-                    (DocumentChunk.page_number >= ch.start_page) &
-                    (DocumentChunk.page_number <= ch.end_page)
+                    (DocumentChunk.page_number >= sp) &
+                    (DocumentChunk.page_number <= ep)
                 )
 
         stmt = (
@@ -719,17 +766,28 @@ class PaperGeneratorService:
         db_chunks = self.paper_repo.db.execute(stmt).scalars().all()
 
         context_lines = []
-        ch_chunks_map: Dict[str, List[str]] = {}
+        ch_contexts_map: Dict[str, List[str]] = {}
+
+        # First add digests for chapters that have them
+        for ch in chapters_with_digest:
+            ch_num = getattr(ch, "chapter_number", "")
+            ch_name = getattr(ch, "name", "")
+            header = f"[Source Exam Knowledge Digest | Chapter {ch_num}: {ch_name} | Chapter ID: {ch.id}]:"
+            digest_block = f"{header}\n{ch.exam_digest.strip()}"
+            context_lines.append(digest_block)
+            ch_contexts_map.setdefault(str(ch.id), []).append(digest_block)
+
+        # Then add chunks for remaining chapters
         if db_chunks:
             for idx, c in enumerate(db_chunks, start=1):
                 page_info = f" (Page {c.page_number})" if c.page_number else ""
                 excerpt = f"[Source Excerpt {idx}{page_info} | Chapter ID: {c.chapter_id}]:\n{c.content}"
                 context_lines.append(excerpt)
                 if c.chapter_id:
-                    ch_chunks_map.setdefault(str(c.chapter_id), []).append(excerpt)
+                    ch_contexts_map.setdefault(str(c.chapter_id), []).append(excerpt)
 
         self._chapter_contexts_map = {
-            cid: "\n\n".join(chunks) for cid, chunks in ch_chunks_map.items()
+            cid: "\n\n".join(chunks) for cid, chunks in ch_contexts_map.items()
         }
 
         if not context_lines:
@@ -739,9 +797,8 @@ class PaperGeneratorService:
 
         logger.info(
             f"Full chapter context retrieval: selected_chapter_ids={selected_chapter_ids}, "
-            f"retrieved_chunk_count={len(db_chunks)}, sent_chunk_count={len(db_chunks)}, "
-            f"retrieved_char_count={len(raw_context)}, sent_char_count={len(raw_context)}, "
-            f"truncated=False, sampling_mode='NONE/FULL'"
+            f"digests_count={len(chapters_with_digest)}, retrieved_chunk_count={len(db_chunks)}, "
+            f"sent_char_count={len(raw_context)}, mode='HYBRID_OR_CHUNKS'"
         )
         return raw_context
 

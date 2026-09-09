@@ -15,6 +15,7 @@ from app.core.database import SessionLocal
 from app.repositories.document_repository import DocumentRepository
 from app.repositories.workspace_repository import WorkspaceRepository
 from app.services.ai.chapter_detection_service import ChapterDetectionService
+from app.services.ai.chapter_digest_service import ChapterDigestService
 from app.services.embeddings.gemini_embedding_service import GeminiEmbeddingService
 from app.services.processors.pdf_processor import PDFProcessor
 from app.services.processors.pptx_processor import PPTXProcessor
@@ -195,6 +196,7 @@ def generate_document_embeddings(self, document_id_str: str) -> dict:
 
         # AI Chapter Detection for complete book uploads (when doc.chapter_id is None)
         page_to_chapter_map = None
+        detected_chapters_meta = []
         if doc.chapter_id is None:
             try:
                 detector = ChapterDetectionService()
@@ -227,6 +229,8 @@ def generate_document_embeddings(self, document_id_str: str) -> dict:
                                 start_page=start_p,
                                 end_page=end_p,
                             )
+
+                        detected_chapters_meta.append((ch_obj.id, ch_obj.name, start_p, end_p))
 
                         for p_num in range(start_p, end_p + 1):
                             page_to_chapter_map[p_num] = ch_obj.id
@@ -263,8 +267,39 @@ def generate_document_embeddings(self, document_id_str: str) -> dict:
         except Exception as embed_exc:
             logger.warning(f"Embedding generation failed for document_id={document_id_str}: {embed_exc}. Chunks preserved in DB.")
 
-        # 4. Mark Document status READY
+        # 4. Generate Structured Exam Knowledge Digest for chapters
+        try:
+            digest_service = ChapterDigestService()
+            ws_repo = WorkspaceRepository(db)
+            if doc.chapter_id:
+                target_ch = ws_repo.get_chapter_by_id(doc.chapter_id)
+                if target_ch:
+                    digest = digest_service.generate_digest_from_pages(
+                        chapter_name=target_ch.name,
+                        pages=pages,
+                    )
+                    if digest:
+                        ws_repo.update_chapter_digest(target_ch.id, digest)
+                        logger.info(f"Generated/updated exam digest for chapter {target_ch.id} ({target_ch.name})")
+            elif detected_chapters_meta:
+                for ch_id, ch_name, s_p, e_p in detected_chapters_meta:
+                    target_ch = ws_repo.get_chapter_by_id(ch_id)
+                    if target_ch:
+                        digest = digest_service.generate_digest_from_pages(
+                            chapter_name=ch_name,
+                            pages=pages,
+                            start_page=s_p,
+                            end_page=e_p,
+                        )
+                        if digest:
+                            ws_repo.update_chapter_digest(ch_id, digest)
+                            logger.info(f"Generated/updated exam digest for detected chapter {ch_id} ({ch_name})")
+        except Exception as digest_exc:
+            logger.warning(f"Chapter digest generation skipped or failed for document_id={document_id_str}: {digest_exc}")
+
+        # 5. Mark Document status READY once embeddings AND digests are complete
         doc_repo.mark_ready(doc_id)
+
         logger.info(f"Successfully processed document_id={document_id_str}, total_chunks={len(created_chunks)}")
         return {
             "status": "READY",
