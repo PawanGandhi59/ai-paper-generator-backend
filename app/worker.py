@@ -103,9 +103,9 @@ def process_document(self, document_id_str: str) -> dict:
         _, ext = os.path.splitext(doc.original_filename)
         ext_lower = ext.lower()
 
-        # 2. Extract Document Pages
+        # 2. Extract Document Pages (using fast OCR mode for textbooks and long books)
         if ext_lower == ".pdf":
-            pages_data = PDFProcessor.process_pdf(doc.stored_path, doc_dir)
+            pages_data = PDFProcessor.process_pdf(doc.stored_path, doc_dir, ocr_mode="fast")
         elif ext_lower == ".pptx":
             pages_data = PPTXProcessor.process_pptx(doc.stored_path, doc_dir)
         else:
@@ -138,6 +138,11 @@ def process_document(self, document_id_str: str) -> dict:
     except TRANSIENT_ERRORS as trans_exc:
         logger.warning(f"Transient processing failure for document_id={document_id_str}, retry={self.request.retries}: {str(trans_exc)}")
         try:
+            try:
+                doc_repo = DocumentRepository(db)
+                doc_repo.mark_failed(doc_id, error_message=f"Retrying: {str(trans_exc)[:200]}")
+            except Exception:
+                pass
             countdown = 5 * (2 ** self.request.retries)
             raise self.retry(exc=trans_exc, countdown=countdown)
         except MaxRetriesExceededError:
