@@ -145,11 +145,13 @@ class DocumentRepository:
 
         created_pages = []
         for page_info in pages_data:
+            raw_text = page_info.get("text_content", "") or ""
+            clean_text = raw_text.replace("\x00", "") if isinstance(raw_text, str) else ""
             page = DocumentPage(
                 document_id=document_id,
                 page_number=page_info["page_number"],
                 content_type=page_info.get("content_type", "PAGE"),
-                text_content=page_info.get("text_content", ""),
+                text_content=clean_text,
                 image_path=page_info.get("image_path"),
                 metadata_json=page_info.get("metadata_json"),
             )
@@ -179,6 +181,8 @@ class DocumentRepository:
 
         created_chunks = []
         for c_info in chunks_data:
+            raw_content = c_info.get("content", "") or ""
+            clean_content = raw_content.replace("\x00", "") if isinstance(raw_content, str) else ""
             chunk = DocumentChunk(
                 document_id=document_id,
                 document_page_id=c_info.get("document_page_id"),
@@ -188,7 +192,7 @@ class DocumentRepository:
                 workspace_id=c_info["workspace_id"],
                 chunk_index=c_info["chunk_index"],
                 page_number=c_info.get("page_number", 1),
-                content=c_info["content"],
+                content=clean_content,
                 content_type=c_info.get("content_type", "TEXT"),
                 metadata_json=c_info.get("metadata_json"),
                 embedding=c_info.get("embedding"),

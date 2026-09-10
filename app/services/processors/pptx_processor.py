@@ -32,14 +32,14 @@ class PPTXProcessor:
                 # 1. Text extraction from text frames
                 if shape.has_text_frame:
                     for paragraph in shape.text_frame.paragraphs:
-                        p_text = paragraph.text.strip()
+                        p_text = paragraph.text.replace("\x00", "").strip()
                         if p_text:
                             extracted_text_chunks.append(p_text)
 
                 # 2. Text extraction from tables
                 if shape.has_table:
                     for row in shape.table.rows:
-                        row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                        row_text = " | ".join(cell.text.replace("\x00", "").strip() for cell in row.cells if cell.text and cell.text.strip())
                         if row_text:
                             extracted_text_chunks.append(row_text)
 
