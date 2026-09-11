@@ -7,6 +7,8 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from fastapi.middleware.cors import CORSMiddleware
+
 from app.api.router import api_router
 from app.core.config import settings
 
@@ -39,6 +41,14 @@ app = FastAPI(
     title=settings.APP_NAME,
     debug=settings.DEBUG,
     default_response_class=UnicodeJSONResponse,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Ensure local storage directory exists and mount static files (matching vigilens-backend pattern)

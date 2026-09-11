@@ -42,6 +42,8 @@ class QuestionConfigItem(BaseModel):
     marks_per_question: int = Field(..., ge=1, description="Marks assigned to each question")
     section_name: Optional[str] = Field(None, max_length=100)
     alternatives_per_question: int = Field(1, ge=1, description="Number of alternatives per question number (e.g. 1 for mandatory, 2 for (a) OR (b))")
+    reasoning_style: Optional[str] = Field(None, description="Cognitive reasoning style e.g. SCENARIO_BASED, DIRECT_RECALL, etc.")
+    section_description: Optional[str] = Field(None, description="Optional pedagogical guidance or description for the section")
 
     @property
     def has_internal_choice(self) -> bool:
@@ -221,6 +223,8 @@ class PaperQuestionResponse(BaseModel):
 
     choice_group: Optional[str] = None
     alternative_label: Optional[str] = None
+    reasoning_style: Optional[str] = None
+    section_description: Optional[str] = None
 
     # Answer fields (conditionally included based on include_answers)
     mcq_options: Optional[List[str]] = None
@@ -280,6 +284,8 @@ class GeminiGeneratedQuestionSchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     question_text: str = Field(..., description="Full text of the question item")
+    question_type: Optional[str] = Field(None, description="Question type e.g. MCQ, SHORT_ANSWER, LONG_ANSWER, NUMERICAL")
+    marks: Optional[int] = Field(None, description="Marks assigned to this question")
     mcq_options: Optional[List[str]] = Field(None, description="Exactly 4 option strings for MCQs ('A. ...', 'B. ...', 'C. ...', 'D. ...')")
     is_numerical: bool = Field(False, description="Whether question involves quantitative calculation")
     chapter_number: Optional[int] = Field(None, description="1-based integer chapter number for chapter attribution")
@@ -287,6 +293,8 @@ class GeminiGeneratedQuestionSchema(BaseModel):
     alternative_label: Optional[str] = Field(None, description="Internal choice alternative label e.g. 'a', 'b'")
     difficulty: Optional[str] = Field(None, description="'EASY', 'MEDIUM', or 'HARD'")
     source_type: Optional[str] = Field(None, description="'AI_GENERATED', 'REFERENCE_REUSED', or 'REFERENCE_VARIATION'")
+    reasoning_style: Optional[str] = Field(None, description="Reasoning style of the question e.g. SCENARIO_BASED, DIRECT_RECALL, etc.")
+    section_description: Optional[str] = Field(None, description="Detailed pedagogical guidance or focus for the section")
     visual: Optional[GeminiVisualRequirementSchema] = Field(None, description="Optional structured visual specification if question requires a diagram, circuit, geometry, graph, or chart")
 
 

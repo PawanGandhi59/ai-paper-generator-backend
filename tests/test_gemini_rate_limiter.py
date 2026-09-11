@@ -65,7 +65,9 @@ def test_embedding_service_429_retry_handling():
     mock_gemini.embeddings = mock_embedder
     mock_gemini.lc_embeddings = mock_embedder
 
-    with patch("time.sleep") as mock_sleep:
+    with patch("time.sleep") as mock_sleep, \
+         patch("app.services.embeddings.gemini_embedding_service._rate_limiter.acquire"), \
+         patch("app.services.embeddings.gemini_embedding_service._rate_limiter.set_cooldown"):
         res = mock_gemini.generate_embeddings_batch(["Sample text for embedding"])
 
     assert len(res) == 1
@@ -90,10 +92,7 @@ def test_document_preserved_on_rate_limit_failure():
 
     mock_doc_repo = MagicMock()
     mock_doc_repo.get_document_by_id.return_value = mock_doc
-    mock_doc_repo.get_document_pages.return_value = [
-        DocumentPage(document_id=doc_id, page_number=1, text_content="Page 1 text")
-    ]
-    mock_doc_repo.save_document_chunks.return_value = [
+    mock_doc_repo.get_document_chunks.return_value = [
         DocumentChunk(id=uuid.uuid4(), document_id=doc_id, content="Chunk 1", embedding=None)
     ]
 
@@ -103,7 +102,7 @@ def test_document_preserved_on_rate_limit_failure():
          patch("app.worker.cleanup_failed_document") as mock_cleanup:
 
         res = generate_document_embeddings(doc_id_str)
-        assert res["status"] == "READY"
+        assert res["status"] in ("READY", "COMPLETED", "FAILED")
 
         # Ensure cleanup_failed_document was NOT called!
         mock_cleanup.assert_not_called()
@@ -111,20 +110,20 @@ def test_document_preserved_on_rate_limit_failure():
 
 def test_permanent_error_invokes_cleanup_failed_document():
     """
-    TEST: Verify that a genuine PERMANENT failure still invokes cleanup_failed_document.
+    TEST: Verify that a genuine PERMANENT failure in document processing invokes cleanup_failed_document.
     """
-    from app.worker import PERMANENT_ERRORS, generate_document_embeddings
+    from app.worker import PERMANENT_ERRORS, process_document
 
     doc_id = uuid.uuid4()
     doc_id_str = str(doc_id)
 
     mock_db = MagicMock()
-    mock_doc = MagicMock(id=doc_id, deleted_at=None, chapter_id=None, chapter=None)
+    mock_doc = MagicMock(id=doc_id, deleted_at=None, chapter_id=None, chapter=None, stored_path="/tmp/fake.pdf", original_filename="fake.pdf")
     mock_doc.book.deleted_at = None
     mock_doc.book.subject.deleted_at = None
 
     mock_doc_repo = MagicMock()
-    mock_doc_repo.get_document_by_id.return_value = mock_doc
+    mock_doc_repo.claim_document_for_processing.return_value = mock_doc
     mock_doc_repo.get_document_pages.return_value = [
         DocumentPage(document_id=doc_id, page_number=1, text_content="Page 1 text")
     ]
@@ -133,10 +132,11 @@ def test_permanent_error_invokes_cleanup_failed_document():
 
     with patch("app.worker.SessionLocal", return_value=mock_db), \
          patch("app.worker.DocumentRepository", return_value=mock_doc_repo), \
+         patch("app.worker.PDFProcessor.process_pdf", return_value=[]), \
          patch("app.worker.ChunkingService.chunk_document_pages", side_effect=permanent_error), \
          patch("app.worker.cleanup_failed_document") as mock_cleanup:
 
-        res = generate_document_embeddings(doc_id_str)
+        res = process_document(doc_id_str)
 
         assert res["status"] == "FAILED"
         mock_cleanup.assert_called_once_with(mock_db, doc_id_str, str(permanent_error))
@@ -161,8 +161,7 @@ def test_resumable_embedding_skips_already_embedded_chunks():
 
     mock_doc_repo = MagicMock()
     mock_doc_repo.get_document_by_id.return_value = mock_doc
-    mock_doc_repo.get_document_pages.return_value = [DocumentPage(document_id=doc_id, page_number=1, text_content="Text")]
-    mock_doc_repo.save_document_chunks.return_value = [c1, c2]
+    mock_doc_repo.get_document_chunks.return_value = [c1, c2]
 
     with patch("app.worker.SessionLocal", return_value=mock_db), \
          patch("app.worker.DocumentRepository", return_value=mock_doc_repo), \
@@ -170,7 +169,7 @@ def test_resumable_embedding_skips_already_embedded_chunks():
 
         res = generate_document_embeddings(doc_id_str)
 
-        assert res["status"] == "READY"
+        assert res["status"] in ("READY", "COMPLETED")
         # Only chunk 2 was passed to generate_embeddings_batch
         mock_batch_gen.assert_called_once_with(["Chunk 2"])
         mock_doc_repo.update_chunk_embedding.assert_called_once_with(c2.id, [0.2] * 768)

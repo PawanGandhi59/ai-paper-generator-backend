@@ -12,7 +12,11 @@ from app.core.rate_limiter import (
     RedisGeminiRateLimiter,
     get_redis_client,
 )
-from app.services.ai.gemini_service import _extract_retry_delay
+from app.services.ai.gemini_service import (
+    GeminiDailyQuotaExhaustedError,
+    _extract_retry_delay,
+    is_daily_quota_error,
+)
 from app.services.embeddings.embedding_service import EmbeddingService
 
 logger = logging.getLogger(__name__)
@@ -139,6 +143,14 @@ class GeminiEmbeddingService(EmbeddingService):
                         break
                     except Exception as exc:
                         exc_str = str(exc)
+                        if is_daily_quota_error(exc_str):
+                            logger.error(
+                                f"Gemini embedding daily quota (RPD) exhausted on batch starting index {i}: {exc_str}. Aborting immediately."
+                            )
+                            raise GeminiDailyQuotaExhaustedError(
+                                f"Gemini embedding daily quota exhausted (RPD limit reached): {exc_str}"
+                            ) from exc
+
                         if ("429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str or "quota" in exc_str.lower()) and attempt < max_retries - 1:
                             # Extract Google's exact retry delay if present, with jitter fallback
                             jitter = random.uniform(1.0, 3.0)
