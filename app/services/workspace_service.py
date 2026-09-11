@@ -37,8 +37,41 @@ class WorkspaceService:
         return self.repo.update_workspace(workspace, name=name)
 
     def delete_workspace(self, workspace_id: UUID, current_user_id: UUID) -> None:
+        import os
+        import shutil
+        from sqlalchemy import select
+        from app.core.config import settings
+        from app.models.book import Book
+        from app.models.document import Document
+        from app.models.reference_paper import ReferencePaper
+        from app.models.generated_paper import GeneratedPaper
+
         workspace = self.get_workspace(workspace_id, current_user_id)
+
+        # Collect storage directories for all descendants in workspace to hard-delete from disk
+        storage_root = settings.LOCAL_STORAGE_PATH
+        dirs_to_delete = []
+
+        for subject in (workspace.subjects or []):
+            book_ids = [b.id for b in (subject.books or [])]
+            if book_ids:
+                docs = self.repo.db.execute(select(Document).where(Document.book_id.in_(book_ids))).scalars().all()
+                for doc in docs:
+                    dirs_to_delete.append(os.path.join(storage_root, "documents", str(doc.id)))
+
+            ref_papers = self.repo.db.execute(select(ReferencePaper).where(ReferencePaper.subject_id == subject.id)).scalars().all()
+            for ref in ref_papers:
+                dirs_to_delete.append(os.path.join(storage_root, "reference_papers", str(ref.id)))
+
+            gen_papers = self.repo.db.execute(select(GeneratedPaper).where(GeneratedPaper.subject_id == subject.id)).scalars().all()
+            for gen in gen_papers:
+                dirs_to_delete.append(os.path.join(storage_root, "generated_papers", str(gen.id)))
+
         self.repo.delete_workspace(workspace)
+
+        for path in dirs_to_delete:
+            if os.path.exists(path):
+                shutil.rmtree(path, ignore_errors=True)
 
     # Subject operations
     def create_subject(self, workspace_id: UUID, current_user_id: UUID, name: str) -> Subject:

@@ -79,6 +79,8 @@ class GeneratedPaperQuestion(Base):
 
     choice_group = Column(String(50), nullable=True)  # e.g., "Q4" or "4"
     alternative_label = Column(String(10), nullable=True)  # e.g., "a", "b"
+    reasoning_style = Column(String(100), nullable=True)  # e.g., "SCENARIO_BASED", "DIRECT_RECALL"
+    section_description = Column(Text, nullable=True)  # Detailed section guidance or focus
 
     mcq_options = Column(JSONB, nullable=True)  # List of option strings
     correct_answer = Column(Text, nullable=True)

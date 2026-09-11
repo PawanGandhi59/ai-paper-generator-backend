@@ -110,10 +110,37 @@ class DocumentRepository:
     def mark_embedding_started(self, document_id: UUID) -> Optional[Document]:
         doc = self.get_document_by_id(document_id)
         if doc:
-            doc.processing_status = "EMBEDDING"
+            doc.embedding_status = "PROCESSING"
+            doc.embedding_error = None
             self.db.commit()
             self.db.refresh(doc)
         return doc
+
+    def mark_embedding_status(
+        self,
+        document_id: UUID,
+        embedding_status: str,
+        error_message: Optional[str] = None,
+    ) -> Optional[Document]:
+        doc = self.get_document_by_id(document_id)
+        if doc:
+            doc.embedding_status = embedding_status
+            if error_message is not None:
+                doc.embedding_error = str(error_message)[:1024]
+            if embedding_status == "COMPLETED":
+                doc.embedding_completed_at = datetime.now(timezone.utc)
+                doc.embedding_error = None
+            elif embedding_status == "PROCESSING":
+                doc.embedding_error = None
+            self.db.commit()
+            self.db.refresh(doc)
+        return doc
+
+    def get_document_embedding_stats(self, document_id: UUID) -> Tuple[int, int]:
+        chunks = self.get_document_chunks(document_id)
+        total = len(chunks)
+        embedded = sum(1 for c in chunks if c.embedding is not None)
+        return total, embedded
 
     def mark_ready(self, document_id: UUID) -> Optional[Document]:
         doc = self.get_document_by_id(document_id)
@@ -215,6 +242,20 @@ class DocumentRepository:
         stmt = update(DocumentChunk).where(DocumentChunk.id == chunk_id).values(embedding=embedding)
         self.db.execute(stmt)
         self.db.commit()
+
+    def clear_document_chunk_embeddings(self, document_id: UUID) -> int:
+        """
+        Clear (set to NULL) any vector embeddings for all chunks belonging to this document.
+        Leaves document, pages, chunks, and content untouched.
+        """
+        stmt = (
+            update(DocumentChunk)
+            .where(DocumentChunk.document_id == document_id)
+            .values(embedding=None)
+        )
+        res = self.db.execute(stmt)
+        self.db.commit()
+        return res.rowcount or 0
 
     def search_similar_chunks(
         self,

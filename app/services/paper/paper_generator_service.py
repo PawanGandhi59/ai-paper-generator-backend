@@ -40,7 +40,7 @@ from app.services.ai.prompts.paper_prompt import (
     PAPER_RECOVERY_SYSTEM_INSTRUCTION,
 )
 from app.services.embeddings.gemini_embedding_service import GeminiEmbeddingService
-from app.services.paper.blueprint_service import BlueprintService, PaperBlueprint, SectionBlueprint
+from app.services.paper.blueprint_service import BlueprintService, PaperBlueprint, SectionBlueprint, normalize_reasoning_style
 from app.services.processors.pdf_processor import PDFProcessor
 from app.services.retrieval.chunking_service import ChunkingService
 from app.services.retrieval.retrieval_service import RetrievalService
@@ -179,6 +179,8 @@ class PaperGeneratorService:
                     "required_alts": required_alts,
                     "alts_per_q": alts_per_q,
                     "is_numerical": False,
+                    "reasoning_style": getattr(sec, "reasoning_style", None),
+                    "section_description": getattr(sec, "section_description", None),
                 })
             current_q_order += sec.question_count
 
@@ -253,6 +255,8 @@ class PaperGeneratorService:
                         "chapter_number": g.get("chapter_number"),
                         "chapter_name": g.get("chapter_name"),
                         "is_numerical": g.get("is_numerical", False),
+                        "reasoning_style": getattr(sec, "reasoning_style", None),
+                        "section_description": getattr(sec, "section_description", None),
                         "required_alts": g["required_alts"],
                         "slots": {alt: None for alt in g["required_alts"]},
                     }
@@ -434,18 +438,17 @@ class PaperGeneratorService:
             else:
                 if source_is_generated_paper:
                     if is_eligible and reference_paper.pdf_path:
-                        # Saved GeneratedPaper: check if blueprint_json from PDF is cached in DB
+                        # Saved GeneratedPaper: check if updated blueprint_json from PDF is in DB
                         if reference_paper.blueprint_json:
                             base_blueprint = PaperBlueprint.model_validate(reference_paper.blueprint_json)
                         else:
-                            # Cache miss: fetch extracted PDF text from linked DocumentPage records
+                            # Cache miss fallback: fetch extracted PDF text from linked DocumentPage records
                             doc_pages = self.doc_repo.get_document_pages(reference_paper.document_id)
                             pages_text = [p.text_content for p in doc_pages] if doc_pages else []
                             raw_base_blueprint = self.blueprint_service.analyze_reference_paper(
                                 paper_pages_text=pages_text,
                                 requested_total_marks=None,
                             )
-                            # Cache raw base blueprint in DB for all future paper generations
                             self.paper_repo.save_blueprint_json(reference_paper.id, raw_base_blueprint.model_dump())
                             base_blueprint = raw_base_blueprint
 
@@ -457,7 +460,7 @@ class PaperGeneratorService:
                         else:
                             blueprint = base_blueprint
                     else:
-                        # Unsaved GeneratedPaper (no saved PDF): build blueprint from original paper JSON
+                        # Unsaved GeneratedPaper (no saved PDF): uses paper.blueprint_json via build_blueprint_from_generated_paper
                         blueprint = self.blueprint_service.build_blueprint_from_generated_paper(
                             paper=reference_paper,
                             requested_total_marks=request_data.total_marks,
@@ -1024,6 +1027,8 @@ class PaperGeneratorService:
                 ]
                 if self._validate_question_structure(cand, sec, existing_sec_questions=current_sec_qs):
                     if not self._is_duplicate_question(cand, all_accepted_questions):
+                        if getattr(sec, "reasoning_style", None):
+                            cand["reasoning_style"] = cand.get("reasoning_style") or sec.reasoning_style
                         cand_ch_num = cand.get("chapter_number")
                         matched_item = None
                         if cand_ch_num and cand_ch_num in ch_num_to_item:
@@ -1114,6 +1119,7 @@ class PaperGeneratorService:
                                 "question_type": g["question_type"],
                                 "marks": g["marks"],
                                 "is_numerical": g.get("is_numerical", False),
+                                "reasoning_style": getattr(sec, "reasoning_style", None),
                                 "paired_slot": paired_q,
                             })
             return missing_slots
@@ -1148,37 +1154,83 @@ class PaperGeneratorService:
             else:
                 recovery_context = context_text
 
-            slot_instructions = []
+            # Group missing slots by section to provide rich pedagogical context
+            sections_missing_map: Dict[str, List[Dict[str, Any]]] = {}
             for s_info in all_missing:
-                sec_name = s_info["section_name"]
-                q_type = s_info["question_type"]
-                marks = s_info["marks"]
-                diff = s_info["difficulty"]
-                ch_num = s_info.get("chapter_number")
-                ch_str = f", Chapter: {ch_num}" if ch_num else ""
-                cg = s_info["choice_group"]
-                alt = s_info["alternative_label"]
-                paired_q = s_info.get("paired_slot")
+                sections_missing_map.setdefault(s_info["section_name"], []).append(s_info)
 
-                if paired_q and cg and alt:
-                    p_text = str(paired_q.get("question_text", "")).strip()[:120]
-                    slot_instructions.append(
-                        f"- Section '{sec_name}' | Choice Group '{cg}', Alternative '{alt}' | Type: {q_type} | Marks: {marks} | Target Difficulty: {diff}{ch_str}. "
-                        f"Must be an internal choice alternative paired with: \"{p_text}...\". "
-                        f"IMPORTANT: Must test a DIFFERENT formula or distinct educational concept from Chapter {ch_num} so it is not duplicate or repetitive."
-                    )
-                elif cg and alt:
-                    slot_instructions.append(
-                        f"- Section '{sec_name}' | Choice Group '{cg}', Alternative '{alt}' | Type: {q_type} | Marks: {marks} | Target Difficulty: {diff}{ch_str}."
-                    )
-                else:
-                    slot_instructions.append(
-                        f"- Section '{sec_name}' | Question {s_info['question_order']} | Type: {q_type} | Marks: {marks} | Target Difficulty: {diff}{ch_str}."
-                    )
-            slots_detail_str = "\n".join(slot_instructions)
+            sections_detail_blocks = []
+            for sec_name, sec_missing_slots in sections_missing_map.items():
+                first_slot = sec_missing_slots[0]
+                sec = first_slot["sec"]
+                r_style = getattr(sec, "reasoning_style", None) or first_slot.get("reasoning_style")
+                sec_desc = getattr(sec, "section_description", None)
+
+                style_str = f"- Dominant Reasoning Style: {r_style}\n" if r_style else ""
+                desc_str = f"- Section Pedagogical Description: {sec_desc}\n" if sec_desc else ""
+                pedagogical_rule = ""
+                if r_style:
+                    if any(kw in r_style for kw in ("SCENARIO", "CASE", "VIGNETTE", "APPLIED", "SITUATION")):
+                        pedagogical_rule = (
+                            f"- STRICT PEDAGOGICAL REQUIREMENT: Every replacement question for this section MUST be grounded in a realistic, "
+                            f"contextual case scenario, vignette, or applied situation (reasoning style: {r_style}). "
+                            f"Do NOT ask generic, bare textbook recall questions. Each question item MUST include "
+                            f"'reasoning_style': '{r_style}'.\n"
+                        )
+                    else:
+                        pedagogical_rule = (
+                            f"- STRICT PEDAGOGICAL REQUIREMENT: Every replacement question for this section MUST strictly embody the reasoning style "
+                            f"'{r_style}'. Do NOT deviate into other unrelated cognitive modes. Each question item MUST include "
+                            f"'reasoning_style': '{r_style}'.\n"
+                        )
+
+                slot_lines = []
+                for s_info in sec_missing_slots:
+                    q_type = s_info["question_type"]
+                    marks = s_info["marks"]
+                    diff = s_info["difficulty"]
+                    ch_num = s_info.get("chapter_number")
+                    ch_name = s_info.get("chapter_name")
+                    if ch_num and ch_name:
+                        ch_str = f"Chapter {ch_num} (\"{ch_name}\")"
+                    elif ch_num:
+                        ch_str = f"Chapter {ch_num}"
+                    else:
+                        ch_str = "Designated Chapter"
+
+                    is_num_str = " | Numerical Calculation" if s_info.get("is_numerical") else ""
+                    cg = s_info["choice_group"]
+                    alt = s_info["alternative_label"]
+                    paired_q = s_info.get("paired_slot")
+
+                    if paired_q and cg and alt:
+                        p_text = str(paired_q.get("question_text", "")).strip()
+                        slot_lines.append(
+                            f"  * Choice Group '{cg}', Alternative '{alt}': {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}. "
+                            f"Must be an internal choice alternative paired with: \"{p_text}\". "
+                            f"IMPORTANT: Must test a DIFFERENT formula or distinct educational concept from {ch_str} so it is not duplicate or repetitive."
+                        )
+                    elif cg and alt:
+                        slot_lines.append(
+                            f"  * Choice Group '{cg}', Alternative '{alt}': {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}."
+                        )
+                    else:
+                        slot_lines.append(
+                            f"  * Question {s_info['question_order']}: {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}."
+                        )
+
+                slots_str = "\n".join(slot_lines)
+                sec_q_type = getattr(sec.question_type, "value", sec.question_type) if hasattr(sec, "question_type") else first_slot["question_type"]
+                sections_detail_blocks.append(
+                    f"SECTION: '{sec_name}'\n"
+                    f"- Question Type: {sec_q_type}\n"
+                    f"{style_str}{desc_str}{pedagogical_rule}- Missing Question Slots to Generate:\n{slots_str}"
+                )
+
+            slots_detail_str = "\n\n".join(sections_detail_blocks)
 
             existing_texts = [
-                str(q.get("question_text", "")).strip()[:140]
+                str(q.get("question_text", "")).strip()
                 for q in all_accepted_questions
                 if q and q.get("question_text")
             ]
@@ -1186,7 +1238,7 @@ class PaperGeneratorService:
 
             rejected_feedback_str = ""
             if rejected_recovery_candidates:
-                unique_rejected = list(dict.fromkeys(r[:140] for r in rejected_recovery_candidates if r))[-15:]
+                unique_rejected = list(dict.fromkeys(r.strip() for r in rejected_recovery_candidates if r and r.strip()))[-15:]
                 rejected_feedback_str = f"""
 STRICT REJECTION FEEDBACK (DO NOT REPEAT OR GENERATE QUESTIONS SIMILAR TO THESE REJECTED CANDIDATES):
 {json.dumps(unique_rejected, ensure_ascii=False)}
@@ -1221,8 +1273,13 @@ Return ONLY valid JSON matching this schema:
       "alternative_label": "<'a' or 'b' if internal choice, else null>",
       "question_order": <integer question order or null>,
       "question_text": "...",
+      "question_type": "<MCQ | VERY_SHORT_ANSWER | SHORT_ANSWER | LONG_ANSWER | NUMERICAL as specified for the slot>",
+      "marks": <marks per question as specified for the slot>,
       "chapter_number": <1-based integer chapter number covering this question from the selected chapters>,
       "difficulty": "<EASY, MEDIUM, or HARD as specified for the slot>",
+      "is_numerical": <true | false>,
+      "reasoning_style": "<Reasoning style matching section requirement, e.g. SCENARIO_BASED, DIRECT_RECALL, or custom style>",
+      "section_description": "<Brief pedagogical description matching section focus or null>",
       "mcq_options": ["A. ...", "B. ...", "C. ...", "D. ..."] or null,
       "visual": null
     }}
@@ -1364,6 +1421,10 @@ Return ONLY valid JSON matching this schema:
                     cand["question_type"] = sec.question_type.value
                     cand["marks"] = sec.marks_per_question
                     cand["difficulty"] = g["difficulty"]
+                    if getattr(sec, "reasoning_style", None):
+                        cand["reasoning_style"] = cand.get("reasoning_style") or sec.reasoning_style
+                    if getattr(sec, "section_description", None):
+                        cand["section_description"] = cand.get("section_description") or sec.section_description
                     if g.get("chapter_id"):
                         cand["chapter_id"] = g["chapter_id"]
                     if g.get("chapter_number"):
@@ -1490,11 +1551,30 @@ Return ONLY valid JSON matching this schema:
 
             slot_breakdown_str = ("\n- Planned Question Slot Grid:\n" + "\n".join(slot_breakdown_lines)) if slot_breakdown_lines else ""
 
+            style_str = f"- Dominant Reasoning Style: {sec.reasoning_style}\n" if getattr(sec, "reasoning_style", None) else ""
+            desc_str = f"- Section Pedagogical Description: {sec.section_description}\n" if getattr(sec, "section_description", None) else ""
+            pedagogical_rule = ""
+            if getattr(sec, "reasoning_style", None):
+                r_style = sec.reasoning_style
+                if any(kw in r_style for kw in ("SCENARIO", "CASE", "VIGNETTE", "APPLIED", "SITUATION")):
+                    pedagogical_rule = (
+                        f"- STRICT PEDAGOGICAL REQUIREMENT: Every question in this section MUST be grounded in a realistic, "
+                        f"contextual case scenario, vignette, or applied situation (reasoning style: {r_style}). "
+                        f"Do NOT ask generic, bare textbook recall questions. Each question item MUST include "
+                        f"'reasoning_style': '{r_style}'.\n"
+                    )
+                else:
+                    pedagogical_rule = (
+                        f"- STRICT PEDAGOGICAL REQUIREMENT: Every question in this section MUST strictly embody the reasoning style "
+                        f"'{r_style}'. Do NOT deviate into other unrelated cognitive modes. Each question item MUST include "
+                        f"'reasoning_style': '{r_style}'.\n"
+                    )
+
             sections_info.append(f"""
 ---
 SECTION NAME: '{sec.name}'
 - Question Type: {sec.question_type.value}
-- Logical Question Count: {sec.question_count}
+{style_str}{desc_str}{pedagogical_rule}- Logical Question Count: {sec.question_count}
 - Alternatives Per Question: {sec.alternatives_per_question}
 - Total Question Items To Generate: {sec.question_count * alts_per_q}
 - Marks Per Question Item: {sec.marks_per_question} (Total Section Marks: {sec.total_section_marks})
@@ -1653,6 +1733,8 @@ Return ONLY a valid JSON object containing a "sections" array. Author ONLY quest
           "alternative_label": "<e.g. a, b or null>",
           "chapter_number": <1-based integer chapter number>,
           "is_numerical": <true | false>,
+          "reasoning_style": "<Reasoning style matching section requirement, e.g. SCENARIO_BASED, DIRECT_RECALL, or custom style>",
+          "section_description": "<Brief pedagogical description matching section focus or null>",
           "mcq_options": ["A. ...", "B. ...", "C. ...", "D. ..."] or null,
           "visual": {{
             "required": true,
@@ -1759,32 +1841,43 @@ SOURCE EDUCATIONAL MATERIAL:
                     logger.warning(f"Rejecting MCQ: correct_answer '{corr}' does not match any option in {opts}")
                     return False
 
-        # 4. Content-based numerical detection and slot alignment
-        sol = str(q.get("solution_explanation") or "").strip()
-        search_corpus = q_text + (" " + sol if sol else "")
-        has_numbers = bool(re.search(r"\b\d+(\.\d+)?\s*(×\s*10|e[+-]?\d+|[a-zA-ZΩ°µμ%C|N|m|V|J|A|Hz])\b", search_corpus, re.IGNORECASE))
-        has_math_ops = bool(re.search(r"[=\+\-\*/\^]", search_corpus))
-        is_calc_text = bool(re.search(r"\b(calculate|compute|find the magnitude|determine the value)\b", q_text, re.IGNORECASE))
+        # 4. Numerical indicator retention and safe fallback detection (no slot rejection)
+        is_num = q.get("is_numerical")
+        if is_num is None:
+            sol = str(q.get("solution_explanation") or "").strip()
+            search_corpus = q_text + (" " + sol if sol else "")
+            # Physical/math units or scientific notation (avoid bare [a-zA-Z] which matches ordinary words)
+            has_num_units = bool(re.search(r"\b\d+(\.\d+)?\s*(×\s*10|e[+-]?\d+|[Ω°µμ%CNmVJAhz]|kg|km|cm|mm|ms|mol|watt|joule|newton|volt|amp)\b", search_corpus, re.IGNORECASE))
+            has_math_ops = bool(re.search(r"[=\+\-\*/\^]", search_corpus))
+            is_calc_text = bool(re.search(r"\b(calculate|compute|find the magnitude|determine the value)\b", q_text, re.IGNORECASE))
+            is_num = (q_type == "NUMERICAL") or (has_num_units and has_math_ops) or (is_calc_text and (has_num_units or has_math_ops))
+        q["is_numerical"] = bool(is_num)
 
-        inferred_numerical = has_numbers or (has_math_ops and is_calc_text) or (q_type == "NUMERICAL")
+        # 5. Cognitive reasoning style validation & metadata retention
+        if not q.get("section_name"):
+            q["section_name"] = sec.name
 
-        if existing_sec_questions is not None and sec.numerical_question_count > 0:
-            current_num_cnt = sum(1 for item in existing_sec_questions if item.get("is_numerical") is True)
-            needed_num_cnt = sec.numerical_question_count
-            total_items_needed = sec.question_count * sec.alternatives_per_question
-            remaining_slots = total_items_needed - len(existing_sec_questions)
-            remaining_num_needed = needed_num_cnt - current_num_cnt
+        cand_style = normalize_reasoning_style(q.get("reasoning_style"))
+        expected_style = getattr(sec, "reasoning_style", None)
 
-            if remaining_num_needed > 0 and remaining_num_needed >= remaining_slots:
-                if not inferred_numerical:
-                    logger.warning(f"Rejecting conceptual question in mandatory numerical slot for section '{sec.name}'")
-                    return False
-            elif remaining_num_needed <= 0 and inferred_numerical and q_type != "NUMERICAL":
-                if len(existing_sec_questions) < sec.question_count:
-                    logger.warning(f"Rejecting calculation question in conceptual slot for section '{sec.name}'")
-                    return False
+        is_scenario_dominant = (
+            expected_style
+            and any(kw in expected_style for kw in ("SCENARIO", "CASE", "VIGNETTE", "APPLIED"))
+        )
 
-        q["is_numerical"] = bool(inferred_numerical)
+        if is_scenario_dominant:
+            # Domain-agnostic check: question must provide situational framing rather than bare factual recall
+            words = q_text.split()
+            is_too_brief = len(words) < 12 and len(q_text) < 60
+            is_bare_recall = bool(re.match(r"^\s*(what is|define|explain|state|list|mention|name the|give the definition)\b", q_text, re.IGNORECASE))
+            if is_too_brief and is_bare_recall:
+                logger.warning(f"Rejecting question in {expected_style} section '{sec.name}' due to lack of situational scenario context: '{q_text[:60]}'")
+                return False
+            q["reasoning_style"] = cand_style or expected_style
+        elif cand_style:
+            q["reasoning_style"] = cand_style
+        elif expected_style:
+            q["reasoning_style"] = expected_style
 
         return True
 
@@ -2033,6 +2126,14 @@ SOURCE EDUCATIONAL MATERIAL:
                 if ch_reused > ch_alloc:
                     logger.warning(f"Final integrity notice: chapter {ch_id} reused marks ({ch_reused}) exceeds allocated weightage ({ch_alloc}).")
 
+        # 6. Cognitive reasoning style retention check
+        for sec in blueprint.sections:
+            if getattr(sec, "reasoning_style", None):
+                for q in generated_questions:
+                    if q.get("section_name") == sec.name:
+                        if not q.get("reasoning_style"):
+                            q["reasoning_style"] = sec.reasoning_style
+
         logger.info(f"Monolithic final paper validation passed cleanly: {len(generated_questions)} items, {computed_marks} total marks.")
 
     def _is_question_grounded(self, q: Dict[str, Any], context_text: str = "") -> bool:
@@ -2149,6 +2250,14 @@ SOURCE EDUCATIONAL MATERIAL:
 
         res["choice_group"] = choice_group
         res["alternative_label"] = alternative_label
+
+        r_style = getattr(sec, "reasoning_style", None)
+        if r_style and any(kw in r_style for kw in ("SCENARIO", "CASE", "VIGNETTE")):
+            res["question_text"] = f"In an applied case study scenario{suffix}, an organization encounters unexpected behavioral variations. Analyze the situation and discuss the primary factors influencing this outcome."
+            res["reasoning_style"] = r_style
+        elif r_style:
+            res["reasoning_style"] = r_style
+
         return res
 
     def _normalize_text(self, text: str) -> str:
@@ -2215,6 +2324,16 @@ SOURCE EDUCATIONAL MATERIAL:
         """
         question_responses: List[PaperQuestionResponse] = []
 
+        sec_style_map: Dict[str, Optional[str]] = {}
+        sec_desc_map: Dict[str, Optional[str]] = {}
+        raw_bp = getattr(paper, "blueprint_json", None)
+        if isinstance(raw_bp, dict) and "sections" in raw_bp and isinstance(raw_bp["sections"], list):
+            for s in raw_bp["sections"]:
+                if isinstance(s, dict) and "name" in s:
+                    s_key = str(s["name"]).strip().lower()
+                    sec_style_map[s_key] = s.get("reasoning_style")
+                    sec_desc_map[s_key] = s.get("section_description")
+
         for q in paper.questions:
             mcq_opts = q.mcq_options
             corr_ans = q.correct_answer if include_answers else None
@@ -2262,6 +2381,25 @@ SOURCE EDUCATIONAL MATERIAL:
             alt_lbl = getattr(q, "alternative_label", None)
             alt_lbl = None if _is_mock(alt_lbl) else alt_lbl
 
+            q_sec_name_clean = str(q.section_name or "").strip().lower()
+            raw_style = getattr(q, "reasoning_style", None)
+            if _is_mock(raw_style):
+                raw_style = None
+            if not raw_style and q_sec_name_clean:
+                raw_style = sec_style_map.get(q_sec_name_clean)
+            if _is_mock(raw_style):
+                raw_style = None
+            q_reasoning_style = str(raw_style) if raw_style else None
+
+            raw_desc = getattr(q, "section_description", None)
+            if _is_mock(raw_desc):
+                raw_desc = None
+            if not raw_desc and q_sec_name_clean:
+                raw_desc = sec_desc_map.get(q_sec_name_clean)
+            if _is_mock(raw_desc):
+                raw_desc = None
+            q_section_desc = str(raw_desc) if raw_desc else None
+
             question_responses.append(
                 PaperQuestionResponse(
                     id=q_id,
@@ -2276,6 +2414,8 @@ SOURCE EDUCATIONAL MATERIAL:
                     is_numerical=is_num,
                     choice_group=choice_grp,
                     alternative_label=alt_lbl,
+                    reasoning_style=q_reasoning_style,
+                    section_description=q_section_desc,
                     mcq_options=mcq_opts,
                     correct_answer=corr_ans,
                     expected_answer=exp_ans,
@@ -2593,10 +2733,36 @@ SOURCE EDUCATIONAL MATERIAL:
                 self.doc_repo.save_document_chunks(doc_id, chunks_data)
 
             self.doc_repo.mark_ready(doc_id)
-            self.paper_repo.update_saved_pdf(paper_id=paper_id, pdf_path=stored_path, document_id=doc_id, processing_status="READY")
+
+            # Analyze edited PDF text to generate updated blueprint reflecting user edits
+            pages_text = [p.get("text_content", "") for p in pages_data if p.get("text_content")]
+            updated_blueprint_dict = None
+            if pages_text:
+                try:
+                    updated_bp = self.blueprint_service.analyze_reference_paper(
+                        paper_pages_text=pages_text,
+                        requested_total_marks=None,
+                    )
+                    if updated_bp:
+                        updated_blueprint_dict = updated_bp.model_dump()
+                except Exception as bp_err:
+                    logger.warning(f"Could not extract updated blueprint from saved PDF for paper {paper_id}: {bp_err}")
+
+            self.paper_repo.update_saved_pdf(
+                paper_id=paper_id,
+                pdf_path=stored_path,
+                document_id=doc_id,
+                processing_status="READY",
+                blueprint_json=updated_blueprint_dict,
+            )
         except Exception as exc:
             logger.error(f"Failed processing saved paper PDF for paper {paper_id}: {exc}")
-            self.paper_repo.update_saved_pdf(paper_id=paper_id, pdf_path=stored_path, document_id=doc_id, processing_status="READY")
+            self.paper_repo.update_saved_pdf(
+                paper_id=paper_id,
+                pdf_path=stored_path,
+                document_id=doc_id,
+                processing_status="READY",
+            )
 
     def get_paper_pdf_path(self, paper_id: UUID, current_user_id: UUID) -> Tuple[str, str]:
         """

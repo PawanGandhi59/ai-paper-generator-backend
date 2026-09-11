@@ -7,7 +7,12 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_current_user_from_header_or_query
 from app.core.database import get_db
 from app.models.user import User
-from app.schemas.document import DocumentPageResponse, DocumentResponse, DocumentUploadResponse
+from app.schemas.document import (
+    DocumentEmbeddingStatusResponse,
+    DocumentPageResponse,
+    DocumentResponse,
+    DocumentUploadResponse,
+)
 from app.services.document_service import DocumentService
 
 router = APIRouter(prefix="/documents", tags=["Documents"])
@@ -73,3 +78,31 @@ def get_document_pages(
     doc = service.get_document(current_user_id=current_user.id, document_id=document_id)
     pages = service.doc_repo.get_document_pages(doc.id)
     return [DocumentPageResponse.model_validate(p) for p in pages]
+
+
+@router.get("/{document_id}/embeddings", response_model=DocumentEmbeddingStatusResponse, status_code=status.HTTP_200_OK)
+def get_document_embedding_status(
+    document_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> DocumentEmbeddingStatusResponse:
+    """
+    Check the asynchronous vector embedding status and progress for a document.
+    """
+    service = DocumentService(db)
+    stats = service.get_embedding_status(current_user_id=current_user.id, document_id=document_id)
+    return DocumentEmbeddingStatusResponse.model_validate(stats)
+
+
+@router.post("/{document_id}/embeddings", response_model=DocumentEmbeddingStatusResponse, status_code=status.HTTP_202_ACCEPTED)
+def trigger_document_embedding(
+    document_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> DocumentEmbeddingStatusResponse:
+    """
+    Trigger or re-trigger asynchronous vector embedding generation for a document.
+    """
+    service = DocumentService(db)
+    stats = service.trigger_embedding(current_user_id=current_user.id, document_id=document_id)
+    return DocumentEmbeddingStatusResponse.model_validate(stats)

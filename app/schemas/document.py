@@ -24,6 +24,9 @@ class DocumentResponse(BaseModel):
     processing_error: Optional[str] = None
     processing_started_at: Optional[datetime] = None
     processing_completed_at: Optional[datetime] = None
+    embedding_status: str = "NOT_STARTED"
+    embedding_error: Optional[str] = None
+    embedding_completed_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 
@@ -31,6 +34,17 @@ class DocumentResponse(BaseModel):
     @property
     def file_url(self) -> str:
         return f"/storage/documents/{self.id}/original.pdf"
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DocumentEmbeddingStatusResponse(BaseModel):
+    document_id: UUID
+    embedding_status: str
+    total_chunks: int
+    embedded_chunks: int
+    embedding_error: Optional[str] = None
+    embedding_completed_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
 

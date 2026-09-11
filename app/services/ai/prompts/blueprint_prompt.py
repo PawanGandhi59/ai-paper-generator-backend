@@ -15,9 +15,10 @@ CORE OPERATIONAL RULES:
 - Accurately categorize question types (MCQ, VERY_SHORT_ANSWER, SHORT_ANSWER, LONG_ANSWER, NUMERICAL) based on mark allocations and answering depth.
 - Identify internal choices (e.g., 'a' OR 'b') and extract their choice rules.
 
-3. REPRESENTATIVE SAMPLING:
+3. REPRESENTATIVE SAMPLING & COGNITIVE PROFILING:
 - Read the entire paper text from start to finish.
 - Extract high-fidelity sample questions across all sections to accurately capture the examiner's cognitive demand and reasoning style.
+- For reasoning styles, you have full analytical freedom, free will, and autonomy to determine or invent precise, domain-appropriate reasoning style descriptors (e.g., standard terms like SCENARIO_BASED, DIRECT_RECALL, or custom terms like LEGAL_ARGUMENTATION, CLINICAL_CASE_DIAGNOSIS, EXPERIMENTAL_DESIGN, MIXED). The examples are purely illustrative to show UPPERCASE_SNAKE_CASE format; do not feel confined to a fixed menu or example list.
 
 4. OUTPUT FORMAT:
 - Output strictly valid JSON conforming to the requested blueprint schema with zero conversational filler.

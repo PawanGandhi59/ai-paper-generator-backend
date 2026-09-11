@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.paper import QuestionConfigItem, QuestionType
 from app.services.ai.gemini_service import GeminiService
@@ -14,9 +14,43 @@ from app.services.ai.prompts.blueprint_prompt import BLUEPRINT_ANALYSIS_SYSTEM_I
 logger = logging.getLogger(__name__)
 
 
+CANONICAL_REASONING_STYLES = {
+    "DIRECT_RECALL": "DIRECT_RECALL",
+    "CONCEPT_EXPLANATION": "CONCEPT_EXPLANATION",
+    "SCENARIO_BASED": "SCENARIO_BASED",
+    "MULTI_STEP_NUMERICAL": "MULTI_STEP_NUMERICAL",
+    "DERIVATION": "DERIVATION",
+    "EXPERIMENTAL_ANALYSIS": "EXPERIMENTAL_ANALYSIS",
+    "ASSERTION_REASON": "ASSERTION_REASON",
+    "COMPARATIVE_ANALYSIS": "COMPARATIVE_ANALYSIS",
+}
+
+
+def normalize_reasoning_style(val: Optional[str]) -> Optional[str]:
+    """
+    Standardizes formatting of reasoning style strings (uppercase, trimmed, underscores)
+    without artificially restricting to a rigid closed list.
+    Preserves Gemini's own nuanced domain classifications.
+    """
+    if not val:
+        return None
+    raw = str(val).strip().upper().replace("-", "_").replace(" ", "_")
+    raw = re.sub(r"_+", "_", raw).strip("_")
+    if not raw:
+        return None
+
+    # Canonicalize common equivalent synonyms for scenarios
+    if raw in ("SCENARIO", "CASE_SCENARIO"):
+        return "SCENARIO_BASED"
+
+    return raw
+
+
 class SectionBlueprint(BaseModel):
     name: str
     question_type: QuestionType
+    reasoning_style: Optional[str] = Field(default=None, description="Dominant cognitive reasoning style e.g. SCENARIO_BASED, DIRECT_RECALL, MIXED, etc.")
+    section_description: Optional[str] = Field(default=None, description="Detailed pedagogical focus or guidance for the section")
     question_count: int = Field(..., ge=1, description="Number of distinct question numbers in this section")
     marks_per_question: int = Field(..., ge=1, description="Marks assigned to each question number")
     total_section_marks: int = Field(..., ge=1, description="Total marks = question_count * marks_per_question")
@@ -25,6 +59,11 @@ class SectionBlueprint(BaseModel):
     choice_rule: Optional[str] = Field(default=None, description="Choice rule description, e.g. 'answer_one_of_two'")
     numerical_question_count: int = Field(default=0, ge=0, description="Calculated count of numerical questions required in this section")
     numerical_percentage: Optional[int] = Field(default=None, ge=1, le=100, description="Percentage of numerical questions in this section")
+
+    @field_validator("reasoning_style", mode="before")
+    @classmethod
+    def validate_reasoning_style(cls, v: Any) -> Optional[str]:
+        return normalize_reasoning_style(v)
 
 
 class PaperBlueprint(BaseModel):
@@ -43,6 +82,8 @@ Return ONLY a JSON object with this exact structure:
     {{
       "name": "<Section Name, e.g. Part A, Part B, Part C>",
       "question_type": "<One of: MCQ, VERY_SHORT_ANSWER, SHORT_ANSWER, LONG_ANSWER, NUMERICAL>",
+      "reasoning_style": "<Analyze the questions in this section and determine what cognitive demand they require. You have complete free will and permission to either choose a common style (e.g. SCENARIO_BASED, DIRECT_RECALL, CONCEPT_EXPLANATION, MULTI_STEP_NUMERICAL, DERIVATION, EXPERIMENTAL_ANALYSIS, ASSERTION_REASON, MIXED) OR invent an entirely new domain-specific style (e.g. CLINICAL_DIAGNOSTIC_VIGNETTE, ETHICAL_EVALUATION, LEGAL_PRECEDENT_ANALYSIS, DATA_INTERPRETATION, etc.) that best characterizes the section. The examples are purely illustrative to demonstrate UPPERCASE_SNAKE_CASE format; choose or invent whatever truly fits best>",
+      "section_description": "<Pedagogical description of what this section tests and any breakdown of question formats (e.g. 'Contains theoretical questions with 1 case scenario', 'Direct definitions and recall', or 'Mathematical problem solving')>",
       "question_count": <number of distinct question numbers in this section as integer>,
       "marks_per_question": <marks assigned per single question number as integer>,
       "has_internal_choice": <true if questions have internal OR choices (e.g. Q4(a) OR Q4(b)), false otherwise>,
@@ -52,12 +93,12 @@ Return ONLY a JSON object with this exact structure:
   ],
   "sample_questions": [
     {{
-      "section_name": "<Section Name>",
+      "section_name": "<Section Name, e.g. SECTION - A>",
       "question_type": "<MCQ | VERY_SHORT_ANSWER | SHORT_ANSWER | LONG_ANSWER | NUMERICAL>",
-      "question_text": "<Question text>",
+      "question_text": "<Full exact question text>",
       "marks": <marks>,
       "cognitive_demand": "<RECALL | COMPREHENSION | APPLICATION | ANALYSIS | NUMERICAL_SOLVING>",
-      "reasoning_style": "<DIRECT_RECALL | CONCEPT_EXPLANATION | MULTI_STEP_NUMERICAL | SCENARIO_BASED | DERIVATION>",
+      "reasoning_style": "<Specific cognitive reasoning style of this question—you have full autonomy to use a standard style or invent a new descriptive style in UPPERCASE_SNAKE_CASE that precisely fits what the question tests>",
       "choice_group": "<Question number like Q4 if internal choice exists, null otherwise>",
       "alternative_label": "<'a' or 'b' if internal choice exists, null otherwise>"
     }}
@@ -71,7 +112,13 @@ CRITICAL BLUEPRINT RULES:
 4. Total paper marks = sum of total_section_marks across all sections (e.g. Part A: 5x1=5, Part B: 5x4=20, Part C: 5x7=35 -> Total = 60).
 5. COMPLETE SECTION EXTRACTION: Read all pages carefully. Identify all sections from question numbering (e.g., Q1-Q5, Q6-Q10, Q11-Q15), even if explicit section header labels (such as Part C) are missing or faint in OCR text. In standard 60-mark examination papers with Part A (5x1=5) and Part B (5x4=20), Part C questions Q11 to Q15 are 7 marks each (5x7=35 marks; Total = 60).
 6. QUESTION TYPES: Classify question_type based on section style: 1 mark direct answers are VERY_SHORT_ANSWER, 2-4 mark questions are SHORT_ANSWER, 5+ mark questions are LONG_ANSWER. Part A (1m) is VERY_SHORT_ANSWER, Part B (4m) is SHORT_ANSWER, while Part C (7m) is LONG_ANSWER.
-7. FULL PAPER COVERAGE: Read the ENTIRE examination text from start to finish. Extract representative sample questions from EVERY section across the entire paper (beginning, middle, and end), capturing questions of varying types, marks, cognitive demands, and reasoning styles.
+7. EXHAUSTIVE QUESTION EXTRACTION (ALL QUESTIONS): Read the ENTIRE examination text from start to finish. In sample_questions, extract EVERY question appearing in the examination paper across all sections (e.g. Q1, Q2, Q3 ... QN, including both alternatives for internal choice questions like Q4(a) and Q4(b)). Do NOT omit, skip, or summarize questions as mere 1-2 question samples—extract ALL questions so the complete pedagogical corpus and every question's specific text, marks, cognitive demand, and reasoning style are fully captured.
+8. SECTION REASONING STYLE & PEDAGOGICAL FREEDOM:
+   Evaluate ALL questions in each section collectively before assigning reasoning_style and section_description:
+   - FULL AUTONOMY & PERMISSION TO INVENT: You have complete free will and explicit permission to either choose an existing style or invent an entirely new domain-appropriate style (in UPPERCASE_SNAKE_CASE) that best characterizes the section or question. You are NOT confined to any fixed menu, multiple-choice list, or pre-set examples. Any examples mentioned in instructions are purely illustrative to demonstrate formatting (e.g. CLINICAL_CASE_DIAGNOSIS, STATISTICAL_ANALYSIS, ETHICAL_DILEMMA, PROOF_BY_CONTRADICTION, HISTORICAL_SOURCE_CRITIQUE, etc.). Use whatever descriptor genuinely best reflects the real cognitive demands of the questions.
+   - DO NOT JUDGE BY A SINGLE QUESTION: Always read all questions in the section collectively.
+   - MIXED SECTIONS: If a section contains an internal mixture of question styles (e.g., 3 theoretical questions and 2 case scenarios), set reasoning_style to "MIXED" (or the dominant primary style) and explicitly describe the exact breakdown in section_description (e.g. "Mixed section: 3 theoretical essay questions, 1 clinical vignette, and 1 calculation").
+   - PER-QUESTION STYLE: In sample_questions, provide the precise reasoning_style for each individual question item.
 
 Examination Paper Text:
 ---
@@ -191,6 +238,8 @@ class BlueprintService:
                 SectionBlueprint(
                     name=sec_name,
                     question_type=cfg.question_type,
+                    reasoning_style=getattr(cfg, "reasoning_style", None),
+                    section_description=getattr(cfg, "section_description", None),
                     question_count=cfg.question_count,
                     marks_per_question=cfg.marks_per_question,
                     total_section_marks=sec_marks,
@@ -259,10 +308,17 @@ class BlueprintService:
 
                 sec_marks = q_count * marks_per_q  # NEVER multiply by alts_per_q!
 
+                r_style = normalize_reasoning_style(sec.get("reasoning_style"))
+                s_desc = sec.get("section_description")
+                if not s_desc and r_style == "SCENARIO_BASED":
+                    s_desc = "Case-scenario questions applying concepts to realistic situations"
+
                 sections.append(
                     SectionBlueprint(
                         name=name,
                         question_type=QuestionType(q_type_str),
+                        reasoning_style=r_style,
+                        section_description=s_desc,
                         question_count=q_count,
                         marks_per_question=marks_per_q,
                         total_section_marks=sec_marks,
@@ -284,11 +340,19 @@ class BlueprintService:
                     )
                 ]
 
+            raw_sample_qs = parsed_json.get("sample_questions", [])
+            sample_questions = []
+            for sq in raw_sample_qs:
+                if isinstance(sq, dict):
+                    if "reasoning_style" in sq:
+                        sq["reasoning_style"] = normalize_reasoning_style(sq["reasoning_style"])
+                    sample_questions.append(sq)
+
             analysis_total = sum(s.total_section_marks for s in sections)
             ref_blueprint = PaperBlueprint(
                 total_marks=analysis_total,
                 sections=sections,
-                sample_questions=parsed_json.get("sample_questions", []),
+                sample_questions=sample_questions,
             )
             self.validate_blueprint(ref_blueprint)
 
@@ -353,12 +417,14 @@ class BlueprintService:
                     "marks": getattr(q, "marks", 1),
                     "choice_group": getattr(q, "choice_group", None),
                     "alternative_label": getattr(q, "alternative_label", None),
+                    "reasoning_style": getattr(q, "reasoning_style", None),
+                    "section_description": getattr(q, "section_description", None),
                 })
 
         if raw_blueprint and isinstance(raw_blueprint, dict):
             try:
                 blueprint = PaperBlueprint.model_validate(raw_blueprint)
-                if sample_questions:
+                if not blueprint.sample_questions and sample_questions:
                     blueprint.sample_questions = sample_questions
                 self.validate_blueprint(blueprint)
             except Exception as exc:
@@ -380,6 +446,8 @@ class BlueprintService:
                         section_map[sec_name] = {
                             "name": sec_name,
                             "question_type": q_type,
+                            "reasoning_style": getattr(q, "reasoning_style", None),
+                            "section_description": getattr(q, "section_description", None),
                             "question_count": 0,
                             "marks_per_question": q_marks,
                             "total_section_marks": 0,
@@ -478,6 +546,8 @@ class BlueprintService:
                     SectionBlueprint(
                         name=sec.name,
                         question_type=sec.question_type,
+                        reasoning_style=sec.reasoning_style,
+                        section_description=sec.section_description,
                         question_count=c_i,
                         marks_per_question=sec.marks_per_question,
                         total_section_marks=sec_marks,
@@ -581,6 +651,8 @@ class BlueprintService:
                 SectionBlueprint(
                     name=sec.name,
                     question_type=sec.question_type,
+                    reasoning_style=sec.reasoning_style,
+                    section_description=sec.section_description,
                     question_count=new_count,
                     marks_per_question=sec.marks_per_question,
                     total_section_marks=new_sec_marks,

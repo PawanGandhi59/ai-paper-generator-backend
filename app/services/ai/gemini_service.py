@@ -60,6 +60,32 @@ class GeminiRateLimitError(GeminiServiceError):
     pass
 
 
+class GeminiDailyQuotaExhaustedError(GeminiRateLimitError):
+    """Raised when Gemini returns a 429 indicating daily quota (RPD) has been exhausted."""
+    pass
+
+
+def is_daily_quota_error(err_msg: str) -> bool:
+    """
+    Check if a Gemini error string indicates daily quota (RPD - Requests Per Day) exhaustion,
+    which cannot be resolved by standard short-interval (per-minute) retries.
+    """
+    err_lower = err_msg.lower()
+    daily_indicators = [
+        "requestsperday",
+        "requests_per_day",
+        "embedcontentrequestsperday",
+        "embed_content_free_tier_requests",
+        "generatecontentrequestsperday",
+        "generate_content_requests_per_day",
+        "perday",
+        "per_day",
+        "daily quota",
+        "requests per day",
+    ]
+    return any(indicator in err_lower for indicator in daily_indicators)
+
+
 class GeminiProviderError(GeminiServiceError):
     """Raised when Gemini provider returns HTTP 500, 502, 503, UNAVAILABLE, or network failure."""
     pass
@@ -303,6 +329,12 @@ class GeminiService(AIService):
 
             except Exception as exc:
                 err_msg = str(exc)
+                if is_daily_quota_error(err_msg):
+                    logger.error(f"Gemini API daily quota (RPD) exhausted: {err_msg}. Aborting immediately without retrying.")
+                    raise GeminiDailyQuotaExhaustedError(
+                        f"Gemini API daily quota exceeded (RPD limit reached): {err_msg}"
+                    ) from exc
+
                 is_rate_limit = any(k in err_msg.upper() for k in ["429", "RESOURCE_EXHAUSTED", "QUOTA"])
                 is_transient = is_rate_limit or any(k in err_msg.upper() for k in ["503", "UNAVAILABLE", "500", "502", "504", "TIMEOUT", "DEADLINE_EXCEEDED"])
 
