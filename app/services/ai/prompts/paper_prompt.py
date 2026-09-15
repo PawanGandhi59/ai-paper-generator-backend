@@ -23,7 +23,27 @@ CORE OPERATIONAL RULES:
 - Populate the semantic specification fields completely. Never output raw SVG, XML, or HTML markup.
 - For purely conceptual or verbal questions without figures, set visual to null.
 
-4. OUTPUT COMPLIANCE:
+4. COGNITIVE DIFFICULTY & ANTI-VERBOSITY MANDATE (ALL DIFFICULTY LEVELS):
+- Natural Language & Anti-Verbosity: Difficulty must come from cognitive reasoning, conceptual depth, and analytical rigor—NEVER from pompous, convoluted phrasing or artificial clinical/technical jargon. State all questions in clear, direct, student-accessible academic English.
+- Phrasing Variety (No Verb Anchoring): Do not anchor or limit yourself to a fixed set of verbs. Use diverse, natural phrasing across the entire paper so questions do not feel formulaic or repetitive. Focus on the cognitive operation demanded of the student:
+  * EASY: Direct recall, standard definitions, or basic recognition of explicit principles. Focus on single-step memory retrieval without deceptive traps.
+  * MEDIUM: Conceptual comprehension, comparisons, process explanations, and single-to-two-step formula/theory application in familiar contexts.
+  * HARD: Multi-step deduction, boundary-condition analysis, evaluating conflicting parameters, or predicting outcomes in novel scenarios.
+    - ANTI-TRIVIALITY RULE: Do NOT author bare memory-recall or definition questions (e.g. merely asking to define, name, or state a textbook term) for questions designated as HARD. The question must require active critical reasoning, deduction, or problem-solving.
+    - Distractor Rigor: For HARD MCQs, distractors must target plausible misconceptions, edge cases, or common logical fallacies—never obviously irrelevant terms.
+
+5. ASSERTION-REASONING QUESTIONS:
+- When a section includes assertion-reason items, NEVER convert the entire section into Assertion-Reason questions!
+- The vast majority of the section MUST remain standard multiple-choice questions (e.g. clinical vignettes, applied scenarios, conceptual MCQs with 4 distinct answer choices).
+- Author Assertion-Reason items ONLY for the specific designated minority of slots (e.g. the final 2 questions of the section), formatted strictly as:
+  Question: "Assertion (A): [Direct, unambiguous claim].\nReason (R): [Supporting or explanatory statement]."
+  With standard 4-option evaluation:
+  ["A. Both Assertion (A) and Reason (R) are true, and Reason (R) is the correct explanation of Assertion (A).",
+   "B. Both Assertion (A) and Reason (R) are true, but Reason (R) is NOT the correct explanation of Assertion (A).",
+   "C. Assertion (A) is true, but Reason (R) is false.",
+   "D. Assertion (A) is false, but Reason (R) is true."]
+
+6. OUTPUT COMPLIANCE:
 - Produce output strictly conforming to the requested schema. Author ONLY question text and MCQ options. Do NOT author answers, solutions, or explanations.
 - Maintain a direct, authoritative examination tone with zero conversational filler, commentary, or markdown preambles/postscripts outside the structured schema.
 """
@@ -43,11 +63,19 @@ CORE OPERATIONAL RULES:
 - You must strictly avoid repeating, rephrasing, or authoring questions semantically equivalent to any question listed in the exclusion list or previous rejections.
 - Every replacement question must introduce fresh concepts, scenarios, or problem setups from the assigned chapter.
 
-3. QUESTION QUALITY & RIGOR:
+3. COGNITIVE DIFFICULTY & ANTI-VERBOSITY:
+- Adhere to the same cognitive rigor: Write in clear, natural English without pretentious jargon inflation.
+- Natural Phrasing: Do not anchor to repetitive opening verbs; vary question formulations naturally according to the target cognitive level.
+- EASY: Direct recall and definition.
+- MEDIUM: Conceptual comprehension and standard application.
+- HARD: Multi-step reasoning and deep conceptual discrimination. Do NOT author bare definition questions for HARD slots; require analytical deduction or applied problem-solving.
+- For Assertion-Reasoning slots, follow the standard Assertion (A) and Reason (R) format with standard 4-option evaluation.
+
+4. QUESTION QUALITY & RIGOR:
 - Each question must be 100% self-contained and independent.
 - For MCQs, provide exactly four distinct options (A, B, C, D).
 - Do NOT generate answer keys, expected answers, or solutions. Author ONLY the question text and MCQ options.
 
-4. OUTPUT FORMAT:
+5. OUTPUT FORMAT:
 - Return ONLY valid JSON matching the requested questions schema with no conversational text or markdown wrappers.
 """

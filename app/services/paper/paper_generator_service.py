@@ -998,14 +998,17 @@ class PaperGeneratorService:
             required_alts = planned_groups[0]["required_alts"] if planned_groups else [None]
             sec_ref = self._get_section_aligned_sample_questions(sec, sample_questions) if (generation_mode == GenerationMode.REFERENCE and sample_questions) else None
 
-            sec_name_clean = sec.name.strip().lower()
+            def _norm_sec_str(val: Any) -> str:
+                return re.sub(r"[\s\-_]", "", str(val or "").lower())
+
+            sec_norm = _norm_sec_str(sec.name)
             sec_resp = next(
                 (
                     s for s in raw_sections
                     if isinstance(s, dict) and (
-                        str(s.get("section_name", "")).strip().lower() == sec_name_clean or
-                        str(s.get("section_name", "")).strip().lower() in sec_name_clean or
-                        sec_name_clean in str(s.get("section_name", "")).strip().lower()
+                        _norm_sec_str(s.get("section_name", "")) == sec_norm or
+                        _norm_sec_str(s.get("section_name", "")) in sec_norm or
+                        sec_norm in _norm_sec_str(s.get("section_name", ""))
                     )
                 ),
                 None
@@ -1184,6 +1187,19 @@ class PaperGeneratorService:
                             f"'reasoning_style': '{r_style}'.\n"
                         )
 
+                sec_desc_lower = str(sec_desc or "").lower()
+                has_ar = "assertion" in sec_desc_lower or "reason" in sec_desc_lower
+                sec_entry_match = next((s for s in planned_sections if _norm_sec_str(s["section_name"]) == _norm_sec_str(sec_name)), None)
+                total_mcqs_in_sec = len(sec_entry_match["groups"]) if sec_entry_match else len(sec_missing_slots)
+                ar_start_q = max(1, total_mcqs_in_sec - 1) if has_ar else 999999
+                ar_rule = ""
+                if has_ar:
+                    ar_rule = (
+                        f"- Question Format Distribution: For MCQ slots in this section, standard multiple-choice questions MUST be used for earlier questions (up to Question {ar_start_q - 1}). "
+                        f"ONLY the final 2 questions (Question {ar_start_q} onwards) may be Assertion-Reason items (formatted strictly as 'Assertion (A): ...\\nReason (R): ...'). "
+                        "Do NOT make all questions Assertion-Reason!\n"
+                    )
+
                 slot_lines = []
                 for s_info in sec_missing_slots:
                     q_type = s_info["question_type"]
@@ -1202,21 +1218,29 @@ class PaperGeneratorService:
                     cg = s_info["choice_group"]
                     alt = s_info["alternative_label"]
                     paired_q = s_info.get("paired_slot")
+                    q_ord = s_info.get("question_order") or 0
+
+                    format_str = ""
+                    if q_type == "MCQ" and has_ar:
+                        if q_ord < ar_start_q:
+                            format_str = " | Format: Standard MCQ (NOT Assertion-Reason)"
+                        else:
+                            format_str = " | Format: Assertion-Reasoning"
 
                     if paired_q and cg and alt:
                         p_text = str(paired_q.get("question_text", "")).strip()
                         slot_lines.append(
-                            f"  * Choice Group '{cg}', Alternative '{alt}': {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}. "
+                            f"  * Choice Group '{cg}', Alternative '{alt}': {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}{format_str}. "
                             f"Must be an internal choice alternative paired with: \"{p_text}\". "
                             f"IMPORTANT: Must test a DIFFERENT formula or distinct educational concept from {ch_str} so it is not duplicate or repetitive."
                         )
                     elif cg and alt:
                         slot_lines.append(
-                            f"  * Choice Group '{cg}', Alternative '{alt}': {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}."
+                            f"  * Choice Group '{cg}', Alternative '{alt}': {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}{format_str}."
                         )
                     else:
                         slot_lines.append(
-                            f"  * Question {s_info['question_order']}: {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}."
+                            f"  * Question {q_ord}: {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}{format_str}."
                         )
 
                 slots_str = "\n".join(slot_lines)
@@ -1224,7 +1248,7 @@ class PaperGeneratorService:
                 sections_detail_blocks.append(
                     f"SECTION: '{sec_name}'\n"
                     f"- Question Type: {sec_q_type}\n"
-                    f"{style_str}{desc_str}{pedagogical_rule}- Missing Question Slots to Generate:\n{slots_str}"
+                    f"{style_str}{desc_str}{pedagogical_rule}{ar_rule}- Missing Question Slots to Generate:\n{slots_str}"
                 )
 
             slots_detail_str = "\n\n".join(sections_detail_blocks)
@@ -1306,15 +1330,15 @@ Return ONLY valid JSON matching this schema:
                 for cand in fill_candidates:
                     if not isinstance(cand, dict):
                         continue
-                    cand_sec_name = str(cand.get("section_name", "")).strip().lower()
+                    cand_sec_name = str(cand.get("section_name", "")).strip()
                     target_sec_data = None
                     if cand_sec_name:
                         target_sec_data = next(
                             (
                                 s for s in planned_sections
-                                if s["section_name"].strip().lower() == cand_sec_name
-                                or cand_sec_name in s["section_name"].strip().lower()
-                                or s["section_name"].strip().lower() in cand_sec_name
+                                if _norm_sec_str(s["section_name"]) == _norm_sec_str(cand_sec_name)
+                                or _norm_sec_str(cand_sec_name) in _norm_sec_str(s["section_name"])
+                                or _norm_sec_str(s["section_name"]) in _norm_sec_str(cand_sec_name)
                             ),
                             None
                         )
@@ -1530,6 +1554,12 @@ Return ONLY valid JSON matching this schema:
             if sec.numerical_question_count > 0:
                 num_str = f"EXACTLY {sec.numerical_question_count} questions in this section MUST be calculation/numerical problems (set is_numerical: true)."
 
+            sec_desc_lower = str(getattr(sec, "section_description", "") or "").lower()
+            has_ar = "assertion" in sec_desc_lower or "reason" in sec_desc_lower
+            ar_count = min(3, max(2, sec.question_count // 5)) if (has_ar and sec.question_count >= 5) else (1 if has_ar else 0)
+            ar_start_q = start_q_num + sec.question_count - ar_count if ar_count > 0 else 999999
+            ar_end_q = start_q_num + sec.question_count - 1 if ar_count > 0 else 999999
+
             slot_breakdown_lines = []
             if planned_sections and sec_idx < len(planned_sections):
                 s_plan = planned_sections[sec_idx]
@@ -1545,8 +1575,15 @@ Return ONLY valid JSON matching this schema:
                         )
                     else:
                         is_num_str = " | Numerical Calculation" if g.get("is_numerical") else ""
+                        q_ord_val = g.get("question_order", 0)
+                        ar_slot_str = ""
+                        if has_ar:
+                            if q_ord_val >= ar_start_q:
+                                ar_slot_str = " | Format: Assertion-Reasoning"
+                            else:
+                                ar_slot_str = " | Format: Standard MCQ (NOT Assertion-Reason)"
                         slot_breakdown_lines.append(
-                            f"  * Question {g['question_order']}: Chapter {ch_num_val} (\"{ch_name_val}\") | Difficulty: {diff_val} | Marks: {marks_val}{is_num_str}"
+                            f"  * Question {q_ord_val}: Chapter {ch_num_val} (\"{ch_name_val}\") | Difficulty: {diff_val} | Marks: {marks_val}{is_num_str}{ar_slot_str}"
                         )
 
             slot_breakdown_str = ("\n- Planned Question Slot Grid:\n" + "\n".join(slot_breakdown_lines)) if slot_breakdown_lines else ""
@@ -1570,11 +1607,26 @@ Return ONLY valid JSON matching this schema:
                         f"'reasoning_style': '{r_style}'.\n"
                     )
 
+            ar_directive = ""
+            if has_ar and ar_count > 0:
+                std_mcq_end = ar_start_q - 1
+                ar_directive = (
+                    f"- QUESTION FORMAT BREAKDOWN & COMPOSITION:\n"
+                    f"  * Questions {start_q_num} through {std_mcq_end} MUST be STANDARD MULTIPLE-CHOICE QUESTIONS (clinical vignettes, conceptual questions, or applied problem setups with four distinct answer options). DO NOT use Assertion-Reason format for these questions.\n"
+                    f"  * ONLY the final {ar_count} question(s) (Questions {ar_start_q} through {ar_end_q}) MUST be Assertion-Reasoning items. Format their 'question_text' strictly as:\n"
+                    f"    \"Assertion (A): [Direct, unambiguous claim].\\nReason (R): [Supporting or explanatory statement].\"\n"
+                    f"    and their 'mcq_options' strictly as exactly 4 standard options:\n"
+                    f"    [\"A. Both Assertion (A) and Reason (R) are true, and Reason (R) is the correct explanation of Assertion (A).\", "
+                    f"\"B. Both Assertion (A) and Reason (R) are true, but Reason (R) is NOT the correct explanation of Assertion (A).\", "
+                    f"\"C. Assertion (A) is true, but Reason (R) is false.\", "
+                    f"\"D. Assertion (A) is false, but Reason (R) is true.\"]\n"
+                )
+
             sections_info.append(f"""
 ---
 SECTION NAME: '{sec.name}'
 - Question Type: {sec.question_type.value}
-{style_str}{desc_str}{pedagogical_rule}- Logical Question Count: {sec.question_count}
+{style_str}{desc_str}{pedagogical_rule}{ar_directive}- Logical Question Count: {sec.question_count}
 - Alternatives Per Question: {sec.alternatives_per_question}
 - Total Question Items To Generate: {sec.question_count * alts_per_q}
 - Marks Per Question Item: {sec.marks_per_question} (Total Section Marks: {sec.total_section_marks})
@@ -1684,10 +1736,30 @@ QUESTION TYPE DEFINITIONS:
 - LONG_ANSWER: Detailed, well-structured answer requiring multi-step reasoning or synthesis.
 - NUMERICAL: Calculation/computation problem requiring quantitative work or mathematical derivation.
 
-DIFFICULTY & COGNITIVE DEMAND:
-- EASY: Direct recall or recognition of explicit facts stated in the source.
-- MEDIUM: Comprehension and simple application. Explain, summarize, compare, classify, or connect information.
-- HARD: Analysis, synthesis, multi-step reasoning, or supported inference.
+COGNITIVE DIFFICULTY & ANTI-VERBOSITY SPECIFICATIONS:
+1. ANTI-VERBOSITY & LANGUAGE ACCESSIBILITY MANDATE (APPLIES TO ALL DIFFICULTIES: EASY, MEDIUM, HARD):
+   - The difficulty of a question MUST lie exclusively in the cognitive reasoning, conceptual depth, problem setup, or analytical deduction—NEVER in obscure, bombastic, convoluted language, or dictionary lookups.
+   - Write in clear, natural, direct academic English.
+   - STRICT PROHIBITION: Do NOT use pretentious, polysyllabic, or hyper-inflated vocabulary to disguise simple recall questions as "hard". A definition question wrapped in complex jargon is still an easy question. Keep phrasing crisp, precise, and student-accessible across all difficulty levels.
+
+2. COGNITIVE DEMAND BY DIFFICULTY LEVEL (PHRASING DIVERSITY - NO VERB ANCHORING):
+   - You are NOT restricted to any fixed list of verbs. Vary question formulations naturally across the paper so questions do not feel repetitive or formulaic. Focus on the cognitive operation demanded of the student:
+   
+   - EASY (Bloom's Level 1 & 2 - Recall & Recognition):
+     * Cognitive Burden: Direct recall or recognition of explicit facts, fundamental definitions, standard laws, or foundational formulas directly stated in the source educational material.
+     * Phrasing & Style: Keep language simple, clear, and direct. Question style can vary naturally (e.g., asking to identify a term, state a law, name a component, recall a formula, or select which item belongs to a category). Single-step recognition requiring only direct memory retrieval.
+     * MCQ Distractor Design: Clear, distinct, plausible categories or terms from the syllabus. Tests fundamental familiarity without deceptive traps.
+
+   - MEDIUM (Bloom's Level 2 & 3 - Comprehension & Standard Application):
+     * Cognitive Burden: Explain a principle in own words, compare/contrast two related mechanisms, interpret a standard diagram/graph, or apply a known formula/concept to a realistic, familiar scenario.
+     * Phrasing & Style: Frame questions around understanding and application (e.g. explaining why or how something works, distinguishing between two concepts, illustrating with an example, calculating a standard 1-to-2 step result, or describing a mechanism). Use varied, natural phrasing rather than repetitive formulaic sentence starters.
+     * MCQ Distractor Design: Plausible options reflecting common student misunderstandings, sign/unit slips, or confusion between closely adjacent concepts.
+
+   - HARD (Bloom's Level 4, 5 & 6 - Analysis, Evaluation, Synthesis & Multi-Step Deduction):
+     * Cognitive Burden: Multi-step reasoning where the student must integrate two or more distinct concepts, deduce an unstated consequence, evaluate boundary conditions, or predict outcomes when constraints change or conflict.
+     * Phrasing & Style: Use rich, varied problem setups, novel scenarios, diagnostic questions, or comparative inquiries that require active thinking (e.g. analyzing causes, evaluating competing explanations, justifying a choice, predicting the effect of changing a parameter, critique, or synthesis).
+     * ANTI-TRIVIALITY RULE: NEVER author bare definition or simple recall questions (e.g. merely asking "Define X", "State the formula of Y", or "List the 3 types of Z") for questions designated as HARD. The question must require active critical reasoning or multi-step problem solving, not memory recall.
+     * MCQ Distractor Design: High-discrimination options targeting deep misconceptions, borderline edge-cases, or subtle causal inversions. All four options MUST appear plausible to a student who only memorized definitions; only deep conceptual reasoning eliminates the distractors.
 
 CONTENT AUTHORITY, SOURCE FIDELITY & ANTI-EMBELLISHMENT RULES:
 1. SOURCE EDUCATIONAL MATERIAL is the ONLY authoritative source for question content, facts, formulas, terminology, and subject matter.
