@@ -1,3 +1,4 @@
+import os
 from typing import List, Optional
 from uuid import UUID
 
@@ -9,6 +10,14 @@ from app.models.chapter import Chapter
 from app.models.subject import Subject
 from app.models.workspace import Workspace
 from app.repositories.workspace_repository import WorkspaceRepository
+from app.schemas.book import (
+    MinimalBookListItem,
+    MinimalChapterItem,
+    MinimalSubjectRef,
+    MinimalWorkspaceRef,
+)
+from app.utils.storage_utils import get_document_storage_url, is_textbook_document
+
 
 
 class WorkspaceService:
@@ -160,6 +169,74 @@ class WorkspaceService:
         subject = self.get_subject(subject_id, current_user_id)
         return self.repo.get_books_by_subject(subject.id)
 
+    def list_all_books_minimal(
+        self,
+        current_user_id: UUID,
+        workspace_id: Optional[UUID] = None,
+        subject_id: Optional[UUID] = None,
+    ) -> List[MinimalBookListItem]:
+        books = self.repo.get_all_books_by_user(
+            user_id=current_user_id,
+            workspace_id=workspace_id,
+            subject_id=subject_id,
+        )
+        result = []
+        for b in books:
+            active_chapters = [c for c in b.chapters if c.deleted_at is None]
+            active_chapters.sort(key=lambda c: c.chapter_number)
+
+            chapter_doc_map = {}
+            whole_book_candidates = []
+
+            if b.documents:
+                for doc in b.documents:
+                    if not is_textbook_document(doc):
+                        continue
+                    if doc.chapter_id is None:
+                        whole_book_candidates.append(doc)
+                    else:
+                        existing_url = chapter_doc_map.get(doc.chapter_id)
+                        if not existing_url or (doc.stored_path and os.path.exists(doc.stored_path)):
+                            chapter_doc_map[doc.chapter_id] = get_document_storage_url(doc)
+
+            whole_book_pdf_url = None
+            if whole_book_candidates:
+                for doc in whole_book_candidates:
+                    if doc.stored_path and os.path.exists(doc.stored_path):
+                        whole_book_pdf_url = get_document_storage_url(doc)
+                        break
+                if not whole_book_pdf_url:
+                    whole_book_pdf_url = get_document_storage_url(whole_book_candidates[0])
+
+            pdf_url = whole_book_pdf_url or b.file_url
+
+            result.append(
+                MinimalBookListItem(
+                    id=b.id,
+                    name=b.name,
+                    pdf_url=pdf_url,
+                    workspace=MinimalWorkspaceRef(
+                        id=b.subject.workspace.id,
+                        name=b.subject.workspace.name,
+                    ),
+                    subject=MinimalSubjectRef(
+                        id=b.subject.id,
+                        name=b.subject.name,
+                    ),
+                    chapters=[
+                        MinimalChapterItem(
+                            id=c.id,
+                            chapter_number=c.chapter_number,
+                            name=c.name,
+                            pdf_url=chapter_doc_map.get(c.id) or c.file_url,
+                        )
+                        for c in active_chapters
+                    ],
+                    created_at=b.created_at,
+                )
+            )
+        return result
+
     def get_book(self, book_id: UUID, current_user_id: UUID) -> Book:
         book = self.repo.get_book_by_id(book_id)
         if not book:
@@ -229,7 +306,10 @@ class WorkspaceService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="start_page must be less than or equal to end_page.",
             )
-        has_whole_book_doc = any(doc.chapter_id is None for doc in book.documents)
+        has_whole_book_doc = any(
+            doc.chapter_id is None and is_textbook_document(doc)
+            for doc in book.documents
+        )
         if has_whole_book_doc:
             if start_page is None or end_page is None:
                 raise HTTPException(
@@ -301,7 +381,10 @@ class WorkspaceService:
             )
 
         book = self.get_book(chapter.book_id, current_user_id)
-        has_whole_book_doc = any(doc.chapter_id is None for doc in book.documents)
+        has_whole_book_doc = any(
+            doc.chapter_id is None and is_textbook_document(doc)
+            for doc in book.documents
+        )
         if has_whole_book_doc:
             if new_start is None or new_end is None:
                 raise HTTPException(

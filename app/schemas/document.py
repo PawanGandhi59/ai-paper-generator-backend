@@ -29,10 +29,17 @@ class DocumentResponse(BaseModel):
     embedding_completed_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
+    stored_path: Optional[str] = None
 
     @computed_field
     @property
     def file_url(self) -> str:
+        if self.stored_path:
+            norm = self.stored_path.replace("\\", "/")
+            if "/storage/" in norm:
+                return norm[norm.find("/storage/"):]
+            if norm.startswith("storage/"):
+                return "/" + norm
         return f"/storage/documents/{self.id}/original.pdf"
 
     model_config = ConfigDict(from_attributes=True)

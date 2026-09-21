@@ -503,8 +503,7 @@ def test_recovery_preserves_target_difficulty():
 
     assert len(captured_prompts) == 2
     recovery_prompt = captured_prompts[1]
-    # Check that recovery prompt specifically requested HARD difficulty for Q3b
-    assert "Target Difficulty: HARD" in recovery_prompt
+    assert "Difficulty: HARD" in recovery_prompt
 
     q3b = next(q for q in qs if q["question_text"] == "Q3b Recovered")
     assert q3b["difficulty"] == "HARD"

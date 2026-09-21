@@ -67,7 +67,7 @@ class SectionBlueprint(BaseModel):
 
 
 class PaperBlueprint(BaseModel):
-    total_marks: int = Field(..., ge=1)
+    total_marks: int = Field(..., ge=1, le=1000)
     sections: List[SectionBlueprint] = Field(..., min_length=1)
     sample_questions: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
 
@@ -720,12 +720,28 @@ class BlueprintService:
 
     def _parse_json_safely(self, text: str) -> Dict[str, Any]:
         text_str = text.strip()
-        if "```json" in text_str:
-            match = re.search(r"```json\s*(.*?)\s*```", text_str, re.DOTALL)
+
+        # 1. Strip leading ```json or ``` markdown codeblock prefix
+        if text_str.startswith("```json"):
+            text_str = text_str[7:].strip()
+        elif text_str.startswith("```"):
+            text_str = text_str[3:].strip()
+        elif "```json" in text_str:
+            match = re.search(r"```json\s*(.*?)(?:```|$)", text_str, re.DOTALL)
             if match:
                 text_str = match.group(1).strip()
         elif "```" in text_str:
-            match = re.search(r"```\s*(.*?)\s*```", text_str, re.DOTALL)
+            match = re.search(r"```\s*(.*?)(?:```|$)", text_str, re.DOTALL)
+            if match:
+                text_str = match.group(1).strip()
+
+        # 2. Strip trailing ``` markdown codeblock suffix if present
+        if text_str.endswith("```"):
+            text_str = text_str[:-3].strip()
+
+        # 3. Fallback regex extract first JSON object/array if conversational text wraps it
+        if not (text_str.startswith("{") or text_str.startswith("[")):
+            match = re.search(r"(\{.*\})", text_str, re.DOTALL)
             if match:
                 text_str = match.group(1).strip()
 
@@ -747,4 +763,13 @@ class BlueprintService:
                 try:
                     return json.loads(balanced)
                 except Exception:
+                    # Final attempt: extract substring between first { and last }
+                    first_brace = text_str.find("{")
+                    last_brace = text_str.rfind("}")
+                    if first_brace != -1 and last_brace > first_brace:
+                        candidate = text_str[first_brace:last_brace + 1]
+                        try:
+                            return json.loads(candidate)
+                        except Exception:
+                            pass
                     return {}

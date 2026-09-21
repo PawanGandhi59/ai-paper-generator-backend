@@ -7,11 +7,32 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_current_user_from_header_or_query
 from app.core.database import get_db
 from app.models.user import User
-from app.schemas.book import BookCreate, BookDetailResponse, BookResponse, BookUpdate
+from app.schemas.book import (
+    BookCreate,
+    BookDetailResponse,
+    BookResponse,
+    BookUpdate,
+    MinimalBookListItem,
+)
 from app.schemas.document import DocumentResponse
 from app.services.workspace_service import WorkspaceService
+from app.utils.storage_utils import is_textbook_document
 
 router = APIRouter(tags=["Books"])
+
+
+@router.get("/books", response_model=List[MinimalBookListItem], status_code=status.HTTP_200_OK)
+def list_all_books(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> List[MinimalBookListItem]:
+    """
+    List all uploaded books for the current user with minimal metadata:
+    book ID, book name, pdf_url (if uploaded whole-book), subject, workspace,
+    and list of chapters (with chapter-level pdf_url if uploaded chapter-wise).
+    """
+    service = WorkspaceService(db)
+    return service.list_all_books_minimal(current_user_id=current_user.id)
 
 
 @router.post("/subjects/{subject_id}/books", response_model=BookResponse, status_code=status.HTTP_201_CREATED)
@@ -68,7 +89,11 @@ def list_book_documents(
     """
     service = WorkspaceService(db)
     book = service.get_book(book_id=book_id, current_user_id=current_user.id)
-    return [DocumentResponse.model_validate(doc) for doc in book.documents]
+    return [
+        DocumentResponse.model_validate(doc)
+        for doc in book.documents
+        if doc.deleted_at is None and is_textbook_document(doc)
+    ]
 
 
 @router.patch("/books/{book_id}", response_model=BookResponse, status_code=status.HTTP_200_OK)
