@@ -2,7 +2,7 @@ from typing import List, Optional
 from uuid import UUID
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.models.book import Book
 from app.models.chapter import Chapter
@@ -141,6 +141,35 @@ class WorkspaceRepository:
     def get_books_by_subject(self, subject_id: UUID) -> List[Book]:
         stmt = select(Book).where(Book.subject_id == subject_id, Book.deleted_at.is_(None)).order_by(Book.created_at.asc())
         return list(self.db.execute(stmt).scalars().all())
+
+    def get_all_books_by_user(
+        self,
+        user_id: UUID,
+        workspace_id: Optional[UUID] = None,
+        subject_id: Optional[UUID] = None,
+    ) -> List[Book]:
+        stmt = (
+            select(Book)
+            .join(Subject, Book.subject_id == Subject.id)
+            .join(Workspace, Subject.workspace_id == Workspace.id)
+            .where(
+                Workspace.owner_id == user_id,
+                Subject.deleted_at.is_(None),
+                Book.deleted_at.is_(None),
+            )
+            .options(
+                joinedload(Book.subject).joinedload(Subject.workspace),
+                selectinload(Book.chapters),
+                selectinload(Book.documents),
+            )
+            .order_by(Book.created_at.desc())
+        )
+        if workspace_id:
+            stmt = stmt.where(Workspace.id == workspace_id)
+        if subject_id:
+            stmt = stmt.where(Subject.id == subject_id)
+
+        return list(self.db.execute(stmt).scalars().unique().all())
 
     def update_book(self, book: Book, name: Optional[str] = None) -> Book:
         if name is not None:

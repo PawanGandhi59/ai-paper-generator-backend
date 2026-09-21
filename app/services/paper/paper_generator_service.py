@@ -49,6 +49,7 @@ from app.services.workspace_service import WorkspaceService
 logger = logging.getLogger(__name__)
 
 MAX_RETRY_ATTEMPTS = 3
+MAX_QUESTIONS_PER_CALL = 100
 
 
 def _is_mock(val: Any) -> bool:
@@ -216,17 +217,20 @@ class PaperGeneratorService:
                 g["chapter_number"] = 1
                 g["chapter_name"] = "General"
 
-        # Global Difficulty Distribution across logical groups
-        global_diffs = self._calculate_difficulty_distribution(
-            difficulty=difficulty,
-            count=len(logical_groups),
-            easy_pct=easy_pct,
-            med_pct=med_pct,
-            hard_pct=hard_pct,
-        )
-        sorted_by_order = sorted(logical_groups, key=lambda g: g["question_order"])
-        for idx, g in enumerate(sorted_by_order):
-            g["difficulty"] = global_diffs[idx] if idx < len(global_diffs) else "MEDIUM"
+        # Per-Section Difficulty Distribution across logical groups
+        for sec in blueprint.sections:
+            sec_groups = [g for g in logical_groups if g["section_name"] == sec.name]
+            sec_diffs = self._calculate_difficulty_distribution(
+                difficulty=difficulty,
+                count=len(sec_groups),
+                easy_pct=easy_pct,
+                med_pct=med_pct,
+                hard_pct=hard_pct,
+                marks_per_q=sec.marks_per_question,
+            )
+            sec_sorted = sorted(sec_groups, key=lambda g: g["question_order"])
+            for idx, g in enumerate(sec_sorted):
+                g["difficulty"] = sec_diffs[idx] if idx < len(sec_diffs) else "MEDIUM"
 
         # Numerical Requirement Allocation per Section
         for sec in blueprint.sections:
@@ -467,7 +471,22 @@ class PaperGeneratorService:
                         )
                 else:
                     # Reference Mode (Uploaded PDF ReferencePaper): Check if blueprint_json is cached in DB
-                    if reference_paper.blueprint_json:
+                    cached_bp = reference_paper.blueprint_json
+                    is_valid_cache = False
+                    if cached_bp and isinstance(cached_bp, dict):
+                        cached_sq = cached_bp.get("sample_questions", [])
+                        cached_secs = cached_bp.get("sections", [])
+                        is_dummy_fallback = (
+                            len(cached_secs) == 1
+                            and cached_secs[0].get("name") == "Section A"
+                            and cached_secs[0].get("marks_per_question") == 2
+                            and cached_secs[0].get("question_count") == 5
+                            and not cached_sq
+                        )
+                        if cached_secs and not is_dummy_fallback and cached_sq:
+                            is_valid_cache = True
+
+                    if is_valid_cache:
                         base_blueprint = PaperBlueprint.model_validate(reference_paper.blueprint_json)
                         if request_data.total_marks and base_blueprint.total_marks != request_data.total_marks:
                             blueprint = self.blueprint_service.adapt_reference_blueprint(
@@ -477,15 +496,23 @@ class PaperGeneratorService:
                         else:
                             blueprint = base_blueprint
                     else:
-                        # Cache miss: fetch reference pages text & analyze via Gemini
+                        # Cache miss or invalid/empty blueprint: fetch reference pages text & analyze via Gemini
                         ref_pages = self.ref_paper_repo.get_reference_paper_pages(reference_paper.id)
                         pages_text = [p.text_content for p in ref_pages] if ref_pages else []
                         raw_base_blueprint = self.blueprint_service.analyze_reference_paper(
                             paper_pages_text=pages_text,
                             requested_total_marks=None,
                         )
-                        # Cache raw base blueprint in DB for all future paper generations
-                        self.ref_paper_repo.save_blueprint_json(reference_paper.id, raw_base_blueprint.model_dump())
+                        is_raw_fallback = (
+                            len(raw_base_blueprint.sections) == 1
+                            and raw_base_blueprint.sections[0].name == "Section A"
+                            and raw_base_blueprint.sections[0].marks_per_question == 2
+                            and raw_base_blueprint.sections[0].question_count == 5
+                            and not raw_base_blueprint.sample_questions
+                        )
+                        # Cache raw base blueprint in DB only if it's a valid analysis
+                        if not is_raw_fallback:
+                            self.ref_paper_repo.save_blueprint_json(reference_paper.id, raw_base_blueprint.model_dump())
 
                         if request_data.total_marks and raw_base_blueprint.total_marks != request_data.total_marks:
                             blueprint = self.blueprint_service.adapt_reference_blueprint(
@@ -907,6 +934,151 @@ class PaperGeneratorService:
                     return True
             return False
 
+    @staticmethod
+    def _partition_planned_sections_into_batches(
+        planned_sections: List[Dict[str, Any]],
+        max_batch_size: int = 100,
+    ) -> List[List[Dict[str, Any]]]:
+        """
+        Partitions planned question slots into batches of at most max_batch_size (100) questions,
+        clustering question slots chapter-by-chapter.
+        
+        This guarantees:
+        1. All questions for a given chapter are clustered together in the minimum number of batches.
+        2. Once a chapter's questions are completed in a batch, that chapter is not repeated in later batches.
+        3. Each batch's prompt context is strictly scoped to the chapters present in that batch.
+        4. Inside each batch, questions remain organized by section to match the schema expected by Gemini.
+        """
+        sec_lookup = {s_data["section_name"]: s_data["sec"] for s_data in planned_sections}
+        sec_order = [s_data["section_name"] for s_data in planned_sections]
+
+        # 1. Collect all groups from all sections
+        all_groups = []
+        for s_data in planned_sections:
+            for g in s_data["groups"]:
+                all_groups.append(g)
+
+        if not all_groups:
+            return [planned_sections]
+
+        # 2. Cluster groups chapter-by-chapter
+        def _ch_key(g: Dict[str, Any]) -> Tuple[int, str]:
+            c_num = g.get("chapter_number")
+            try:
+                c_num_int = int(c_num) if c_num is not None else 999999
+            except (ValueError, TypeError):
+                c_num_int = 999999
+            c_id = str(g.get("chapter_id") or "")
+            return (c_num_int, c_id)
+
+        unique_ch_keys = []
+        seen_keys = set()
+        for g in sorted(all_groups, key=lambda x: (_ch_key(x), x["question_order"])):
+            ck = _ch_key(g)
+            if ck not in seen_keys:
+                seen_keys.add(ck)
+                unique_ch_keys.append(ck)
+
+        ch_to_groups: Dict[Tuple[int, str], List[Dict[str, Any]]] = {ck: [] for ck in unique_ch_keys}
+        for g in all_groups:
+            ck = _ch_key(g)
+            ch_to_groups[ck].append(g)
+
+        for ck in unique_ch_keys:
+            ch_to_groups[ck].sort(key=lambda g: g["question_order"])
+
+        # 3. Fill batches chapter-by-chapter
+        batches: List[List[Dict[str, Any]]] = []
+        current_batch_groups: List[Dict[str, Any]] = []
+
+        def _seal_batch(groups_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            batch_sections: List[Dict[str, Any]] = []
+            for s_name in sec_order:
+                matching = [g for g in groups_list if g["section_name"] == s_name]
+                if matching:
+                    batch_sections.append({
+                        "section_name": s_name,
+                        "sec": sec_lookup[s_name],
+                        "groups": matching,
+                    })
+            return batch_sections
+
+        for ck in unique_ch_keys:
+            c_groups = ch_to_groups[ck]
+            idx = 0
+            while idx < len(c_groups):
+                space_left = max_batch_size - len(current_batch_groups)
+                take = min(len(c_groups) - idx, space_left)
+                current_batch_groups.extend(c_groups[idx : idx + take])
+                idx += take
+
+                if len(current_batch_groups) >= max_batch_size:
+                    batches.append(_seal_batch(current_batch_groups))
+                    current_batch_groups = []
+
+        if current_batch_groups:
+            batches.append(_seal_batch(current_batch_groups))
+
+        return batches if batches else [planned_sections]
+
+    @staticmethod
+    def _partition_missing_slots_into_batches(
+        missing_slots: List[Dict[str, Any]],
+        max_batch_size: int = 100,
+    ) -> List[List[Dict[str, Any]]]:
+        """
+        Partitions missing question slots for recovery into batches of at most max_batch_size (100)
+        slots, clustering slots chapter-by-chapter.
+        """
+        if not missing_slots:
+            return []
+
+        def _ch_key(s: Dict[str, Any]) -> Tuple[int, str]:
+            c_num = s.get("chapter_number")
+            try:
+                c_num_int = int(c_num) if c_num is not None else 999999
+            except (ValueError, TypeError):
+                c_num_int = 999999
+            c_id = str(s.get("chapter_id") or "")
+            return (c_num_int, c_id)
+
+        unique_ch_keys = []
+        seen_keys = set()
+        for s in sorted(missing_slots, key=lambda x: (_ch_key(x), x.get("question_order") or 0)):
+            ck = _ch_key(s)
+            if ck not in seen_keys:
+                seen_keys.add(ck)
+                unique_ch_keys.append(ck)
+
+        ch_to_slots: Dict[Tuple[int, str], List[Dict[str, Any]]] = {ck: [] for ck in unique_ch_keys}
+        for s in missing_slots:
+            ck = _ch_key(s)
+            ch_to_slots[ck].append(s)
+
+        for ck in unique_ch_keys:
+            ch_to_slots[ck].sort(key=lambda s: s.get("question_order") or 0)
+
+        batches: List[List[Dict[str, Any]]] = []
+        current_batch: List[Dict[str, Any]] = []
+
+        for ck in unique_ch_keys:
+            c_slots = ch_to_slots[ck]
+            idx = 0
+            while idx < len(c_slots):
+                space_left = max_batch_size - len(current_batch)
+                take = min(len(c_slots) - idx, space_left)
+                current_batch.extend(c_slots[idx : idx + take])
+                idx += take
+
+                if len(current_batch) >= max_batch_size:
+                    batches.append(current_batch)
+                    current_batch = []
+
+        if current_batch:
+            batches.append(current_batch)
+
+        return batches
+
     def _generate_complete_paper(
         self,
         blueprint: PaperBlueprint,
@@ -938,165 +1110,229 @@ class PaperGeneratorService:
             hard_pct=hard_pct,
         )
 
-        prompt = self._build_complete_paper_prompt(
-            blueprint=blueprint,
-            context_text=context_text,
-            topic_focus=topic_focus,
-            difficulty=difficulty,
-            generation_mode=generation_mode,
-            sample_questions=sample_questions,
-            easy_pct=easy_pct,
-            med_pct=med_pct,
-            hard_pct=hard_pct,
-            chapter_weightages_data=chapter_weightages_data,
-            planned_sections=planned_sections,
-        )
-
-        # Actual Gemini SDK Token Capacity Check
-        MAX_INPUT_TOKENS = 980_000
-        token_count = self.ai_service.count_tokens(
-            prompt,
-            system_instruction=PAPER_GENERATION_SYSTEM_INSTRUCTION,
-        )
-        if token_count > MAX_INPUT_TOKENS:
-            logger.error(f"Complete-paper prompt tokens ({token_count}) exceed model context capacity ({MAX_INPUT_TOKENS}).")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Selected chapters contain too much educational content to generate this paper in a single model request. Please select fewer chapters and try again.",
-            )
-
-        try:
-            response_text = self.ai_service.generate_response(
-                prompt,
-                system_instruction=PAPER_GENERATION_SYSTEM_INSTRUCTION,
-                response_schema=GeminiCompletePaperSchema,
-            )
-        except TypeError:
-            try:
-                response_text = self.ai_service.generate_response(
-                    prompt,
-                    system_instruction=PAPER_GENERATION_SYSTEM_INSTRUCTION,
-                )
-            except TypeError:
-                response_text = self.ai_service.generate_response(prompt)
-        parsed = self._parse_json_safely(response_text)
-
-        raw_sections = parsed.get("sections", []) if isinstance(parsed, dict) else []
-        if not raw_sections and isinstance(parsed, dict) and "questions" in parsed:
-            raw_sections = [{"section_name": sec.name, "questions": parsed["questions"]} for sec in blueprint.sections]
-
         ch_num_to_item = {item["chapter_number"]: item for item in (chapter_weightages_data or []) if "chapter_number" in item}
         default_ch_item = chapter_weightages_data[0] if (chapter_weightages_data and len(chapter_weightages_data) > 0) else None
 
         all_accepted_questions: List[Dict[str, Any]] = []
 
-        # 2. First Pass: Process Initial Generated Candidates across each section
-        for s_idx, s_data in enumerate(planned_sections):
-            sec = s_data["sec"]
-            planned_groups = s_data["groups"]
-            alts_per_q = sec.alternatives_per_question if (sec.has_internal_choice and sec.alternatives_per_question > 1) else 1
-            required_alts = planned_groups[0]["required_alts"] if planned_groups else [None]
-            sec_ref = self._get_section_aligned_sample_questions(sec, sample_questions) if (generation_mode == GenerationMode.REFERENCE and sample_questions) else None
+        def _norm_sec_str(val: Any) -> str:
+            return re.sub(r"[\s\-_]", "", str(val or "").lower())
 
-            def _norm_sec_str(val: Any) -> str:
-                return re.sub(r"[\s\-_]", "", str(val or "").lower())
+        # 2. Partition planned sections into batches (up to MAX_QUESTIONS_PER_CALL = 100 questions per LLM call)
+        batches = self._partition_planned_sections_into_batches(
+            planned_sections=planned_sections,
+            max_batch_size=MAX_QUESTIONS_PER_CALL,
+        )
 
-            sec_norm = _norm_sec_str(sec.name)
-            sec_resp = next(
-                (
-                    s for s in raw_sections
-                    if isinstance(s, dict) and (
-                        _norm_sec_str(s.get("section_name", "")) == sec_norm or
-                        _norm_sec_str(s.get("section_name", "")) in sec_norm or
-                        sec_norm in _norm_sec_str(s.get("section_name", ""))
-                    )
-                ),
-                None
-            )
-            candidates = sec_resp.get("questions", []) if (sec_resp and isinstance(sec_resp, dict)) else []
-            if not candidates and s_idx < len(raw_sections) and isinstance(raw_sections[s_idx], dict):
-                candidates = raw_sections[s_idx].get("questions", [])
+        MAX_INPUT_TOKENS = 980_000
 
-            for cand in candidates:
-                unfilled = self._get_unfilled_slots(planned_groups, required_alts)
-                if not unfilled:
-                    break
+        for batch_idx, batch_planned in enumerate(batches, start=1):
+            # A. Extract scoped chapter context for this batch
+            batch_all_groups = [g for bs in batch_planned for g in bs["groups"]]
+            batch_ch_ids = {str(g["chapter_id"]) for g in batch_all_groups if g.get("chapter_id")}
 
-                current_sec_qs = [
-                    g["slots"][alt]
-                    for g in planned_groups
-                    for alt in required_alts
-                    if g["slots"].get(alt) is not None
+            if hasattr(self, "_chapter_contexts_map") and self._chapter_contexts_map and batch_ch_ids:
+                scoped_parts = [
+                    self._chapter_contexts_map[cid]
+                    for cid in batch_ch_ids
+                    if cid in self._chapter_contexts_map
                 ]
-                if self._validate_question_structure(cand, sec, existing_sec_questions=current_sec_qs):
-                    if not self._is_duplicate_question(cand, all_accepted_questions):
-                        if getattr(sec, "reasoning_style", None):
-                            cand["reasoning_style"] = cand.get("reasoning_style") or sec.reasoning_style
-                        cand_ch_num = cand.get("chapter_number")
-                        matched_item = None
-                        if cand_ch_num and cand_ch_num in ch_num_to_item:
-                            matched_item = ch_num_to_item[cand_ch_num]
-                        elif default_ch_item:
-                            matched_item = default_ch_item
+                batch_context = "\n\n".join(scoped_parts) if scoped_parts else context_text
+            else:
+                batch_context = context_text
 
-                        if matched_item:
-                            cand["chapter_id"] = matched_item.get("chapter_id")
-                            cand["chapter_number"] = matched_item.get("chapter_number")
+            if not batch_context or not batch_context.strip():
+                batch_context = context_text or "Educational source material context for selected chapters."
 
-                        if generation_mode == GenerationMode.CUSTOM or not sec_ref:
-                            cand["source_type"] = "AI_GENERATED"
-                        else:
-                            cand_st = str(cand.get("source_type", "")).upper()
-                            cand_marks = sec.marks_per_question
-                            max_overall_reused_marks = max(sec.marks_per_question, int(0.20 * blueprint.total_marks))
-                            max_overall_variation_marks = max(sec.marks_per_question, int(0.20 * blueprint.total_marks))
+            # B. Scoped chapter weightages for this batch
+            if chapter_weightages_data:
+                batch_ch_weightages = [
+                    item for item in chapter_weightages_data
+                    if str(item.get("chapter_id")) in batch_ch_ids or str(item.get("chapter_number")) in batch_ch_ids
+                ]
+                if not batch_ch_weightages:
+                    batch_ch_weightages = chapter_weightages_data
+            else:
+                batch_ch_weightages = None
 
-                            cur_total_reused_marks = sum(
-                                q.get("marks", sec.marks_per_question)
-                                for q in all_accepted_questions
-                                if q.get("source_type") == "REFERENCE_REUSED"
-                            )
-                            cur_total_variation_marks = sum(
-                                q.get("marks", sec.marks_per_question)
-                                for q in all_accepted_questions
-                                if q.get("source_type") == "REFERENCE_VARIATION"
-                            )
+            # C. Construct batch blueprint
+            batch_sections = []
+            for bs in batch_planned:
+                sec = bs["sec"]
+                grp_cnt = len(bs["groups"])
+                sec_copy = SectionBlueprint(
+                    name=bs["section_name"],
+                    question_type=sec.question_type,
+                    question_count=grp_cnt,
+                    marks_per_question=sec.marks_per_question,
+                    total_section_marks=grp_cnt * sec.marks_per_question,
+                    has_internal_choice=sec.has_internal_choice,
+                    alternatives_per_question=sec.alternatives_per_question,
+                    numerical_question_count=sum(1 for g in bs["groups"] if g.get("is_numerical")),
+                    reasoning_style=getattr(sec, "reasoning_style", None),
+                    section_description=getattr(sec, "section_description", None),
+                )
+                batch_sections.append(sec_copy)
 
-                            ch_alloc_marks = matched_item.get("allocated_marks", blueprint.total_marks) if matched_item else blueprint.total_marks
-                            cur_ch_reused_marks = sum(
-                                q.get("marks", sec.marks_per_question)
-                                for q in all_accepted_questions
-                                if q.get("chapter_id") == (matched_item["chapter_id"] if matched_item else None)
-                                and q.get("source_type") == "REFERENCE_REUSED"
-                            )
-                            cur_ch_variation_marks = sum(
-                                q.get("marks", sec.marks_per_question)
-                                for q in all_accepted_questions
-                                if q.get("chapter_id") == (matched_item["chapter_id"] if matched_item else None)
-                                and q.get("source_type") == "REFERENCE_VARIATION"
-                            )
+            batch_total_marks = sum(s.total_section_marks for s in batch_sections)
+            batch_bp = PaperBlueprint(
+                total_marks=batch_total_marks,
+                sections=batch_sections,
+                sample_questions=sample_questions or [],
+            )
 
-                            if cand_st == "REFERENCE_REUSED":
-                                if (cur_total_reused_marks + cand_marks > max_overall_reused_marks) or (cur_ch_reused_marks + cand_marks > ch_alloc_marks):
-                                    cand["source_type"] = "AI_GENERATED"
-                                else:
-                                    cand["source_type"] = "REFERENCE_REUSED"
-                            elif cand_st == "REFERENCE_VARIATION":
-                                if (cur_total_variation_marks + cand_marks > max_overall_variation_marks) or (cur_ch_variation_marks + cand_marks > ch_alloc_marks):
-                                    cand["source_type"] = "AI_GENERATED"
-                                else:
-                                    cand["source_type"] = "REFERENCE_VARIATION"
-                            else:
-                                cand["source_type"] = "AI_GENERATED"
+            # D. Build prompt for this batch
+            prompt = self._build_complete_paper_prompt(
+                blueprint=batch_bp,
+                context_text=batch_context,
+                topic_focus=topic_focus,
+                difficulty=difficulty,
+                generation_mode=generation_mode,
+                sample_questions=sample_questions,
+                easy_pct=easy_pct,
+                med_pct=med_pct,
+                hard_pct=hard_pct,
+                chapter_weightages_data=batch_ch_weightages,
+                planned_sections=batch_planned,
+            )
 
-                        assigned = self._assign_candidate_to_slot(
-                            cand=cand,
-                            planned_groups=planned_groups,
-                            required_alts=required_alts,
-                            targeted_missing_slots=None,
+            # E. Token capacity check
+            token_count = self.ai_service.count_tokens(
+                prompt,
+                system_instruction=PAPER_GENERATION_SYSTEM_INSTRUCTION,
+            )
+            if token_count > MAX_INPUT_TOKENS:
+                logger.error(f"Batch {batch_idx} prompt tokens ({token_count}) exceed model context capacity ({MAX_INPUT_TOKENS}).")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Selected chapters contain too much educational content to generate this paper in a single model request. Please select fewer chapters and try again.",
+                )
+
+            # F. Call Gemini
+            try:
+                response_text = self.ai_service.generate_response(
+                    prompt,
+                    system_instruction=PAPER_GENERATION_SYSTEM_INSTRUCTION,
+                    response_schema=GeminiCompletePaperSchema,
+                )
+            except TypeError:
+                try:
+                    response_text = self.ai_service.generate_response(
+                        prompt,
+                        system_instruction=PAPER_GENERATION_SYSTEM_INSTRUCTION,
+                    )
+                except TypeError:
+                    response_text = self.ai_service.generate_response(prompt)
+            parsed = self._parse_json_safely(response_text)
+
+            raw_sections = parsed.get("sections", []) if isinstance(parsed, dict) else []
+            if not raw_sections and isinstance(parsed, dict) and "questions" in parsed:
+                raw_sections = [{"section_name": sec.name, "questions": parsed["questions"]} for sec in batch_bp.sections]
+
+            # G. Ingest candidates for this batch's planned sections
+            for s_idx, s_data in enumerate(batch_planned):
+                sec = s_data["sec"]
+                planned_groups = s_data["groups"]
+                alts_per_q = sec.alternatives_per_question if (sec.has_internal_choice and sec.alternatives_per_question > 1) else 1
+                required_alts = planned_groups[0]["required_alts"] if planned_groups else [None]
+                sec_ref = self._get_section_aligned_sample_questions(sec, sample_questions) if (generation_mode == GenerationMode.REFERENCE and sample_questions) else None
+
+                sec_norm = _norm_sec_str(sec.name)
+                sec_resp = next(
+                    (
+                        s for s in raw_sections
+                        if isinstance(s, dict) and (
+                            _norm_sec_str(s.get("section_name", "")) == sec_norm or
+                            _norm_sec_str(s.get("section_name", "")) in sec_norm or
+                            sec_norm in _norm_sec_str(s.get("section_name", ""))
                         )
-                        if assigned:
-                            all_accepted_questions.append(cand)
+                    ),
+                    None
+                )
+                candidates = sec_resp.get("questions", []) if (sec_resp and isinstance(sec_resp, dict)) else []
+                if not candidates and s_idx < len(raw_sections) and isinstance(raw_sections[s_idx], dict):
+                    candidates = raw_sections[s_idx].get("questions", [])
+
+                for cand in candidates:
+                    unfilled = self._get_unfilled_slots(planned_groups, required_alts)
+                    if not unfilled:
+                        break
+
+                    current_sec_qs = [
+                        g["slots"][alt]
+                        for g in planned_groups
+                        for alt in required_alts
+                        if g["slots"].get(alt) is not None
+                    ]
+                    if self._validate_question_structure(cand, sec, existing_sec_questions=current_sec_qs):
+                        if not self._is_duplicate_question(cand, all_accepted_questions):
+                            if getattr(sec, "reasoning_style", None):
+                                cand["reasoning_style"] = cand.get("reasoning_style") or sec.reasoning_style
+                            cand_ch_num = cand.get("chapter_number")
+                            matched_item = None
+                            if cand_ch_num and cand_ch_num in ch_num_to_item:
+                                matched_item = ch_num_to_item[cand_ch_num]
+                            elif default_ch_item:
+                                matched_item = default_ch_item
+
+                            if matched_item:
+                                cand["chapter_id"] = matched_item.get("chapter_id")
+                                cand["chapter_number"] = matched_item.get("chapter_number")
+
+                            if generation_mode == GenerationMode.CUSTOM or not sec_ref:
+                                cand["source_type"] = "AI_GENERATED"
+                            else:
+                                cand_st = str(cand.get("source_type", "")).upper()
+                                cand_marks = sec.marks_per_question
+                                max_overall_reused_marks = max(sec.marks_per_question, int(0.20 * blueprint.total_marks))
+                                max_overall_variation_marks = max(sec.marks_per_question, int(0.20 * blueprint.total_marks))
+
+                                cur_total_reused_marks = sum(
+                                    q.get("marks", sec.marks_per_question)
+                                    for q in all_accepted_questions
+                                    if q.get("source_type") == "REFERENCE_REUSED"
+                                )
+                                cur_total_variation_marks = sum(
+                                    q.get("marks", sec.marks_per_question)
+                                    for q in all_accepted_questions
+                                    if q.get("source_type") == "REFERENCE_VARIATION"
+                                )
+
+                                ch_alloc_marks = matched_item.get("allocated_marks", blueprint.total_marks) if matched_item else blueprint.total_marks
+                                cur_ch_reused_marks = sum(
+                                    q.get("marks", sec.marks_per_question)
+                                    for q in all_accepted_questions
+                                    if q.get("chapter_id") == (matched_item["chapter_id"] if matched_item else None)
+                                    and q.get("source_type") == "REFERENCE_REUSED"
+                                )
+                                cur_ch_variation_marks = sum(
+                                    q.get("marks", sec.marks_per_question)
+                                    for q in all_accepted_questions
+                                    if q.get("chapter_id") == (matched_item["chapter_id"] if matched_item else None)
+                                    and q.get("source_type") == "REFERENCE_VARIATION"
+                                )
+
+                                if cand_st == "REFERENCE_REUSED":
+                                    if (cur_total_reused_marks + cand_marks > max_overall_reused_marks) or (cur_ch_reused_marks + cand_marks > ch_alloc_marks):
+                                        cand["source_type"] = "AI_GENERATED"
+                                    else:
+                                        cand["source_type"] = "REFERENCE_REUSED"
+                                elif cand_st == "REFERENCE_VARIATION":
+                                    if (cur_total_variation_marks + cand_marks > max_overall_variation_marks) or (cur_ch_variation_marks + cand_marks > ch_alloc_marks):
+                                        cand["source_type"] = "AI_GENERATED"
+                                    else:
+                                        cand["source_type"] = "REFERENCE_VARIATION"
+                                else:
+                                    cand["source_type"] = "AI_GENERATED"
+
+                            assigned = self._assign_candidate_to_slot(
+                                cand=cand,
+                                planned_groups=planned_groups,
+                                required_alts=required_alts,
+                                targeted_missing_slots=None,
+                            )
+                            if assigned:
+                                all_accepted_questions.append(cand)
 
         # Helper function to collect unfilled slots across ALL sections
         def _get_all_unfilled_slots() -> List[Dict[str, Any]]:
@@ -1127,8 +1363,8 @@ class PaperGeneratorService:
                             })
             return missing_slots
 
-        # 3. Unified Whole-Paper Supplemental Recovery Loop (Max 2 Attempts)
-        MAX_UNIFIED_RECOVERY_ATTEMPTS = 2
+        # 3. Unified Whole-Paper Supplemental Recovery Loop (Max 5 Attempts, Batched up to MAX_QUESTIONS_PER_CALL)
+        MAX_UNIFIED_RECOVERY_ATTEMPTS = 5
         recovery_attempt = 0
         rejected_recovery_candidates: List[str] = []
 
@@ -1139,144 +1375,153 @@ class PaperGeneratorService:
 
             recovery_attempt += 1
             missing_cnt = len(all_missing)
-            num_candidates_to_request = missing_cnt + 1 if missing_cnt <= 2 else missing_cnt
             logger.info(
                 f"Unified whole-paper recovery attempt {recovery_attempt}/{MAX_UNIFIED_RECOVERY_ATTEMPTS}: "
-                f"requesting {num_candidates_to_request} candidates for {missing_cnt} missing slot(s) across all sections."
+                f"{missing_cnt} missing slot(s) across all sections."
             )
 
-            # Scoped Context: Send context strictly for chapters with missing slots!
-            needed_ch_ids = {str(s["chapter_id"]) for s in all_missing if s.get("chapter_id")}
-            if hasattr(self, "_chapter_contexts_map") and self._chapter_contexts_map and needed_ch_ids:
-                scoped_chunks = [
-                    self._chapter_contexts_map[cid]
-                    for cid in needed_ch_ids
-                    if cid in self._chapter_contexts_map
-                ]
-                recovery_context = "\n\n".join(scoped_chunks) if scoped_chunks else context_text
-            else:
-                recovery_context = context_text
+            # Partition missing slots into chapter-clustered batches of <= 100 questions
+            recovery_batches = self._partition_missing_slots_into_batches(
+                missing_slots=all_missing,
+                max_batch_size=MAX_QUESTIONS_PER_CALL,
+            )
 
-            # Group missing slots by section to provide rich pedagogical context
-            sections_missing_map: Dict[str, List[Dict[str, Any]]] = {}
-            for s_info in all_missing:
-                sections_missing_map.setdefault(s_info["section_name"], []).append(s_info)
+            for batch_missing in recovery_batches:
+                batch_missing_cnt = len(batch_missing)
+                num_candidates_to_request = batch_missing_cnt + 1 if batch_missing_cnt <= 2 else batch_missing_cnt
 
-            sections_detail_blocks = []
-            for sec_name, sec_missing_slots in sections_missing_map.items():
-                first_slot = sec_missing_slots[0]
-                sec = first_slot["sec"]
-                r_style = getattr(sec, "reasoning_style", None) or first_slot.get("reasoning_style")
-                sec_desc = getattr(sec, "section_description", None)
+                # Scoped Context: Send context strictly for chapters with missing slots in this batch!
+                needed_ch_ids = {str(s["chapter_id"]) for s in batch_missing if s.get("chapter_id")}
+                if hasattr(self, "_chapter_contexts_map") and self._chapter_contexts_map and needed_ch_ids:
+                    scoped_chunks = [
+                        self._chapter_contexts_map[cid]
+                        for cid in needed_ch_ids
+                        if cid in self._chapter_contexts_map
+                    ]
+                    recovery_context = "\n\n".join(scoped_chunks) if scoped_chunks else context_text
+                else:
+                    recovery_context = context_text
 
-                style_str = f"- Dominant Reasoning Style: {r_style}\n" if r_style else ""
-                desc_str = f"- Section Pedagogical Description: {sec_desc}\n" if sec_desc else ""
-                pedagogical_rule = ""
-                if r_style:
-                    if any(kw in r_style for kw in ("SCENARIO", "CASE", "VIGNETTE", "APPLIED", "SITUATION")):
-                        pedagogical_rule = (
-                            f"- STRICT PEDAGOGICAL REQUIREMENT: Every replacement question for this section MUST be grounded in a realistic, "
-                            f"contextual case scenario, vignette, or applied situation (reasoning style: {r_style}). "
-                            f"Do NOT ask generic, bare textbook recall questions. Each question item MUST include "
-                            f"'reasoning_style': '{r_style}'.\n"
+                # Group missing slots by section to provide rich pedagogical context
+                sections_missing_map: Dict[str, List[Dict[str, Any]]] = {}
+                for s_info in batch_missing:
+                    sections_missing_map.setdefault(s_info["section_name"], []).append(s_info)
+
+                sections_detail_blocks = []
+                for sec_name, sec_missing_slots in sections_missing_map.items():
+                    first_slot = sec_missing_slots[0]
+                    sec = first_slot["sec"]
+                    r_style = getattr(sec, "reasoning_style", None) or first_slot.get("reasoning_style")
+                    sec_desc = getattr(sec, "section_description", None)
+
+                    style_str = f"- Dominant Reasoning Style: {r_style}\n" if r_style else ""
+                    desc_str = f"- Section Pedagogical Description: {sec_desc}\n" if sec_desc else ""
+                    pedagogical_rule = ""
+                    if r_style:
+                        if any(kw in r_style for kw in ("SCENARIO", "CASE", "VIGNETTE", "APPLIED", "SITUATION")):
+                            pedagogical_rule = (
+                                f"- STRICT PEDAGOGICAL REQUIREMENT: Every replacement question for this section MUST be grounded in a realistic, "
+                                f"contextual case scenario, vignette, or applied situation (reasoning style: {r_style}). "
+                                f"Do NOT ask generic, bare textbook recall questions. Each question item MUST include "
+                                f"'reasoning_style': '{r_style}'.\n"
+                            )
+                        else:
+                            pedagogical_rule = (
+                                f"- STRICT PEDAGOGICAL REQUIREMENT: Every replacement question for this section MUST strictly embody the reasoning style "
+                                f"'{r_style}'. Do NOT deviate into other unrelated cognitive modes. Each question item MUST include "
+                                f"'reasoning_style': '{r_style}'.\n"
+                            )
+
+                    sec_desc_lower = str(sec_desc or "").lower()
+                    has_ar = "assertion" in sec_desc_lower or "reason" in sec_desc_lower
+                    sec_entry_match = next((s for s in planned_sections if _norm_sec_str(s["section_name"]) == _norm_sec_str(sec_name)), None)
+                    total_mcqs_in_sec = len(sec_entry_match["groups"]) if sec_entry_match else len(sec_missing_slots)
+                    ar_start_q = max(1, total_mcqs_in_sec - 1) if has_ar else 999999
+                    ar_rule = ""
+                    if has_ar:
+                        ar_rule = (
+                            f"- Question Format Distribution: For MCQ slots in this section, standard multiple-choice questions MUST be used for earlier questions (up to Question {ar_start_q - 1}). "
+                            f"ONLY the final 2 questions (Question {ar_start_q} onwards) may be Assertion-Reason items (formatted strictly as 'Assertion (A): ...\\nReason (R): ...'). "
+                            "Do NOT make all questions Assertion-Reason!\n"
                         )
-                    else:
-                        pedagogical_rule = (
-                            f"- STRICT PEDAGOGICAL REQUIREMENT: Every replacement question for this section MUST strictly embody the reasoning style "
-                            f"'{r_style}'. Do NOT deviate into other unrelated cognitive modes. Each question item MUST include "
-                            f"'reasoning_style': '{r_style}'.\n"
-                        )
 
-                sec_desc_lower = str(sec_desc or "").lower()
-                has_ar = "assertion" in sec_desc_lower or "reason" in sec_desc_lower
-                sec_entry_match = next((s for s in planned_sections if _norm_sec_str(s["section_name"]) == _norm_sec_str(sec_name)), None)
-                total_mcqs_in_sec = len(sec_entry_match["groups"]) if sec_entry_match else len(sec_missing_slots)
-                ar_start_q = max(1, total_mcqs_in_sec - 1) if has_ar else 999999
-                ar_rule = ""
-                if has_ar:
-                    ar_rule = (
-                        f"- Question Format Distribution: For MCQ slots in this section, standard multiple-choice questions MUST be used for earlier questions (up to Question {ar_start_q - 1}). "
-                        f"ONLY the final 2 questions (Question {ar_start_q} onwards) may be Assertion-Reason items (formatted strictly as 'Assertion (A): ...\\nReason (R): ...'). "
-                        "Do NOT make all questions Assertion-Reason!\n"
+                    slot_lines = []
+                    for s_info in sec_missing_slots:
+                        q_type = s_info["question_type"]
+                        marks = s_info["marks"]
+                        diff = s_info["difficulty"]
+                        ch_num = s_info.get("chapter_number")
+                        ch_name = s_info.get("chapter_name")
+                        if ch_num and ch_name:
+                            ch_str = f"Chapter {ch_num} (\"{ch_name}\")"
+                        elif ch_num:
+                            ch_str = f"Chapter {ch_num}"
+                        else:
+                            ch_str = "Designated Chapter"
+
+                        is_num_str = " | Numerical Calculation" if s_info.get("is_numerical") else ""
+                        cg = s_info["choice_group"]
+                        alt = s_info["alternative_label"]
+                        paired_q = s_info.get("paired_slot")
+                        q_ord = s_info.get("question_order") or 0
+
+                        format_str = ""
+                        if q_type == "MCQ" and has_ar:
+                            if q_ord < ar_start_q:
+                                format_str = " | Format: Standard MCQ (NOT Assertion-Reason)"
+                            else:
+                                format_str = " | Format: Assertion-Reasoning"
+
+                        if paired_q and cg and alt:
+                            p_text = str(paired_q.get("question_text", "")).strip()
+                            slot_lines.append(
+                                f"  * Choice Group '{cg}', Alternative '{alt}': {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}{format_str}. "
+                                f"Must be an internal choice alternative paired with: \"{p_text}\". "
+                                f"IMPORTANT: Must test a DIFFERENT formula or distinct educational concept from {ch_str} so it is not duplicate or repetitive."
+                            )
+                        elif cg and alt:
+                            slot_lines.append(
+                                f"  * Choice Group '{cg}', Alternative '{alt}': {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}{format_str}."
+                            )
+                        else:
+                            slot_lines.append(
+                                f"  * Question {q_ord}: {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}{format_str}."
+                            )
+
+                    slots_str = "\n".join(slot_lines)
+                    sec_q_type = getattr(sec.question_type, "value", sec.question_type) if hasattr(sec, "question_type") else first_slot["question_type"]
+                    sections_detail_blocks.append(
+                        f"SECTION: '{sec_name}'\n"
+                        f"- Question Type: {sec_q_type}\n"
+                        f"{style_str}{desc_str}{pedagogical_rule}{ar_rule}- Missing Question Slots to Generate:\n{slots_str}"
                     )
 
-                slot_lines = []
-                for s_info in sec_missing_slots:
-                    q_type = s_info["question_type"]
-                    marks = s_info["marks"]
-                    diff = s_info["difficulty"]
-                    ch_num = s_info.get("chapter_number")
-                    ch_name = s_info.get("chapter_name")
-                    if ch_num and ch_name:
-                        ch_str = f"Chapter {ch_num} (\"{ch_name}\")"
-                    elif ch_num:
-                        ch_str = f"Chapter {ch_num}"
-                    else:
-                        ch_str = "Designated Chapter"
+                slots_detail_str = "\n\n".join(sections_detail_blocks)
 
-                    is_num_str = " | Numerical Calculation" if s_info.get("is_numerical") else ""
-                    cg = s_info["choice_group"]
-                    alt = s_info["alternative_label"]
-                    paired_q = s_info.get("paired_slot")
-                    q_ord = s_info.get("question_order") or 0
+                existing_texts = [
+                    str(q.get("question_text", "")).strip()
+                    for q in all_accepted_questions
+                    if q and q.get("question_text")
+                ]
+                existing_summary = json.dumps(existing_texts, ensure_ascii=False) if existing_texts else "None"
 
-                    format_str = ""
-                    if q_type == "MCQ" and has_ar:
-                        if q_ord < ar_start_q:
-                            format_str = " | Format: Standard MCQ (NOT Assertion-Reason)"
-                        else:
-                            format_str = " | Format: Assertion-Reasoning"
-
-                    if paired_q and cg and alt:
-                        p_text = str(paired_q.get("question_text", "")).strip()
-                        slot_lines.append(
-                            f"  * Choice Group '{cg}', Alternative '{alt}': {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}{format_str}. "
-                            f"Must be an internal choice alternative paired with: \"{p_text}\". "
-                            f"IMPORTANT: Must test a DIFFERENT formula or distinct educational concept from {ch_str} so it is not duplicate or repetitive."
-                        )
-                    elif cg and alt:
-                        slot_lines.append(
-                            f"  * Choice Group '{cg}', Alternative '{alt}': {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}{format_str}."
-                        )
-                    else:
-                        slot_lines.append(
-                            f"  * Question {q_ord}: {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}{format_str}."
-                        )
-
-                slots_str = "\n".join(slot_lines)
-                sec_q_type = getattr(sec.question_type, "value", sec.question_type) if hasattr(sec, "question_type") else first_slot["question_type"]
-                sections_detail_blocks.append(
-                    f"SECTION: '{sec_name}'\n"
-                    f"- Question Type: {sec_q_type}\n"
-                    f"{style_str}{desc_str}{pedagogical_rule}{ar_rule}- Missing Question Slots to Generate:\n{slots_str}"
-                )
-
-            slots_detail_str = "\n\n".join(sections_detail_blocks)
-
-            existing_texts = [
-                str(q.get("question_text", "")).strip()
-                for q in all_accepted_questions
-                if q and q.get("question_text")
-            ]
-            existing_summary = json.dumps(existing_texts, ensure_ascii=False) if existing_texts else "None"
-
-            rejected_feedback_str = ""
-            if rejected_recovery_candidates:
-                unique_rejected = list(dict.fromkeys(r.strip() for r in rejected_recovery_candidates if r and r.strip()))[-15:]
-                rejected_feedback_str = f"""
+                rejected_feedback_str = ""
+                if rejected_recovery_candidates:
+                    unique_rejected = list(dict.fromkeys(r.strip() for r in rejected_recovery_candidates if r and r.strip()))[-15:]
+                    rejected_feedback_str = f"""
 STRICT REJECTION FEEDBACK (DO NOT REPEAT OR GENERATE QUESTIONS SIMILAR TO THESE REJECTED CANDIDATES):
 {json.dumps(unique_rejected, ensure_ascii=False)}
 """
 
-            diversity_directive = ""
-            if recovery_attempt >= 2 and missing_cnt <= 3:
-                diversity_directive = """
+                diversity_directive = ""
+                if recovery_attempt >= 2 and batch_missing_cnt <= 3:
+                    diversity_directive = """
 CRITICAL DIVERSITY REQUIREMENT:
 A previous attempt to fill this slot generated a duplicate question.
 You MUST choose a fresh, DIFFERENT concept, formula, or subtopic from the selected material that has NOT been tested anywhere in this paper.
 """
 
-            fill_prompt = f"""Generate {num_candidates_to_request} unique, non-repetitive candidate questions to fill the {missing_cnt} missing slot(s) across the examination paper.
+                fill_prompt = f"""Generate {num_candidates_to_request} unique, non-repetitive candidate questions to fill the {batch_missing_cnt} missing slot(s) across the examination paper.
 
 TARGET MISSING SLOTS:
 {slots_detail_str}
@@ -1309,95 +1554,95 @@ Return ONLY valid JSON matching this schema:
     }}
   ]
 }}"""
-            try:
                 try:
-                    fill_response_text = self.ai_service.generate_response(
-                        fill_prompt,
-                        system_instruction=PAPER_RECOVERY_SYSTEM_INSTRUCTION,
-                    )
-                except TypeError:
-                    fill_response_text = self.ai_service.generate_response(fill_prompt)
-                fill_parsed = self._parse_json_safely(fill_response_text)
-                fill_candidates = []
-                if isinstance(fill_parsed, dict):
-                    if "questions" in fill_parsed and isinstance(fill_parsed["questions"], list):
-                        fill_candidates = fill_parsed["questions"]
-                    elif "sections" in fill_parsed and isinstance(fill_parsed["sections"], list):
-                        for s in fill_parsed["sections"]:
-                            if isinstance(s, dict) and "questions" in s and isinstance(s["questions"], list):
-                                fill_candidates.extend(s["questions"])
-
-                for cand in fill_candidates:
-                    if not isinstance(cand, dict):
-                        continue
-                    cand_sec_name = str(cand.get("section_name", "")).strip()
-                    target_sec_data = None
-                    if cand_sec_name:
-                        target_sec_data = next(
-                            (
-                                s for s in planned_sections
-                                if _norm_sec_str(s["section_name"]) == _norm_sec_str(cand_sec_name)
-                                or _norm_sec_str(cand_sec_name) in _norm_sec_str(s["section_name"])
-                                or _norm_sec_str(s["section_name"]) in _norm_sec_str(cand_sec_name)
-                            ),
-                            None
+                    try:
+                        fill_response_text = self.ai_service.generate_response(
+                            fill_prompt,
+                            system_instruction=PAPER_RECOVERY_SYSTEM_INSTRUCTION,
                         )
-                    if not target_sec_data:
-                        current_missing = _get_all_unfilled_slots()
-                        if current_missing:
-                            target_sec_name = current_missing[0]["section_name"]
-                            target_sec_data = next((s for s in planned_sections if s["section_name"] == target_sec_name), None)
+                    except TypeError:
+                        fill_response_text = self.ai_service.generate_response(fill_prompt)
+                    fill_parsed = self._parse_json_safely(fill_response_text)
+                    fill_candidates = []
+                    if isinstance(fill_parsed, dict):
+                        if "questions" in fill_parsed and isinstance(fill_parsed["questions"], list):
+                            fill_candidates = fill_parsed["questions"]
+                        elif "sections" in fill_parsed and isinstance(fill_parsed["sections"], list):
+                            for s in fill_parsed["sections"]:
+                                if isinstance(s, dict) and "questions" in s and isinstance(s["questions"], list):
+                                    fill_candidates.extend(s["questions"])
 
-                    if not target_sec_data:
-                        continue
-
-                    sec = target_sec_data["sec"]
-                    planned_groups = target_sec_data["groups"]
-                    required_alts = planned_groups[0]["required_alts"] if planned_groups else [None]
-
-                    missing_in_sec = self._get_unfilled_slots(planned_groups, required_alts)
-                    if not missing_in_sec:
-                        continue
-
-                    current_sec_qs = [
-                        g["slots"][alt]
-                        for g in planned_groups
-                        for alt in required_alts
-                        if g["slots"].get(alt) is not None
-                    ]
-                    cand_q_text = str(cand.get("question_text", "")).strip()
-
-                    if self._validate_question_structure(cand, sec, existing_sec_questions=current_sec_qs):
-                        if not self._is_duplicate_question(cand, all_accepted_questions):
-                            cand_ch_num = cand.get("chapter_number")
-                            matched_item = None
-                            if cand_ch_num and cand_ch_num in ch_num_to_item:
-                                matched_item = ch_num_to_item[cand_ch_num]
-                            elif default_ch_item:
-                                matched_item = default_ch_item
-
-                            if matched_item:
-                                cand["chapter_id"] = matched_item.get("chapter_id")
-                                cand["chapter_number"] = matched_item.get("chapter_number")
-
-                            cand["source_type"] = "AI_GENERATED"
-
-                            assigned = self._assign_candidate_to_slot(
-                                cand=cand,
-                                planned_groups=planned_groups,
-                                required_alts=required_alts,
-                                targeted_missing_slots=missing_in_sec,
+                    for cand in fill_candidates:
+                        if not isinstance(cand, dict):
+                            continue
+                        cand_sec_name = str(cand.get("section_name", "")).strip()
+                        target_sec_data = None
+                        if cand_sec_name:
+                            target_sec_data = next(
+                                (
+                                    s for s in planned_sections
+                                    if _norm_sec_str(s["section_name"]) == _norm_sec_str(cand_sec_name)
+                                    or _norm_sec_str(cand_sec_name) in _norm_sec_str(s["section_name"])
+                                    or _norm_sec_str(s["section_name"]) in _norm_sec_str(cand_sec_name)
+                                ),
+                                None
                             )
-                            if assigned:
-                                all_accepted_questions.append(cand)
+                        if not target_sec_data:
+                            current_missing = _get_all_unfilled_slots()
+                            if current_missing:
+                                target_sec_name = current_missing[0]["section_name"]
+                                target_sec_data = next((s for s in planned_sections if s["section_name"] == target_sec_name), None)
+
+                        if not target_sec_data:
+                            continue
+
+                        sec = target_sec_data["sec"]
+                        planned_groups = target_sec_data["groups"]
+                        required_alts = planned_groups[0]["required_alts"] if planned_groups else [None]
+
+                        missing_in_sec = self._get_unfilled_slots(planned_groups, required_alts)
+                        if not missing_in_sec:
+                            continue
+
+                        current_sec_qs = [
+                            g["slots"][alt]
+                            for g in planned_groups
+                            for alt in required_alts
+                            if g["slots"].get(alt) is not None
+                        ]
+                        cand_q_text = str(cand.get("question_text", "")).strip()
+
+                        if self._validate_question_structure(cand, sec, existing_sec_questions=current_sec_qs):
+                            if not self._is_duplicate_question(cand, all_accepted_questions):
+                                cand_ch_num = cand.get("chapter_number")
+                                matched_item = None
+                                if cand_ch_num and cand_ch_num in ch_num_to_item:
+                                    matched_item = ch_num_to_item[cand_ch_num]
+                                elif default_ch_item:
+                                    matched_item = default_ch_item
+
+                                if matched_item:
+                                    cand["chapter_id"] = matched_item.get("chapter_id")
+                                    cand["chapter_number"] = matched_item.get("chapter_number")
+
+                                cand["source_type"] = "AI_GENERATED"
+
+                                assigned = self._assign_candidate_to_slot(
+                                    cand=cand,
+                                    planned_groups=planned_groups,
+                                    required_alts=required_alts,
+                                    targeted_missing_slots=missing_in_sec,
+                                )
+                                if assigned:
+                                    all_accepted_questions.append(cand)
+                            else:
+                                if cand_q_text:
+                                    rejected_recovery_candidates.append(cand_q_text)
                         else:
                             if cand_q_text:
                                 rejected_recovery_candidates.append(cand_q_text)
-                    else:
-                        if cand_q_text:
-                            rejected_recovery_candidates.append(cand_q_text)
-            except Exception as fill_err:
-                logger.warning(f"Unified recovery attempt {recovery_attempt} failed: {fill_err}")
+                except Exception as fill_err:
+                    logger.warning(f"Unified recovery attempt {recovery_attempt} batch failed: {fill_err}")
 
         # 4. Deterministic Fallback Completion (Guarantees zero unhandled 400 errors)
         remaining_missing = _get_all_unfilled_slots()
@@ -1543,7 +1788,14 @@ Return ONLY valid JSON matching this schema:
         start_q_num = 1
         for sec_idx, sec in enumerate(blueprint.sections):
             alts_per_q = sec.alternatives_per_question if (sec.has_internal_choice and sec.alternatives_per_question > 1) else 1
-            sec_difficulties = self._calculate_difficulty_distribution(difficulty, sec.question_count, easy_pct, med_pct, hard_pct)
+            sec_difficulties = self._calculate_difficulty_distribution(
+                difficulty=difficulty,
+                count=sec.question_count,
+                easy_pct=easy_pct,
+                med_pct=med_pct,
+                hard_pct=hard_pct,
+                marks_per_q=sec.marks_per_question,
+            )
 
             choice_str = "None"
             if sec.has_internal_choice and sec.alternatives_per_question > 1:
@@ -1765,7 +2017,7 @@ CONTENT AUTHORITY, SOURCE FIDELITY & ANTI-EMBELLISHMENT RULES:
 1. SOURCE EDUCATIONAL MATERIAL is the ONLY authoritative source for question content, facts, formulas, terminology, and subject matter.
 2. Every generated question MUST be strictly derived from and answerable using ONLY the provided SOURCE EDUCATIONAL MATERIAL.
 3. DO NOT use external knowledge, pretrained/model general knowledge, assumptions, or information outside the provided SOURCE EDUCATIONAL MATERIAL.
-4. CHAPTER COVERAGE & ATTRIBUTION RULE: Distribute questions strictly according to the requested chapter weightages. If no custom weightages are provided, distribute coverage reasonably across all selected chapters. Include "chapter_number": <1-based integer chapter number> for each question.
+4. CHAPTER ATTRIBUTION & SLOTS FIDELITY RULE: Strictly follow the designated chapter assigned to each question slot in the Planned Question Slot Grid. Every generated question MUST include "chapter_number": <1-based integer chapter number> matching its designated slot.
 5. NUMERICAL CALCULATION ACCURACY RULE: You MUST perform exact step-by-step arithmetic verification for all numerical calculations. Double-check powers of 10, exponents, signs, and unit conversions (e.g. 10⁹ × 10⁻⁷ × 10⁻⁷ / (0.3)² = 5.4 × 10⁻³ / 0.09 = 6.0 × 10⁻³ N).
 6. VARIABLE DISAMBIGUATION RULE: NEVER use the same variable letter or symbol for two different physical quantities in the same question (e.g. do NOT use 'a' for both an electric field coefficient and a cube edge length; use distinct symbols like 'k' and 'L', or 'a' and 'd').
 7. SELF-CONTAINED QUESTION RULE: EVERY single question MUST be 100% self-contained and independent. NEVER use phrases like 'the previous problem', 'above question', 'from question X', or 'from the previous result'. Each question must supply all its own parameters, definitions, and context.
@@ -2243,26 +2495,81 @@ SOURCE EDUCATIONAL MATERIAL:
         easy_pct: Optional[int] = None,
         med_pct: Optional[int] = None,
         hard_pct: Optional[int] = None,
+        marks_per_q: Optional[int] = None,
     ) -> List[str]:
-        if easy_pct is not None and med_pct is not None and hard_pct is not None:
-            easy_cnt = int(round(count * (easy_pct / 100.0)))
-            hard_cnt = int(round(count * (hard_pct / 100.0)))
-            med_cnt = max(0, count - easy_cnt - hard_cnt)
+        if count <= 0:
+            return []
 
-            dist = (["EASY"] * easy_cnt) + (["MEDIUM"] * med_cnt) + (["HARD"] * hard_cnt)
-            if len(dist) < count:
-                dist.extend(["MEDIUM"] * (count - len(dist)))
-            return dist[:count]
-
-        if difficulty != DifficultyLevel.MIXED:
+        # If user explicitly selected a uniform single difficulty (e.g. DifficultyLevel.EASY)
+        # without custom percentages, return uniform distribution.
+        if difficulty != DifficultyLevel.MIXED and (easy_pct is None or med_pct is None or hard_pct is None):
             return [difficulty.value] * count
 
-        # MIXED distribution: ~30% Easy, ~50% Medium, ~20% Hard
-        easy_cnt = max(1 if count >= 3 else 0, int(round(count * 0.3)))
-        hard_cnt = max(1 if count >= 5 else 0, int(round(count * 0.2)))
-        med_cnt = max(1, count - easy_cnt - hard_cnt)
+        # Determine target percentage weights
+        if easy_pct is not None and med_pct is not None and hard_pct is not None:
+            e_pct = float(easy_pct)
+            m_pct = float(med_pct)
+            h_pct = float(hard_pct)
+        else:
+            # Default MIXED distribution: ~30% Easy, ~50% Medium, ~20% Hard
+            e_pct = 30.0
+            m_pct = 50.0
+            h_pct = 20.0
 
-        dist = (["EASY"] * easy_cnt) + (["MEDIUM"] * med_cnt) + (["HARD"] * hard_cnt)
+        # Special Case: Single question in section (count == 1)
+        if count == 1:
+            # If equal split between Easy and Hard (e.g. 50% Easy / 50% Hard), choose MEDIUM as neutral midpoint
+            if e_pct == h_pct and e_pct > 0 and (m_pct == 0 or e_pct == m_pct):
+                return ["MEDIUM"]
+            # Otherwise, pick the tier with strictly the highest configured percentage
+            best_tier = max(
+                [("EASY", e_pct), ("MEDIUM", m_pct), ("HARD", h_pct)],
+                key=lambda x: x[1]
+            )[0]
+            return [best_tier]
+
+        # Largest Remainder Method (Hamilton Method) for exact integer distribution
+        quotas = {
+            "EASY": count * (e_pct / 100.0),
+            "MEDIUM": count * (m_pct / 100.0),
+            "HARD": count * (h_pct / 100.0),
+        }
+
+        # Base integer counts
+        counts = {tier: int(math.floor(q)) for tier, q in quotas.items()}
+        allocated = sum(counts.values())
+        needed = count - allocated
+
+        if needed > 0:
+            # Calculate fractional remainders
+            remainders = {tier: quotas[tier] - counts[tier] for tier in quotas}
+
+            # Tie-breaker priorities when remainders are identical:
+            # For 2 questions on 33/33/34 (0.66 Easy, 0.66 Medium, 0.68 Hard):
+            # Hard wins 1st slot (0.68). Easy and Medium tie at 0.66.
+            # Breaking tie in favor of EASY gives [EASY, HARD], a balanced spectrum.
+            # If marks_per_q >= 4, lean HARD > MEDIUM > EASY.
+            # If marks_per_q <= 2, lean EASY > MEDIUM > HARD.
+            if marks_per_q is not None and marks_per_q >= 4:
+                tie_order = {"HARD": 3, "MEDIUM": 2, "EASY": 1}
+            elif marks_per_q is not None and marks_per_q <= 2:
+                tie_order = {"EASY": 3, "MEDIUM": 2, "HARD": 1}
+            else:
+                tie_order = {"EASY": 3, "HARD": 2, "MEDIUM": 1}
+
+            # Sort tiers by (remainder descending, tie_order descending)
+            ranked_tiers = sorted(
+                ["EASY", "MEDIUM", "HARD"],
+                key=lambda t: (round(remainders[t], 6), tie_order[t]),
+                reverse=True,
+            )
+
+            for i in range(needed):
+                tier_to_increment = ranked_tiers[i % len(ranked_tiers)]
+                counts[tier_to_increment] += 1
+
+        # Intra-section progression: Easy -> Medium -> Hard
+        dist = (["EASY"] * counts["EASY"]) + (["MEDIUM"] * counts["MEDIUM"]) + (["HARD"] * counts["HARD"])
         return dist[:count]
 
     def _create_fallback_question(
