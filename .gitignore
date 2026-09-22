@@ -52,3 +52,9 @@ htmlcov/
 *.sqlite3
 postgres_data/
 storage/
+
+# Documentation
+API_DOCUMENTATION.md
+API_ENDPOINTS_GUIDE.md
+FRONTEND_INTEGRATION_GUIDE.md
+docs/
