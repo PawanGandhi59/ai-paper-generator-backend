@@ -179,7 +179,6 @@ def test_paper_generator_passes_paper_system_instruction_and_schema():
     questions = svc._generate_complete_paper(
         blueprint=bp,
         context_text="Educational textbook content for Chapter 1.",
-        topic_focus="Electric Charges",
         difficulty=DifficultyLevel.EASY,
         generation_mode=GenerationMode.CUSTOM,
         sample_questions=None,
@@ -200,11 +199,10 @@ def test_paper_generator_passes_paper_system_instruction_and_schema():
     # 3. Assert structured schema is GeminiCompletePaperSchema
     assert call_kwargs.get("response_schema") == GeminiCompletePaperSchema
 
-    # 4. Assert user prompt contains dynamic data (blueprint, context, topic focus, chapters)
+    # 4. Assert user prompt contains dynamic data (blueprint, context, chapters)
     user_prompt = mock_ai.generate_response.call_args[0][0]
     assert "SECTION NAME: 'Section A'" in user_prompt
     assert "TOTAL EXAMINATION MARKS: 1" in user_prompt
-    assert "Electric Charges" in user_prompt
     assert "Educational textbook content for Chapter 1." in user_prompt
     assert "Electrostatics" in user_prompt
 

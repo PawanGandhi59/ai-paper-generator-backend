@@ -12,7 +12,7 @@ from fastapi import HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models.generated_paper import GeneratedPaper, GeneratedPaperQuestion
+from app.models.generated_paper import GeneratedPaper
 from app.repositories.document_repository import DocumentRepository
 from app.repositories.paper_repository import PaperRepository
 from app.repositories.reference_paper_repository import ReferencePaperRepository
@@ -48,7 +48,6 @@ from app.services.workspace_service import WorkspaceService
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRY_ATTEMPTS = 3
 MAX_QUESTIONS_PER_CALL = 100
 
 
@@ -420,7 +419,6 @@ class PaperGeneratorService:
             chapter_weightages=chapter_weightages_data,
             include_answers=request_data.include_answers,
             title=request_data.title,
-            topic_focus=request_data.topic_focus,
             reference_paper_id=request_data.reference_paper_id,
             easy_percentage=request_data.easy_percentage,
             medium_percentage=request_data.medium_percentage,
@@ -535,14 +533,12 @@ class PaperGeneratorService:
                 subject_id=subject_id,
                 book_id=book.id,
                 selected_chapter_ids=selected_ch_ids,
-                topic_focus=request_data.topic_focus,
             )
 
             # 5. Generate Questions in ONE Single Gemini API Request with Validation
             generated_questions = self._generate_complete_paper(
                 blueprint=blueprint,
                 context_text=context_text,
-                topic_focus=request_data.topic_focus,
                 difficulty=request_data.difficulty,
                 generation_mode=request_data.generation_mode,
                 sample_questions=blueprint.sample_questions,
@@ -714,7 +710,7 @@ class PaperGeneratorService:
         subject_id: UUID,
         book_id: UUID,
         selected_chapter_ids: List[UUID],
-        topic_focus: Optional[str],
+        **kwargs,
     ) -> str:
         """
         Retrieve educational context strictly bounded to selected_chapter_ids.
@@ -1094,7 +1090,6 @@ class PaperGeneratorService:
         self,
         blueprint: PaperBlueprint,
         context_text: str,
-        topic_focus: Optional[str],
         difficulty: DifficultyLevel,
         generation_mode: GenerationMode,
         sample_questions: Optional[List[Dict[str, Any]]],
@@ -1102,6 +1097,7 @@ class PaperGeneratorService:
         med_pct: Optional[int] = None,
         hard_pct: Optional[int] = None,
         chapter_weightages_data: Optional[List[Dict[str, Any]]] = None,
+        **kwargs,
     ) -> List[Dict[str, Any]]:
         """
         Generate the complete examination paper using deterministic blueprint matrix pre-planning,
@@ -1209,7 +1205,6 @@ class PaperGeneratorService:
             prompt = self._build_complete_paper_prompt(
                 blueprint=batch_bp,
                 context_text=batch_context,
-                topic_focus=topic_focus,
                 difficulty=difficulty,
                 generation_mode=generation_mode,
                 sample_questions=sample_questions,
@@ -1306,48 +1301,8 @@ class PaperGeneratorService:
                             if generation_mode == GenerationMode.CUSTOM or not sec_ref:
                                 cand["source_type"] = "AI_GENERATED"
                             else:
-                                cand_st = str(cand.get("source_type", "")).upper()
-                                cand_marks = sec.marks_per_question
-                                max_overall_reused_marks = max(sec.marks_per_question, int(0.20 * blueprint.total_marks))
-                                max_overall_variation_marks = max(sec.marks_per_question, int(0.20 * blueprint.total_marks))
-
-                                cur_total_reused_marks = sum(
-                                    q.get("marks", sec.marks_per_question)
-                                    for q in all_accepted_questions
-                                    if q.get("source_type") == "REFERENCE_REUSED"
-                                )
-                                cur_total_variation_marks = sum(
-                                    q.get("marks", sec.marks_per_question)
-                                    for q in all_accepted_questions
-                                    if q.get("source_type") == "REFERENCE_VARIATION"
-                                )
-
-                                ch_alloc_marks = matched_item.get("allocated_marks", blueprint.total_marks) if matched_item else blueprint.total_marks
-                                cur_ch_reused_marks = sum(
-                                    q.get("marks", sec.marks_per_question)
-                                    for q in all_accepted_questions
-                                    if q.get("chapter_id") == (matched_item["chapter_id"] if matched_item else None)
-                                    and q.get("source_type") == "REFERENCE_REUSED"
-                                )
-                                cur_ch_variation_marks = sum(
-                                    q.get("marks", sec.marks_per_question)
-                                    for q in all_accepted_questions
-                                    if q.get("chapter_id") == (matched_item["chapter_id"] if matched_item else None)
-                                    and q.get("source_type") == "REFERENCE_VARIATION"
-                                )
-
-                                if cand_st == "REFERENCE_REUSED":
-                                    if (cur_total_reused_marks + cand_marks > max_overall_reused_marks) or (cur_ch_reused_marks + cand_marks > ch_alloc_marks):
-                                        cand["source_type"] = "AI_GENERATED"
-                                    else:
-                                        cand["source_type"] = "REFERENCE_REUSED"
-                                elif cand_st == "REFERENCE_VARIATION":
-                                    if (cur_total_variation_marks + cand_marks > max_overall_variation_marks) or (cur_ch_variation_marks + cand_marks > ch_alloc_marks):
-                                        cand["source_type"] = "AI_GENERATED"
-                                    else:
-                                        cand["source_type"] = "REFERENCE_VARIATION"
-                                else:
-                                    cand["source_type"] = "AI_GENERATED"
+                                cand_st = str(cand.get("source_type", "AI_GENERATED")).strip().upper()
+                                cand["source_type"] = cand_st if cand_st in ("REFERENCE_REUSED", "REFERENCE_VARIATION") else "AI_GENERATED"
 
                             assigned = self._assign_candidate_to_slot(
                                 cand=cand,
@@ -1699,10 +1654,6 @@ Return ONLY valid JSON matching this schema:
             alts_per_q = sec.alternatives_per_question if (sec.has_internal_choice and sec.alternatives_per_question > 1) else 1
             required_alts = groups[0]["required_alts"] if groups else [None]
 
-            if generation_mode == GenerationMode.REFERENCE:
-                import random
-                random.shuffle(groups)
-
             sec_questions = []
             for new_idx, g in enumerate(groups):
                 order = current_q_order + new_idx
@@ -1794,7 +1745,6 @@ Return ONLY valid JSON matching this schema:
         self,
         blueprint: PaperBlueprint,
         context_text: str,
-        topic_focus: Optional[str],
         difficulty: DifficultyLevel,
         generation_mode: GenerationMode,
         sample_questions: Optional[List[Dict[str, Any]]] = None,
@@ -1803,6 +1753,7 @@ Return ONLY valid JSON matching this schema:
         hard_pct: Optional[int] = None,
         chapter_weightages_data: Optional[List[Dict[str, Any]]] = None,
         planned_sections: Optional[List[Dict[str, Any]]] = None,
+        **kwargs,
     ) -> str:
         """
         Construct a single complete-paper generation prompt asking Gemini to generate all sections
@@ -1915,19 +1866,6 @@ SECTION NAME: '{sec.name}'
 """)
             start_q_num += sec.question_count
 
-        topic_instruction_str = ""
-        if topic_focus and topic_focus.strip():
-            topic_instruction_str = f"""
-USER TOPIC FOCUS:
-"{topic_focus.strip()}"
-
-STRICT RULE:
-Check whether this concept exists in the SOURCE EDUCATIONAL MATERIAL.
-- If it exists, prioritize it where appropriate.
-- If it does not exist, completely ignore it.
-- Never introduce content solely because it appears in TOPIC FOCUS.
-"""
-
         ch_weightage_lines = []
         if chapter_weightages_data:
             ch_weightage_lines.append("\nCHAPTER WEIGHTAGE & MARKS ALLOCATION BREAKDOWN:")
@@ -1957,37 +1895,34 @@ Check whether this concept exists in the SOURCE EDUCATIONAL MATERIAL.
 REFERENCE PAPER SAMPLE QUESTIONS & COGNITIVE STYLE PROFILE:
 {samples_formatted}
 
-CRITICAL: REFERENCE MODE SEMANTIC EXAMINATION STYLE & PEDAGOGICAL EMULATION:
-You are generating an examination paper in REFERENCE MODE. You MUST capture and emulate the DEEP SEMANTIC AND PEDAGOGICAL QUESTION-SETTING PHILOSOPHY of the reference examiner, NOT merely copy vocabulary, keywords, or surface phrasing.
+CRITICAL: REFERENCE MODE EXAMINATION REUSE & EMULATION RULES:
+You are generating an examination paper in REFERENCE MODE.
 
-1. PEDAGOGICAL & COGNITIVE DEMAND EMULATION:
-   - Analyze HOW the reference paper converts textbook concepts into questions (the pattern: concept → physical scenario → given parameters → cognitive reasoning required → operation expected → answer depth).
-   - Match the examiner's cognitive burden: whether questions test direct recall, conceptual comprehension, scenario-based application, multi-step derivation, or numerical calculation.
-   - For numerical problems, replicate the reasoning depth (e.g. single-step direct formula substitution vs. multi-step parameter setup and derivation).
-   - For MCQs, emulate distractor construction strategy (targeting common student misconceptions or subtle conceptual errors rather than trivial options).
-   - Real difficulty must reflect actual reasoning burden, regardless of superficial terminology.
+1. PRIORITIZED REUSE OF REFERENCE QUESTIONS (UP TO 10% TO 20% OF TOTAL PAPER MARKS):
+   - Scope & Cap: When matching reference questions exist for the user's selected chapters, PRIORITIZE reusing them word-by-word into compatible question slots, up to a cumulative limit of 10% to 20% of total paper marks (no more than {max_overall_ref_marks} marks total across the entire paper).
+   - Chapter & Slot Alignment:
+     * A reference question is ONLY eligible for reuse if its underlying topic/concept belongs to one of the user's SELECTED CHAPTERS in the SOURCE EDUCATIONAL MATERIAL.
+     * Match eligible reference questions to a compatible slot in the "Planned Question Slot Grid" that has the SAME chapter_number and the SAME marks.
+     * If a selected chapter has NO matching reference questions in the sample list, do NOT force reuse for that chapter—fill its slots with fresh questions instead.
+   - Word-by-Word Fidelity & Options Formatting:
+     * For each matched slot, copy the question text EXACTLY WORD-FOR-WORD from the reference sample question without alteration, rephrasing, or adding extraneous scenarios.
+     * If the reference question is a multiple-choice question (MCQ), ensure the question stem is placed in "question_text" and its four options are cleanly provided in "mcq_options" as ["A. ...", "B. ...", "C. ...", "D. ..."] (even if the reference sample had options embedded inline in its text).
+     * Mark ONLY these questions that are directly copied from the reference paper sample list as "source_type": "REFERENCE_REUSED". NEVER label fresh questions authored from textbook materials as "REFERENCE_REUSED".
+     * EXEMPTION: Questions with "source_type": "REFERENCE_REUSED" are completely EXEMPT from section reasoning-style or vignette rewriting mandates; retain their original phrasing as given in the reference paper.
 
-2. CHAPTER ALIGNMENT, WEIGHTAGE & DUAL-CAP REUSE ELIGIBILITY RULE:
-   - Check if any sample questions in REFERENCE PAPER SAMPLE QUESTIONS belong to the concepts in SOURCE EDUCATIONAL MATERIAL (the selected chapters).
-   - DUAL-CAP REUSE CONSTRAINTS:
-     * Overall Paper Reuse Limit: You may directly reuse matching reference questions as "REFERENCE_REUSED" up to a MAXIMUM of 10% to 20% of total paper marks (no more than {max_overall_ref_marks} marks total across the entire paper).
-     * Per-Chapter Weightage Cap: For any individual chapter C, the total questions/marks for chapter C (reused + variations + fresh) MUST NOT exceed chapter C's allocated weightage percentage.
-     * Furthermore, the total marks of reused questions for chapter C CANNOT exceed min(chapter C allocated marks, overall allowed reference reuse marks).
-     * BALANCED 50/50 SPLIT PREFERENCE (IF FEASIBLE): For any selected chapter C where reference questions exist, IF POSSIBLE and if question marks/counts can be divided (e.g. Chapter 1 has 10 marks consisting of two 5-mark questions or multiple items), prefer reusing reference questions for ~half of chapter C's marks/questions and generating fresh "AI_GENERATED" questions for the remaining ~half. If NOT feasible to divide (e.g. only 1 question in that chapter or indivisible section marks), you may reuse up to the full chapter weightage cap (up to {max_overall_ref_marks} marks).
-     * If the reference paper ONLY contains questions for a single chapter (e.g. Chapter 1 with 10% weightage = 10 marks), you can reuse AT MOST 10 marks of Chapter 1 questions (NEVER more, with a 50/50 reuse/fresh split if feasible), and 100% of the remaining questions for other selected chapters MUST be fresh "AI_GENERATED" questions from SOURCE EDUCATIONAL MATERIAL.
-   - IF NO MATCHING QUESTIONS EXIST in the reference paper for a selected chapter:
-     * 100% of questions for that chapter MUST be fresh, newly authored questions ("AI_GENERATED") from SOURCE EDUCATIONAL MATERIAL.
+2. SYLLABUS & FRESH QUESTIONS (80% TO 90% OF TOTAL PAPER MARKS):
+   - For all remaining slots, or for selected chapters that have NO matching questions in the reference paper:
+     * Author fresh, original questions strictly from the SOURCE EDUCATIONAL MATERIAL.
+     * Emulate the reference paper's cognitive depth, difficulty, and question-setting style.
+     * Set "source_type": "AI_GENERATED" (or "REFERENCE_VARIATION" if adapting the parameters or scenario of an existing reference question).
 
-3. STRICT ANTI-CLUSTERING & NON-SEQUENTIAL REUSE RULE:
-   - NEVER copy reference paper questions sequentially in order (e.g. DO NOT copy Reference Q1, Q2, Q3... as generated Q1, Q2, Q3...).
-   - NEVER cluster or place all reused/variation questions together in the first section or in a single block at the beginning of the paper.
-   - Randomly SCATTER any allowed REFERENCE_REUSED or REFERENCE_VARIATION questions across different question numbers throughout the paper, interspersing them evenly among fresh AI_GENERATED questions.
+3. CHAPTER WEIGHTAGE & SLOT FIDELITY:
+   - Every question (whether reused or fresh) MUST strictly occupy its designated chapter_number and marks as defined in the Planned Question Slot Grid.
+   - Never violate the chapter marks allocation.
 
-4. ADAPTATION & TRACEABILITY (source_type):
-   For each generated question, set "source_type" as:
-   - "REFERENCE_REUSED": Use ONLY when a question from the reference paper matches the selected textbook chapters and is directly reused.
-   - "REFERENCE_VARIATION": Use ONLY when a question from the reference paper matches the selected textbook chapters and its parameters/scenario are modified.
-   - "AI_GENERATED": Use for ALL newly created questions derived from the SOURCE EDUCATIONAL MATERIAL (mandatory when chapter differs or when exceeding 20% reuse/variation).
+4. STRICT ANTI-CLUSTERING & NON-SEQUENTIAL REUSE:
+   - Do NOT cluster all reused questions together at the beginning of the paper.
+   - Place any allowed "REFERENCE_REUSED" or "REFERENCE_VARIATION" questions into their matching chapter/mark slots throughout the paper, interspersing them naturally among fresh "AI_GENERATED" questions.
 
 5. USER BLUEPRINT AUTHORITATIVENESS:
    - The user's requested TOTAL EXAMINATION MARKS ({blueprint.total_marks}), section counts, question types, marks per question, requested difficulty ({difficulty.value}), and selected textbook chapters are AUTHORITATIVE and MUST be strictly respected.
@@ -2021,7 +1956,10 @@ COGNITIVE DIFFICULTY & ANTI-VERBOSITY SPECIFICATIONS:
    - Write in clear, natural, direct academic English.
    - STRICT PROHIBITION: Do NOT use pretentious, polysyllabic, or hyper-inflated vocabulary to disguise simple recall questions as "hard". A definition question wrapped in complex jargon is still an easy question. Keep phrasing crisp, precise, and student-accessible across all difficulty levels.
 
-2. COGNITIVE DEMAND BY DIFFICULTY LEVEL (PHRASING DIVERSITY - NO VERB ANCHORING):
+2. DIFFICULTY & COGNITIVE DEMAND:
+   - EASY: Direct recall or recognition of explicit facts, fundamental definitions, standard laws, or foundational formulas directly stated in the source educational material.
+   - MEDIUM: Conceptual comprehension and standard application of principles.
+   - HARD: Analysis, synthesis, multi-step reasoning, and evaluation in novel scenarios.
    - You are NOT restricted to any fixed list of verbs. Vary question formulations naturally across the paper so questions do not feel repetitive or formulaic. Focus on the cognitive operation demanded of the student:
    
    - EASY (Bloom's Level 1 & 2 - Recall & Recognition):
@@ -2066,7 +2004,6 @@ CONTENT AUTHORITY, SOURCE FIDELITY & ANTI-EMBELLISHMENT RULES:
    - CRITICAL SPEC REQUIREMENT: When "visual" is not null, "spec" MUST NOT be empty. You MUST populate the full internal structure (e.g. "components" & "connections" for circuit; "points", "segments" & "polygons" for geometry; "functions" & ranges for graph).
    - INTERNAL CHOICE INDEPENDENCE: For questions with internal choice, each alternative ('a' and 'b') independently specifies its own "visual" object (or null).
 {ch_weightage_instruction_str}
-{topic_instruction_str}
 {ref_instruction_str}
 OUTPUT FORMAT REQUIREMENT:
 Return ONLY a valid JSON object containing a "sections" array. Author ONLY question text and MCQ options. Do NOT author answer keys, expected answers, or solutions. Do NOT wrap in markdown text outside the JSON.
@@ -2211,22 +2148,7 @@ SOURCE EDUCATIONAL MATERIAL:
 
         cand_style = normalize_reasoning_style(q.get("reasoning_style"))
         expected_style = getattr(sec, "reasoning_style", None)
-
-        is_scenario_dominant = (
-            expected_style
-            and any(kw in expected_style for kw in ("SCENARIO", "CASE", "VIGNETTE", "APPLIED"))
-        )
-
-        if is_scenario_dominant:
-            # Domain-agnostic check: question must provide situational framing rather than bare factual recall
-            words = q_text.split()
-            is_too_brief = len(words) < 12 and len(q_text) < 60
-            is_bare_recall = bool(re.match(r"^\s*(what is|define|explain|state|list|mention|name the|give the definition)\b", q_text, re.IGNORECASE))
-            if is_too_brief and is_bare_recall:
-                logger.warning(f"Rejecting question in {expected_style} section '{sec.name}' due to lack of situational scenario context: '{q_text[:60]}'")
-                return False
-            q["reasoning_style"] = cand_style or expected_style
-        elif cand_style:
+        if cand_style:
             q["reasoning_style"] = cand_style
         elif expected_style:
             q["reasoning_style"] = expected_style
@@ -2487,13 +2409,6 @@ SOURCE EDUCATIONAL MATERIAL:
                             q["reasoning_style"] = sec.reasoning_style
 
         logger.info(f"Monolithic final paper validation passed cleanly: {len(generated_questions)} items, {computed_marks} total marks.")
-
-    def _is_question_grounded(self, q: Dict[str, Any], context_text: str = "") -> bool:
-        """
-        Legacy grounding check stub. Post-generation educational rejection is completely disabled.
-        Always returns True to ensure model-generated content within scope is accepted.
-        """
-        return True
 
     def _is_duplicate_question(
         self,
@@ -2903,9 +2818,6 @@ SOURCE EDUCATIONAL MATERIAL:
         raw_title = getattr(paper, "title", None)
         title_val = "Generated Paper" if (_is_mock(raw_title) or not raw_title) else str(raw_title)
 
-        raw_topic = getattr(paper, "topic_focus", None)
-        topic_val = None if (_is_mock(raw_topic) or not raw_topic) else str(raw_topic)
-
         raw_bp = getattr(paper, "blueprint_json", None)
         bp_val = None if _is_mock(raw_bp) else raw_bp
 
@@ -2985,7 +2897,6 @@ SOURCE EDUCATIONAL MATERIAL:
             easy_percentage=easy_val,
             medium_percentage=med_val,
             hard_percentage=hard_val,
-            topic_focus=topic_val,
             selected_chapters=weightage_responses or [],
             include_answers=inc_ans_val,
             blueprint_json=bp_val,

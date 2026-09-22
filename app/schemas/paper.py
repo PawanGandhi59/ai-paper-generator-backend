@@ -86,7 +86,8 @@ class PaperGenerateRequest(BaseModel):
     medium_percentage: Optional[int] = Field(None, ge=0, le=100, description="Optional percentage of Medium questions (0-100%)")
     hard_percentage: Optional[int] = Field(None, ge=0, le=100, description="Optional percentage of Hard questions (0-100%)")
 
-    topic_focus: Optional[str] = Field(None, max_length=1000, description="Optional natural language topic focus/preference")
+    model_config = ConfigDict(extra="ignore")
+
     include_answers: bool = Field(True, description="Whether to include answer keys in API response")
     title: Optional[str] = Field(None, max_length=255)
 
@@ -131,15 +132,6 @@ class PaperGenerateRequest(BaseModel):
     @classmethod
     def validate_title(cls, v: Optional[str]) -> Optional[str]:
 
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-        return v
-
-    @field_validator("topic_focus")
-    @classmethod
-    def validate_topic_focus(cls, v: Optional[str]) -> Optional[str]:
         if v is not None:
             v = v.strip()
             if not v:
@@ -262,7 +254,6 @@ class PaperResponse(BaseModel):
     medium_percentage: Optional[int] = None
     hard_percentage: Optional[int] = None
 
-    topic_focus: Optional[str] = None
     selected_chapters: List[ChapterWeightageResponse] = Field(default_factory=list)
     include_answers: bool
     blueprint_json: Optional[Dict[str, Any]] = None

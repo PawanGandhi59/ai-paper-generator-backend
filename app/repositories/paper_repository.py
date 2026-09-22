@@ -27,13 +27,13 @@ class PaperRepository:
         class_name: Optional[str] = None,
         include_answers: bool = True,
         title: Optional[str] = None,
-        topic_focus: Optional[str] = None,
         reference_paper_id: Optional[UUID] = None,
         blueprint_json: Optional[Dict[str, Any]] = None,
         easy_percentage: Optional[int] = None,
         medium_percentage: Optional[int] = None,
         hard_percentage: Optional[int] = None,
         chapter_weightages: Optional[List[Dict[str, Any]]] = None,
+        **kwargs,
     ) -> GeneratedPaper:
         paper_title = title or f"Generated Paper ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')})"
         paper = GeneratedPaper(
@@ -53,7 +53,6 @@ class PaperRepository:
             easy_percentage=easy_percentage,
             medium_percentage=medium_percentage,
             hard_percentage=hard_percentage,
-            topic_focus=topic_focus,
             selected_chapter_ids=[str(cid) for cid in selected_chapter_ids],
             chapter_weightages=chapter_weightages,
             include_answers=include_answers,
