@@ -27,13 +27,13 @@ class PaperRepository:
         class_name: Optional[str] = None,
         include_answers: bool = True,
         title: Optional[str] = None,
-        topic_focus: Optional[str] = None,
         reference_paper_id: Optional[UUID] = None,
         blueprint_json: Optional[Dict[str, Any]] = None,
         easy_percentage: Optional[int] = None,
         medium_percentage: Optional[int] = None,
         hard_percentage: Optional[int] = None,
         chapter_weightages: Optional[List[Dict[str, Any]]] = None,
+        **kwargs,
     ) -> GeneratedPaper:
         paper_title = title or f"Generated Paper ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')})"
         paper = GeneratedPaper(
@@ -53,7 +53,6 @@ class PaperRepository:
             easy_percentage=easy_percentage,
             medium_percentage=medium_percentage,
             hard_percentage=hard_percentage,
-            topic_focus=topic_focus,
             selected_chapter_ids=[str(cid) for cid in selected_chapter_ids],
             chapter_weightages=chapter_weightages,
             include_answers=include_answers,
@@ -113,13 +112,17 @@ class PaperRepository:
         pdf_path: str,
         document_id: Optional[UUID],
         processing_status: str,
+        blueprint_json: Optional[Dict[str, Any]] = None,
     ) -> Optional[GeneratedPaper]:
         paper = self.db.get(GeneratedPaper, paper_id)
         if paper and paper.deleted_at is None:
             paper.pdf_path = pdf_path
             paper.document_id = document_id
             paper.processing_status = processing_status
-            paper.blueprint_json = None
+            if blueprint_json is not None:
+                paper.blueprint_json = blueprint_json
+                if "total_marks" in blueprint_json and isinstance(blueprint_json["total_marks"], int):
+                    paper.total_marks = blueprint_json["total_marks"]
             self.db.commit()
             self.db.refresh(paper)
         return paper
@@ -207,6 +210,8 @@ class PaperRepository:
                 is_numerical=bool(q_info.get("is_numerical", False)),
                 choice_group=q_info.get("choice_group"),
                 alternative_label=q_info.get("alternative_label"),
+                reasoning_style=q_info.get("reasoning_style"),
+                section_description=q_info.get("section_description"),
                 mcq_options=q_info.get("mcq_options"),
                 correct_answer=q_info.get("correct_answer"),
                 expected_answer=q_info.get("expected_answer"),

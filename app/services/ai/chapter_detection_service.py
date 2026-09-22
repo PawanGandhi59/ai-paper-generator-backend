@@ -80,7 +80,7 @@ class ChapterDetectionService:
         detected_chapters = []
 
         # --- PRIMARY PATH: Gemini Page-Structure Detection ---
-        if service and service.client:
+        if service and (service.llm or getattr(service, "client", None)):
             try:
                 detected_chapters = self._gemini_page_structure_detection(service, sorted_pages, total_pages)
                 if detected_chapters:
@@ -126,7 +126,7 @@ class ChapterDetectionService:
         Fallback path using Table of Contents / Heading Candidates regex extraction.
         """
         detected = []
-        if service and service.client:
+        if service and (service.llm or getattr(service, "client", None)):
             try:
                 toc_text = self._extract_toc_text(sorted_pages)
                 if toc_text:
@@ -212,30 +212,29 @@ class ChapterDetectionService:
         return "\n".join(candidates)
 
     def _call_gemini_detection(self, service: GeminiService, input_text: str) -> List[ChapterDetectionItem]:
-        from google.genai import types
-
         prompt = f"Analyze the following textbook document text / page headers and identify all chapters with their 1-based start pages:\n\n{input_text}"
 
-        config = types.GenerateContentConfig(
-            system_instruction=CHAPTER_DETECTION_SYSTEM_INSTRUCTION,
-            response_mime_type="application/json",
-            response_schema=ChapterDetectionResult,
-            temperature=0.1,
-        )
+        try:
+            response_text = service.generate_response(
+                prompt=prompt,
+                system_instruction=CHAPTER_DETECTION_SYSTEM_INSTRUCTION,
+                response_schema=ChapterDetectionResult,
+            )
+        except Exception as exc:
+            logger.warning(f"Error during Gemini chapter detection call: {exc}")
+            return []
 
-        response = service.client.models.generate_content(
-            model=service.model_name,
-            contents=prompt,
-            config=config,
-        )
-
-        if not response or not response.text:
+        if not response_text:
             logger.warning("Gemini returned empty response for chapter detection.")
             return []
 
-        parsed_data = json.loads(response.text)
-        result = ChapterDetectionResult.model_validate(parsed_data)
-        return result.chapters
+        try:
+            parsed_data = json.loads(response_text)
+            result = ChapterDetectionResult.model_validate(parsed_data)
+            return result.chapters
+        except Exception as exc:
+            logger.warning(f"Failed to parse chapter detection JSON response: {exc}")
+            return []
 
     def _validate_and_clean_chapters(
         self, items: List[ChapterDetectionItem], total_pages: int

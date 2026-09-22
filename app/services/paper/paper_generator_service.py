@@ -4,19 +4,21 @@ import math
 import os
 import re
 import shutil
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models.generated_paper import GeneratedPaper, GeneratedPaperQuestion
+from app.models.generated_paper import GeneratedPaper
 from app.repositories.document_repository import DocumentRepository
 from app.repositories.paper_repository import PaperRepository
 from app.repositories.reference_paper_repository import ReferencePaperRepository
 
 from app.schemas.paper import (
+    ChapterWeightageResponse,
     DifficultyLevel,
     GenerationMode,
     PaperGenerateRequest,
@@ -33,8 +35,12 @@ from app.services.ai.gemini_service import (
     GeminiRateLimitError,
     GeminiService,
 )
+from app.services.ai.prompts.paper_prompt import (
+    PAPER_GENERATION_SYSTEM_INSTRUCTION,
+    PAPER_RECOVERY_SYSTEM_INSTRUCTION,
+)
 from app.services.embeddings.gemini_embedding_service import GeminiEmbeddingService
-from app.services.paper.blueprint_service import BlueprintService, PaperBlueprint, SectionBlueprint
+from app.services.paper.blueprint_service import BlueprintService, PaperBlueprint, SectionBlueprint, normalize_reasoning_style
 from app.services.processors.pdf_processor import PDFProcessor
 from app.services.retrieval.chunking_service import ChunkingService
 from app.services.retrieval.retrieval_service import RetrievalService
@@ -42,7 +48,7 @@ from app.services.workspace_service import WorkspaceService
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRY_ATTEMPTS = 3
+MAX_QUESTIONS_PER_CALL = 100
 
 
 def _is_mock(val: Any) -> bool:
@@ -69,6 +75,200 @@ class PaperGeneratorService:
         self.embedding_service = embedding_service or GeminiEmbeddingService()
         self.blueprint_service = blueprint_service or BlueprintService(self.ai_service)
 
+    @staticmethod
+    def calculate_proportional_chapter_allocations(
+        ordered_chapters: List[Any],
+        total_marks: int,
+        weightage_lookup: Optional[Dict[Any, float]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Calculates proportional chapter mark allocations using the Hamilton-Hare /
+        Largest Remainder method with deterministic tie-breaking by chapter_number.
+        Guarantees that sum(allocated_marks) == total_marks exactly, and avoids
+        dumping rounding remainders into a single chapter.
+        """
+        num_selected = len(ordered_chapters)
+        if num_selected == 0:
+            return []
+
+        has_custom_weights = bool(weightage_lookup)
+        intermediate = []
+        for idx, ch in enumerate(ordered_chapters):
+            ch_id = getattr(ch, "id", ch.get("id") if isinstance(ch, dict) else None)
+            ch_num = getattr(ch, "chapter_number", ch.get("chapter_number") if isinstance(ch, dict) else idx + 1)
+            ch_name = (
+                getattr(ch, "name", None)
+                or getattr(ch, "title", None)
+                or (ch.get("name") or ch.get("title") if isinstance(ch, dict) else None)
+                or f"Chapter {ch_num}"
+            )
+            pct = 100.0 / num_selected
+            if has_custom_weights and weightage_lookup:
+                pct = weightage_lookup.get(ch_id, 0.0)
+
+            raw_marks = total_marks * (pct / 100.0)
+            base_marks = int(math.floor(raw_marks))
+            remainder = raw_marks - base_marks
+
+            intermediate.append({
+                "chapter_id": str(ch_id) if ch_id else str(idx + 1),
+                "chapter_number": ch_num,
+                "chapter_name": ch_name,
+                "weightage_percentage": round(pct, 2),
+                "base_marks": base_marks,
+                "remainder": remainder,
+                "orig_idx": idx,
+            })
+
+        total_base = sum(item["base_marks"] for item in intermediate)
+        surplus = total_marks - total_base
+
+        # Sort by remainder descending, tie-break by chapter_number ascending, then orig_idx
+        sorted_indices = sorted(
+            range(len(intermediate)),
+            key=lambda i: (-intermediate[i]["remainder"], intermediate[i]["chapter_number"], intermediate[i]["orig_idx"])
+        )
+
+        surplus_awards = set(sorted_indices[:surplus])
+
+        allocations = []
+        for i, item in enumerate(intermediate):
+            allocated = item["base_marks"] + (1 if i in surplus_awards else 0)
+            allocations.append({
+                "chapter_id": item["chapter_id"],
+                "chapter_number": item["chapter_number"],
+                "chapter_name": item["chapter_name"],
+                "weightage_percentage": item["weightage_percentage"],
+                "allocated_marks": allocated,
+            })
+
+        return allocations
+
+    def preplan_blueprint_matrix(
+        self,
+        blueprint: PaperBlueprint,
+        difficulty: DifficultyLevel,
+        chapter_weightages_data: Optional[List[Dict[str, Any]]] = None,
+        easy_pct: Optional[int] = None,
+        med_pct: Optional[int] = None,
+        hard_pct: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Pre-plans the authoritative question slot matrix before invoking Gemini.
+        Solves:
+        1. Denomination-aware chapter allocation (knapsack greedy by marks descending, matching real integer coins).
+        2. Intra-chapter choice pairing (both alternatives 'a' and 'b' strictly bound to the exact same chapter).
+        3. Global difficulty distribution (Easy -> Medium -> Hard assigned across logical groups).
+        4. Identical difficulty for paired alternatives.
+        """
+        logical_groups = []
+        current_q_order = 1
+        for sec in blueprint.sections:
+            alts_per_q = sec.alternatives_per_question if (sec.has_internal_choice and sec.alternatives_per_question > 1) else 1
+            required_alts = [chr(ord("a") + i) for i in range(alts_per_q)] if alts_per_q > 1 else [None]
+            for group_idx in range(sec.question_count):
+                q_order = current_q_order + group_idx
+                choice_grp = f"Q{q_order}" if alts_per_q > 1 else None
+                logical_groups.append({
+                    "section_name": sec.name,
+                    "group_idx": group_idx,
+                    "question_order": q_order,
+                    "choice_group": choice_grp,
+                    "marks": sec.marks_per_question,
+                    "question_type": sec.question_type.value,
+                    "required_alts": required_alts,
+                    "alts_per_q": alts_per_q,
+                    "is_numerical": False,
+                    "reasoning_style": getattr(sec, "reasoning_style", None),
+                    "section_description": getattr(sec, "section_description", None),
+                })
+            current_q_order += sec.question_count
+
+        # Denomination-Aware Chapter Allocation
+        if chapter_weightages_data and len(chapter_weightages_data) > 0:
+            for idx, item in enumerate(chapter_weightages_data):
+                if "chapter_id" not in item or not item["chapter_id"]:
+                    item["chapter_id"] = str(item.get("chapter_number") or (idx + 1))
+            ch_remaining = {
+                item["chapter_id"]: item.get("allocated_marks", 0)
+                for item in chapter_weightages_data
+            }
+            ch_lookup = {item["chapter_id"]: item for item in chapter_weightages_data}
+            ch_ids = [item["chapter_id"] for item in chapter_weightages_data]
+
+            # Sort groups by marks descending so high-mark questions (e.g. 5m) go first,
+            # and low-mark questions (e.g. 1m MCQs) fine-tune the remaining mark deficits.
+            sorted_groups = sorted(logical_groups, key=lambda g: (-g["marks"], g["question_order"]))
+
+            for g in sorted_groups:
+                best_ch_id = max(
+                    ch_ids,
+                    key=lambda cid: (ch_remaining[cid], -int(ch_lookup[cid].get("chapter_number") or 0))
+                )
+                ch_info = ch_lookup[best_ch_id]
+                g["chapter_id"] = ch_info.get("chapter_id")
+                g["chapter_number"] = ch_info.get("chapter_number")
+                g["chapter_name"] = ch_info.get("chapter_name")
+                ch_remaining[best_ch_id] -= g["marks"]
+        else:
+            for g in logical_groups:
+                g["chapter_id"] = None
+                g["chapter_number"] = 1
+                g["chapter_name"] = "General"
+
+        # Per-Section Difficulty Distribution across logical groups
+        for sec in blueprint.sections:
+            sec_groups = [g for g in logical_groups if g["section_name"] == sec.name]
+            sec_diffs = self._calculate_difficulty_distribution(
+                difficulty=difficulty,
+                count=len(sec_groups),
+                easy_pct=easy_pct,
+                med_pct=med_pct,
+                hard_pct=hard_pct,
+                marks_per_q=sec.marks_per_question,
+            )
+            sec_sorted = sorted(sec_groups, key=lambda g: g["question_order"])
+            for idx, g in enumerate(sec_sorted):
+                g["difficulty"] = sec_diffs[idx] if idx < len(sec_diffs) else "MEDIUM"
+
+        # Numerical Requirement Allocation per Section
+        for sec in blueprint.sections:
+            if sec.numerical_question_count > 0:
+                sec_groups = [g for g in logical_groups if g["section_name"] == sec.name]
+                for g in sec_groups[:sec.numerical_question_count]:
+                    g["is_numerical"] = True
+
+        # Construct Section-Organized Matrix Structure
+        planned_sections = []
+        for sec in blueprint.sections:
+            sec_groups = [g for g in logical_groups if g["section_name"] == sec.name]
+            planned_sections.append({
+                "section_name": sec.name,
+                "sec": sec,
+                "groups": [
+                    {
+                        "group_idx": g["group_idx"],
+                        "question_order": g["question_order"],
+                        "choice_group": g["choice_group"],
+                        "difficulty": g["difficulty"],
+                        "section_name": sec.name,
+                        "question_type": sec.question_type.value,
+                        "marks": sec.marks_per_question,
+                        "chapter_id": g.get("chapter_id"),
+                        "chapter_number": g.get("chapter_number"),
+                        "chapter_name": g.get("chapter_name"),
+                        "is_numerical": g.get("is_numerical", False),
+                        "reasoning_style": getattr(sec, "reasoning_style", None),
+                        "section_description": getattr(sec, "section_description", None),
+                        "required_alts": g["required_alts"],
+                        "slots": {alt: None for alt in g["required_alts"]},
+                    }
+                    for g in sec_groups
+                ],
+            })
+
+        return planned_sections
+
     def generate_paper(
         self,
         current_user_id: UUID,
@@ -79,6 +279,9 @@ class PaperGeneratorService:
         Executes end-to-end flow: authorization -> blueprint construction -> chapter-bounded RAG ->
         structured question generation -> business validation -> deduplication -> bounded regeneration -> persistence.
         """
+        if hasattr(self.ai_service, "reset_session_usage"):
+            self.ai_service.reset_session_usage()
+
         # 1. Authorization & Scope Validation
         book = self.workspace_service.get_book(request_data.book_id, current_user_id)
         subject_id = book.subject_id
@@ -99,34 +302,75 @@ class PaperGeneratorService:
                 )
 
         # Reference Mode specific scope check
+        sample_questions: List[Dict[str, Any]] = []
         reference_paper = None
         source_is_generated_paper = False
         if request_data.generation_mode == GenerationMode.REFERENCE:
+            if not request_data.reference_paper_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="reference_paper_id is required when generation_mode is REFERENCE.",
+                )
             reference_paper = self.ref_paper_repo.get_reference_paper(request_data.reference_paper_id)
             if not reference_paper:
                 # Try looking up in generated_papers table
                 reference_paper = self.paper_repo.get_paper(request_data.reference_paper_id)
                 if reference_paper:
                     source_is_generated_paper = True
-                    # Enforce reference eligibility: pdf_path exists, processing_status == READY, deleted_at is None
+                    # Check if deleted
+                    if getattr(reference_paper, "deleted_at", None) is not None:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Selected generated paper has been deleted.",
+                        )
+
+                    # Determine if eligible for saved-PDF extraction pipeline
                     doc_proc_status = getattr(reference_paper, "processing_status", None)
                     if _is_mock(doc_proc_status):
                         doc_proc_status = "NOT_SAVED"
-                    if reference_paper.document_id and not _is_mock(reference_paper.document_id):
+                    if getattr(reference_paper, "document_id", None) and not _is_mock(reference_paper.document_id):
                         doc = self.doc_repo.get_document_by_id(reference_paper.document_id)
                         if doc and getattr(doc, "processing_status", None) and not _is_mock(doc.processing_status):
                             doc_proc_status = str(doc.processing_status)
 
-                    is_eligible = bool(
+                    has_saved_pdf = bool(
                         reference_paper.pdf_path is not None
                         and not _is_mock(reference_paper.pdf_path)
-                        and doc_proc_status == "READY"
-                        and getattr(reference_paper, "deleted_at", None) is None
                     )
+                    is_eligible = bool(
+                        has_saved_pdf
+                        and doc_proc_status == "READY"
+                    )
+
+                    has_json_data = bool(
+                        reference_paper.blueprint_json
+                        or (hasattr(reference_paper, "questions") and reference_paper.questions)
+                    )
+
+                    if not is_eligible and not has_json_data:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Selected generated paper cannot be used as a reference because it has not been saved as a PDF and has no questions or blueprint.",
+                        )
                 else:
                     raise HTTPException(
                         status_code=status.HTTP_404_NOT_FOUND,
                         detail="Reference paper not found in uploaded reference papers or generated papers.",
+                    )
+            else:
+                # reference_paper is an uploaded ReferencePaper
+                is_eligible = bool(
+                    _is_mock(reference_paper)
+                    or (
+                        getattr(reference_paper, "stored_path", None) is not None
+                        and not _is_mock(getattr(reference_paper, "stored_path", None))
+                        and getattr(reference_paper, "deleted_at", None) is None
+                    )
+                )
+                if not is_eligible:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Selected reference paper is invalid or has been deleted.",
                     )
 
             # Verify current user has access to the reference paper's workspace
@@ -148,38 +392,17 @@ class PaperGeneratorService:
 
 
 
-        # 1.5. Calculate structured chapter weightages
+        # 1.5. Calculate structured chapter weightages using Hamilton-Hare Largest Remainder method
         selected_ch_models = [c for c in book_chapters if c.id in selected_ch_ids]
         ch_map = {c.id: c for c in selected_ch_models}
         ordered_chapters = [ch_map[cid] for cid in selected_ch_ids if cid in ch_map]
-
-        num_selected = len(ordered_chapters)
         weightage_lookup = {ch.chapter_id: ch.weightage_percentage for ch in request_data.selected_chapters if ch.weightage_percentage is not None}
-        has_custom_weights = bool(weightage_lookup)
 
-        chapter_weightages_data: List[Dict[str, Any]] = []
-        if num_selected > 0:
-            raw_allocations = []
-            for ch in ordered_chapters:
-                pct = weightage_lookup.get(ch.id, 100.0 / num_selected if not has_custom_weights else 0.0)
-                raw_marks = request_data.total_marks * (pct / 100.0)
-                int_marks = int(round(raw_marks))
-                raw_allocations.append({
-                    "chapter_id": str(ch.id),
-                    "chapter_number": ch.chapter_number,
-                    "chapter_name": getattr(ch, "name", None) or getattr(ch, "title", None) or f"Chapter {ch.chapter_number}",
-                    "weightage_percentage": round(pct, 2),
-                    "allocated_marks": int_marks,
-                })
-
-            # Adjust allocated_marks rounding so sum == total_marks
-            allocated_sum = sum(a["allocated_marks"] for a in raw_allocations)
-            diff = request_data.total_marks - allocated_sum
-            if diff != 0 and raw_allocations:
-                max_item = max(raw_allocations, key=lambda x: x["allocated_marks"])
-                max_item["allocated_marks"] += diff
-
-            chapter_weightages_data = raw_allocations
+        chapter_weightages_data = self.calculate_proportional_chapter_allocations(
+            ordered_chapters=ordered_chapters,
+            total_marks=request_data.total_marks,
+            weightage_lookup=weightage_lookup,
+        )
 
         # 2. Create Initial Paper Record (PENDING)
         paper = self.paper_repo.create_paper(
@@ -196,7 +419,6 @@ class PaperGeneratorService:
             chapter_weightages=chapter_weightages_data,
             include_answers=request_data.include_answers,
             title=request_data.title,
-            topic_focus=request_data.topic_focus,
             reference_paper_id=request_data.reference_paper_id,
             easy_percentage=request_data.easy_percentage,
             medium_percentage=request_data.medium_percentage,
@@ -218,18 +440,17 @@ class PaperGeneratorService:
             else:
                 if source_is_generated_paper:
                     if is_eligible and reference_paper.pdf_path:
-                        # Saved GeneratedPaper: check if blueprint_json from PDF is cached in DB
+                        # Saved GeneratedPaper: check if updated blueprint_json from PDF is in DB
                         if reference_paper.blueprint_json:
                             base_blueprint = PaperBlueprint.model_validate(reference_paper.blueprint_json)
                         else:
-                            # Cache miss: fetch extracted PDF text from linked DocumentPage records
+                            # Cache miss fallback: fetch extracted PDF text from linked DocumentPage records
                             doc_pages = self.doc_repo.get_document_pages(reference_paper.document_id)
                             pages_text = [p.text_content for p in doc_pages] if doc_pages else []
                             raw_base_blueprint = self.blueprint_service.analyze_reference_paper(
                                 paper_pages_text=pages_text,
                                 requested_total_marks=None,
                             )
-                            # Cache raw base blueprint in DB for all future paper generations
                             self.paper_repo.save_blueprint_json(reference_paper.id, raw_base_blueprint.model_dump())
                             base_blueprint = raw_base_blueprint
 
@@ -241,14 +462,29 @@ class PaperGeneratorService:
                         else:
                             blueprint = base_blueprint
                     else:
-                        # Unsaved GeneratedPaper (no saved PDF): build blueprint from original paper JSON
+                        # Unsaved GeneratedPaper (no saved PDF): uses paper.blueprint_json via build_blueprint_from_generated_paper
                         blueprint = self.blueprint_service.build_blueprint_from_generated_paper(
                             paper=reference_paper,
                             requested_total_marks=request_data.total_marks,
                         )
                 else:
                     # Reference Mode (Uploaded PDF ReferencePaper): Check if blueprint_json is cached in DB
-                    if reference_paper.blueprint_json:
+                    cached_bp = reference_paper.blueprint_json
+                    is_valid_cache = False
+                    if cached_bp and isinstance(cached_bp, dict):
+                        cached_sq = cached_bp.get("sample_questions", [])
+                        cached_secs = cached_bp.get("sections", [])
+                        is_dummy_fallback = (
+                            len(cached_secs) == 1
+                            and cached_secs[0].get("name") == "Section A"
+                            and cached_secs[0].get("marks_per_question") == 2
+                            and cached_secs[0].get("question_count") == 5
+                            and not cached_sq
+                        )
+                        if cached_secs and not is_dummy_fallback and cached_sq:
+                            is_valid_cache = True
+
+                    if is_valid_cache:
                         base_blueprint = PaperBlueprint.model_validate(reference_paper.blueprint_json)
                         if request_data.total_marks and base_blueprint.total_marks != request_data.total_marks:
                             blueprint = self.blueprint_service.adapt_reference_blueprint(
@@ -258,15 +494,23 @@ class PaperGeneratorService:
                         else:
                             blueprint = base_blueprint
                     else:
-                        # Cache miss: fetch reference pages text & analyze via Gemini
+                        # Cache miss or invalid/empty blueprint: fetch reference pages text & analyze via Gemini
                         ref_pages = self.ref_paper_repo.get_reference_paper_pages(reference_paper.id)
                         pages_text = [p.text_content for p in ref_pages] if ref_pages else []
                         raw_base_blueprint = self.blueprint_service.analyze_reference_paper(
                             paper_pages_text=pages_text,
                             requested_total_marks=None,
                         )
-                        # Cache raw base blueprint in DB for all future paper generations
-                        self.ref_paper_repo.save_blueprint_json(reference_paper.id, raw_base_blueprint.model_dump())
+                        is_raw_fallback = (
+                            len(raw_base_blueprint.sections) == 1
+                            and raw_base_blueprint.sections[0].name == "Section A"
+                            and raw_base_blueprint.sections[0].marks_per_question == 2
+                            and raw_base_blueprint.sections[0].question_count == 5
+                            and not raw_base_blueprint.sample_questions
+                        )
+                        # Cache raw base blueprint in DB only if it's a valid analysis
+                        if not is_raw_fallback:
+                            self.ref_paper_repo.save_blueprint_json(reference_paper.id, raw_base_blueprint.model_dump())
 
                         if request_data.total_marks and raw_base_blueprint.total_marks != request_data.total_marks:
                             blueprint = self.blueprint_service.adapt_reference_blueprint(
@@ -289,14 +533,12 @@ class PaperGeneratorService:
                 subject_id=subject_id,
                 book_id=book.id,
                 selected_chapter_ids=selected_ch_ids,
-                topic_focus=request_data.topic_focus,
             )
 
             # 5. Generate Questions in ONE Single Gemini API Request with Validation
             generated_questions = self._generate_complete_paper(
                 blueprint=blueprint,
                 context_text=context_text,
-                topic_focus=request_data.topic_focus,
                 difficulty=request_data.difficulty,
                 generation_mode=request_data.generation_mode,
                 sample_questions=blueprint.sample_questions,
@@ -316,8 +558,27 @@ class PaperGeneratorService:
             )
 
             # 6. Save Questions to DB
+            token_usage = self.ai_service.get_session_usage() if hasattr(self.ai_service, "get_session_usage") else {}
+
+            # Embed token usage in blueprint_json so it is accessible in API response
+            bp_dict = blueprint.model_dump() if blueprint else {}
+            bp_dict["token_usage"] = token_usage
+
             self.paper_repo.save_questions(paper.id, generated_questions)
-            self.paper_repo.update_status(paper.id, "COMPLETED")
+            self.paper_repo.update_status(paper.id, "COMPLETED", blueprint_json=bp_dict)
+
+            # Prominently log and print token usage to console
+            token_banner = (
+                "\n" + "=" * 70 + "\n"
+                f"📊 [PAPER_TOKEN_USAGE] Paper generation finished for paper_id={paper.id}\n"
+                f"   • Total LLM Calls:   {token_usage.get('call_count', 0)}\n"
+                f"   • Prompt Tokens:     {token_usage.get('prompt_tokens', 0)}\n"
+                f"   • Completion Tokens: {token_usage.get('completion_tokens', 0)}\n"
+                f"   • Total Tokens Used: {token_usage.get('total_tokens', 0)}\n"
+                + "=" * 70 + "\n"
+            )
+            logger.info(token_banner.strip())
+            print(token_banner, flush=True)
 
             # Refresh paper from DB
             final_paper = self.paper_repo.get_paper(paper.id)
@@ -449,7 +710,7 @@ class PaperGeneratorService:
         subject_id: UUID,
         book_id: UUID,
         selected_chapter_ids: List[UUID],
-        topic_focus: Optional[str],
+        **kwargs,
     ) -> str:
         """
         Retrieve educational context strictly bounded to selected_chapter_ids.
@@ -460,15 +721,62 @@ class PaperGeneratorService:
         from app.models.document import DocumentChunk
         from sqlalchemy import or_, select
 
-        # Query all active chunks matching selected chapter_ids or chapter page ranges
+        # Query all active chapters matching selected chapter_ids
         chapters = self.paper_repo.db.query(Chapter).filter(Chapter.id.in_(selected_chapter_ids), Chapter.deleted_at.is_(None)).all()
-        conditions = [DocumentChunk.chapter_id.in_(selected_chapter_ids)]
-        for ch in chapters:
-            if ch.start_page is not None and ch.end_page is not None:
+
+        # Categorize chapters by presence of valid precomputed Exam Knowledge Digest
+        chapters_with_digest = []
+        chapters_needing_chunks = []
+        if chapters and not _is_mock(chapters):
+            for ch in chapters:
+                raw_digest = getattr(ch, "exam_digest", None)
+                if (
+                    raw_digest
+                    and not _is_mock(raw_digest)
+                    and isinstance(raw_digest, str)
+                    and len(raw_digest.strip()) >= 50
+                    and raw_digest.strip().lower() not in ("none", "null", "n/a", "empty")
+                ):
+                    chapters_with_digest.append(ch)
+                else:
+                    chapters_needing_chunks.append(ch)
+
+        # FAST PATH: All selected chapters have high-density exam digests precomputed
+        if chapters and len(chapters_with_digest) == len(chapters) and len(chapters_needing_chunks) == 0:
+            context_lines = []
+            ch_contexts_map: Dict[str, List[str]] = {}
+            for ch in chapters_with_digest:
+                ch_num = getattr(ch, "chapter_number", "")
+                ch_name = getattr(ch, "name", "")
+                header = f"[Source Exam Knowledge Digest | Chapter {ch_num}: {ch_name} | Chapter ID: {ch.id}]:"
+                digest_block = f"{header}\n{ch.exam_digest.strip()}"
+                context_lines.append(digest_block)
+                ch_contexts_map[str(ch.id)] = [digest_block]
+
+            self._chapter_contexts_map = {
+                cid: "\n\n".join(blocks) for cid, blocks in ch_contexts_map.items()
+            }
+            raw_context = "\n\n".join(context_lines)
+            logger.info(
+                f"Structured exam digest context retrieval: selected_chapter_ids={selected_chapter_ids}, "
+                f"chapter_count={len(chapters_with_digest)}, sent_char_count={len(raw_context)}, "
+                f"mode='EXAM_KNOWLEDGE_DIGEST'"
+            )
+            return raw_context
+
+        # HYBRID / FALLBACK PATH: Query chunks for chapters lacking exam_digest
+        target_chunk_chapters = chapters_needing_chunks if chapters_needing_chunks else chapters
+        target_ch_ids = [ch.id for ch in target_chunk_chapters] if target_chunk_chapters else selected_chapter_ids
+
+        conditions = [DocumentChunk.chapter_id.in_(target_ch_ids)]
+        for ch in target_chunk_chapters:
+            sp = getattr(ch, "start_page", None)
+            ep = getattr(ch, "end_page", None)
+            if sp is not None and ep is not None and not _is_mock(sp) and not _is_mock(ep):
                 conditions.append(
                     (DocumentChunk.book_id == ch.book_id) &
-                    (DocumentChunk.page_number >= ch.start_page) &
-                    (DocumentChunk.page_number <= ch.end_page)
+                    (DocumentChunk.page_number >= sp) &
+                    (DocumentChunk.page_number <= ep)
                 )
 
         stmt = (
@@ -484,10 +792,29 @@ class PaperGeneratorService:
         db_chunks = self.paper_repo.db.execute(stmt).scalars().all()
 
         context_lines = []
+        ch_contexts_map: Dict[str, List[str]] = {}
+
+        # First add digests for chapters that have them
+        for ch in chapters_with_digest:
+            ch_num = getattr(ch, "chapter_number", "")
+            ch_name = getattr(ch, "name", "")
+            header = f"[Source Exam Knowledge Digest | Chapter {ch_num}: {ch_name} | Chapter ID: {ch.id}]:"
+            digest_block = f"{header}\n{ch.exam_digest.strip()}"
+            context_lines.append(digest_block)
+            ch_contexts_map.setdefault(str(ch.id), []).append(digest_block)
+
+        # Then add chunks for remaining chapters
         if db_chunks:
             for idx, c in enumerate(db_chunks, start=1):
                 page_info = f" (Page {c.page_number})" if c.page_number else ""
-                context_lines.append(f"[Source Excerpt {idx}{page_info} | Chapter ID: {c.chapter_id}]:\n{c.content}")
+                excerpt = f"[Source Excerpt {idx}{page_info} | Chapter ID: {c.chapter_id}]:\n{c.content}"
+                context_lines.append(excerpt)
+                if c.chapter_id:
+                    ch_contexts_map.setdefault(str(c.chapter_id), []).append(excerpt)
+
+        self._chapter_contexts_map = {
+            cid: "\n\n".join(chunks) for cid, chunks in ch_contexts_map.items()
+        }
 
         if not context_lines:
             return "Educational source material context for selected chapters."
@@ -496,17 +823,273 @@ class PaperGeneratorService:
 
         logger.info(
             f"Full chapter context retrieval: selected_chapter_ids={selected_chapter_ids}, "
-            f"retrieved_chunk_count={len(db_chunks)}, sent_chunk_count={len(db_chunks)}, "
-            f"retrieved_char_count={len(raw_context)}, sent_char_count={len(raw_context)}, "
-            f"truncated=False, sampling_mode='NONE/FULL'"
+            f"digests_count={len(chapters_with_digest)}, retrieved_chunk_count={len(db_chunks)}, "
+            f"sent_char_count={len(raw_context)}, mode='HYBRID_OR_CHUNKS'"
         )
         return raw_context
+
+    @staticmethod
+    def _get_unfilled_slots(
+        planned_groups: List[Dict[str, Any]],
+        required_alts: List[Any],
+    ) -> List[Dict[str, Any]]:
+        """Returns an ordered list of unfilled slot descriptors across all planned groups."""
+        missing = []
+        for g in planned_groups:
+            for alt in required_alts:
+                if g["slots"].get(alt) is None:
+                    paired_q = g["slots"].get("a") if alt == "b" else (g["slots"].get("b") if alt == "a" else None)
+                    missing.append({
+                        "group_idx": g["group_idx"],
+                        "question_order": g["question_order"],
+                        "choice_group": g["choice_group"],
+                        "alternative_label": alt,
+                        "difficulty": g["difficulty"],
+                        "chapter_id": g.get("chapter_id"),
+                        "chapter_number": g.get("chapter_number"),
+                        "chapter_name": g.get("chapter_name"),
+                        "marks": g.get("marks"),
+                        "question_type": g.get("question_type"),
+                        "is_numerical": g.get("is_numerical", False),
+                        "paired_slot": paired_q,
+                    })
+        return missing
+
+    @staticmethod
+    def _assign_candidate_to_slot(
+        cand: Dict[str, Any],
+        planned_groups: List[Dict[str, Any]],
+        required_alts: List[Any],
+        targeted_missing_slots: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        """
+        Authoritatively assigns a validated candidate question into the planned_groups slot grid.
+        Preserves internal-choice pairing deterministically:
+        - If candidate has explicit choice_group/question_order and alternative_label that matches an empty slot, assigns there.
+        - If targeted_missing_slots is provided (recovery mode) and no explicit match, assigns to the next targeted slot.
+        - If initial generation mode (targeted_missing_slots is None) and no explicit match, assigns to the next empty 'a' slot.
+          (Never blindly pairs adjacent metadata-less candidates into 'b' slots of unrelated questions).
+        Returns True if assigned, False if no slot was available.
+        """
+        cg = cand.get("choice_group")
+        alt_raw = cand.get("alternative_label")
+        alt = str(alt_raw).strip().lower() if alt_raw is not None else None
+        q_ord = cand.get("question_order")
+
+        # 1. Try explicit matching by choice metadata
+        matched_group = None
+        if cg:
+            cg_str = str(cg).strip().lower()
+            for g in planned_groups:
+                g_cg = str(g["choice_group"]).lower() if g.get("choice_group") else ""
+                if g_cg and (g_cg == cg_str or g_cg == f"q{cg_str}" or cg_str == f"q{g_cg}"):
+                    matched_group = g
+                    break
+        if not matched_group and q_ord is not None:
+            try:
+                ord_int = int(q_ord)
+                for g in planned_groups:
+                    if g["question_order"] == ord_int:
+                        matched_group = g
+                        break
+            except (ValueError, TypeError):
+                pass
+
+        if matched_group:
+            if alt in required_alts and matched_group["slots"].get(alt) is None:
+                matched_group["slots"][alt] = cand
+                return True
+            if None in required_alts and matched_group["slots"].get(None) is None:
+                matched_group["slots"][None] = cand
+                return True
+
+        # 2. Recovery targeted slot fallback
+        if targeted_missing_slots is not None:
+            for target in targeted_missing_slots:
+                g_idx = target["group_idx"]
+                t_alt = target["alternative_label"]
+                g = planned_groups[g_idx]
+                if g["slots"].get(t_alt) is None:
+                    g["slots"][t_alt] = cand
+                    return True
+            return False
+
+        # 3. Initial generation fallback
+        if None in required_alts:
+            for g in planned_groups:
+                if g["slots"].get(None) is None:
+                    g["slots"][None] = cand
+                    return True
+            return False
+        else:
+            # For internal choice, map sequentially ONLY to 'a' slots if unassigned.
+            # Never blindly pair metadata-less candidate into 'b' slot.
+            for g in planned_groups:
+                if g["slots"].get("a") is None:
+                    g["slots"]["a"] = cand
+                    return True
+            return False
+
+    @staticmethod
+    def _partition_planned_sections_into_batches(
+        planned_sections: List[Dict[str, Any]],
+        max_batch_size: int = 100,
+    ) -> List[List[Dict[str, Any]]]:
+        """
+        Partitions planned question slots into batches of at most max_batch_size (100) questions,
+        clustering question slots chapter-by-chapter.
+        
+        This guarantees:
+        1. All questions for a given chapter are clustered together in the minimum number of batches.
+        2. Once a chapter's questions are completed in a batch, that chapter is not repeated in later batches.
+        3. Each batch's prompt context is strictly scoped to the chapters present in that batch.
+        4. Inside each batch, questions remain organized by section to match the schema expected by Gemini.
+        """
+        sec_lookup = {s_data["section_name"]: s_data["sec"] for s_data in planned_sections}
+        sec_order = [s_data["section_name"] for s_data in planned_sections]
+
+        # 1. Collect all groups from all sections
+        all_groups = []
+        for s_data in planned_sections:
+            for g in s_data["groups"]:
+                all_groups.append(g)
+
+        if not all_groups:
+            return [planned_sections]
+
+        # 2. Cluster groups chapter-by-chapter
+        def _ch_key(g: Dict[str, Any]) -> Tuple[int, str]:
+            c_num = g.get("chapter_number")
+            try:
+                c_num_int = int(c_num) if c_num is not None else 999999
+            except (ValueError, TypeError):
+                c_num_int = 999999
+            c_id = str(g.get("chapter_id") or "")
+            return (c_num_int, c_id)
+
+        unique_ch_keys = []
+        seen_keys = set()
+        for g in sorted(all_groups, key=lambda x: (_ch_key(x), x["question_order"])):
+            ck = _ch_key(g)
+            if ck not in seen_keys:
+                seen_keys.add(ck)
+                unique_ch_keys.append(ck)
+
+        ch_to_groups: Dict[Tuple[int, str], List[Dict[str, Any]]] = {ck: [] for ck in unique_ch_keys}
+        for g in all_groups:
+            ck = _ch_key(g)
+            ch_to_groups[ck].append(g)
+
+        for ck in unique_ch_keys:
+            ch_to_groups[ck].sort(key=lambda g: g["question_order"])
+
+        # 3. Fill batches chapter-by-chapter, counting individual question items (including alternatives)
+        batches: List[List[Dict[str, Any]]] = []
+        current_batch_groups: List[Dict[str, Any]] = []
+        current_batch_items = 0
+
+        def _group_item_count(g: Dict[str, Any]) -> int:
+            alts = g.get("required_alts")
+            if alts and isinstance(alts, list):
+                return len(alts)
+            return max(1, int(g.get("alts_per_q") or 1))
+
+        def _seal_batch(groups_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            batch_sections: List[Dict[str, Any]] = []
+            for s_name in sec_order:
+                matching = [g for g in groups_list if g["section_name"] == s_name]
+                if matching:
+                    batch_sections.append({
+                        "section_name": s_name,
+                        "sec": sec_lookup[s_name],
+                        "groups": matching,
+                    })
+            return batch_sections
+
+        for ck in unique_ch_keys:
+            c_groups = ch_to_groups[ck]
+            for g in c_groups:
+                g_count = _group_item_count(g)
+                if current_batch_groups and (current_batch_items + g_count > max_batch_size):
+                    batches.append(_seal_batch(current_batch_groups))
+                    current_batch_groups = []
+                    current_batch_items = 0
+
+                current_batch_groups.append(g)
+                current_batch_items += g_count
+
+                if current_batch_items >= max_batch_size:
+                    batches.append(_seal_batch(current_batch_groups))
+                    current_batch_groups = []
+                    current_batch_items = 0
+
+        if current_batch_groups:
+            batches.append(_seal_batch(current_batch_groups))
+
+        return batches if batches else [planned_sections]
+
+    @staticmethod
+    def _partition_missing_slots_into_batches(
+        missing_slots: List[Dict[str, Any]],
+        max_batch_size: int = 100,
+    ) -> List[List[Dict[str, Any]]]:
+        """
+        Partitions missing question slots for recovery into batches of at most max_batch_size (100)
+        slots, clustering slots chapter-by-chapter.
+        """
+        if not missing_slots:
+            return []
+
+        def _ch_key(s: Dict[str, Any]) -> Tuple[int, str]:
+            c_num = s.get("chapter_number")
+            try:
+                c_num_int = int(c_num) if c_num is not None else 999999
+            except (ValueError, TypeError):
+                c_num_int = 999999
+            c_id = str(s.get("chapter_id") or "")
+            return (c_num_int, c_id)
+
+        unique_ch_keys = []
+        seen_keys = set()
+        for s in sorted(missing_slots, key=lambda x: (_ch_key(x), x.get("question_order") or 0)):
+            ck = _ch_key(s)
+            if ck not in seen_keys:
+                seen_keys.add(ck)
+                unique_ch_keys.append(ck)
+
+        ch_to_slots: Dict[Tuple[int, str], List[Dict[str, Any]]] = {ck: [] for ck in unique_ch_keys}
+        for s in missing_slots:
+            ck = _ch_key(s)
+            ch_to_slots[ck].append(s)
+
+        for ck in unique_ch_keys:
+            ch_to_slots[ck].sort(key=lambda s: s.get("question_order") or 0)
+
+        batches: List[List[Dict[str, Any]]] = []
+        current_batch: List[Dict[str, Any]] = []
+
+        for ck in unique_ch_keys:
+            c_slots = ch_to_slots[ck]
+            idx = 0
+            while idx < len(c_slots):
+                space_left = max_batch_size - len(current_batch)
+                take = min(len(c_slots) - idx, space_left)
+                current_batch.extend(c_slots[idx : idx + take])
+                idx += take
+
+                if len(current_batch) >= max_batch_size:
+                    batches.append(current_batch)
+                    current_batch = []
+
+        if current_batch:
+            batches.append(current_batch)
+
+        return batches
 
     def _generate_complete_paper(
         self,
         blueprint: PaperBlueprint,
         context_text: str,
-        topic_focus: Optional[str],
         difficulty: DifficultyLevel,
         generation_mode: GenerationMode,
         sample_questions: Optional[List[Dict[str, Any]]],
@@ -514,213 +1097,450 @@ class PaperGeneratorService:
         med_pct: Optional[int] = None,
         hard_pct: Optional[int] = None,
         chapter_weightages_data: Optional[List[Dict[str, Any]]] = None,
+        **kwargs,
     ) -> List[Dict[str, Any]]:
         """
-        Generate the ENTIRE examination paper in ONE single Gemini API request.
-        Validates the returned structured response against the blueprint and assigns deterministic question numbers.
+        Generate the complete examination paper using deterministic blueprint matrix pre-planning,
+        one main Gemini generation request, and at most one unified whole-paper recovery call with scoped chapter context.
         """
         if not context_text or not context_text.strip():
             logger.warning("No educational source context retrieved; generating paper using general educational knowledge.")
             context_text = "Educational source material context for selected chapters."
 
-        prompt = self._build_complete_paper_prompt(
+        # 1. Deterministic Blueprint Slot Matrix Pre-Planning
+        planned_sections = self.preplan_blueprint_matrix(
             blueprint=blueprint,
-            context_text=context_text,
-            topic_focus=topic_focus,
             difficulty=difficulty,
-            generation_mode=generation_mode,
-            sample_questions=sample_questions,
+            chapter_weightages_data=chapter_weightages_data,
             easy_pct=easy_pct,
             med_pct=med_pct,
             hard_pct=hard_pct,
-            chapter_weightages_data=chapter_weightages_data,
         )
-
-        # Actual Gemini SDK Token Capacity Check (1,000,000 token limit minus output headroom allowance)
-        MAX_INPUT_TOKENS = 980_000
-        token_count = self.ai_service.count_tokens(prompt)
-        if token_count > MAX_INPUT_TOKENS:
-            logger.error(f"Complete-paper prompt tokens ({token_count}) exceed model context capacity ({MAX_INPUT_TOKENS}).")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Selected chapters contain too much educational content to generate this paper in a single model request. Please select fewer chapters and try again.",
-            )
-
-        try:
-            response_text = self.ai_service.generate_response(prompt, response_schema=GeminiCompletePaperSchema)
-        except TypeError:
-            response_text = self.ai_service.generate_response(prompt)
-        parsed = self._parse_json_safely(response_text)
-
-        raw_sections = parsed.get("sections", []) if isinstance(parsed, dict) else []
-        if not raw_sections and isinstance(parsed, dict) and "questions" in parsed:
-            raw_sections = [{"section_name": sec.name, "questions": parsed["questions"]} for sec in blueprint.sections]
-
-        all_validated_questions: List[Dict[str, Any]] = []
-        current_q_order = 1
 
         ch_num_to_item = {item["chapter_number"]: item for item in (chapter_weightages_data or []) if "chapter_number" in item}
         default_ch_item = chapter_weightages_data[0] if (chapter_weightages_data and len(chapter_weightages_data) > 0) else None
 
-        for sec in blueprint.sections:
-            alts_per_q = sec.alternatives_per_question if (sec.has_internal_choice and sec.alternatives_per_question > 1) else 1
-            needed_items = sec.question_count * alts_per_q
-            sec_ref = self._get_section_aligned_sample_questions(sec, sample_questions) if (generation_mode == GenerationMode.REFERENCE and sample_questions) else None
+        all_accepted_questions: List[Dict[str, Any]] = []
 
-            sec_name_clean = sec.name.strip().lower()
-            sec_data = next(
-                (
-                    s for s in raw_sections
-                    if isinstance(s, dict) and (
-                        str(s.get("section_name", "")).strip().lower() == sec_name_clean or
-                        str(s.get("section_name", "")).strip().lower() in sec_name_clean or
-                        sec_name_clean in str(s.get("section_name", "")).strip().lower()
-                    )
-                ),
-                None
+        def _norm_sec_str(val: Any) -> str:
+            return re.sub(r"[\s\-_]", "", str(val or "").lower())
+
+        # 2. Partition planned sections into batches (up to MAX_QUESTIONS_PER_CALL = 100 questions per LLM call)
+        batches = self._partition_planned_sections_into_batches(
+            planned_sections=planned_sections,
+            max_batch_size=MAX_QUESTIONS_PER_CALL,
+        )
+        total_items_to_gen = sum(
+            len(g.get("required_alts") or [None])
+            for s_data in planned_sections
+            for g in s_data["groups"]
+        )
+        logger.info(
+            f"Partitioned {total_items_to_gen} total question items (including internal choice alternatives) into "
+            f"{len(batches)} batch(es) (max {MAX_QUESTIONS_PER_CALL} items per LLM call)."
+        )
+
+        MAX_INPUT_TOKENS = 980_000
+
+        for batch_idx, batch_planned in enumerate(batches, start=1):
+            batch_all_groups = [g for bs in batch_planned for g in bs["groups"]]
+            batch_items_cnt = sum(len(g.get("required_alts") or [None]) for g in batch_all_groups)
+            logger.info(
+                f"Processing batch {batch_idx}/{len(batches)}: {len(batch_all_groups)} question groups, "
+                f"{batch_items_cnt} total question items (including alternatives)."
             )
-            candidates = sec_data.get("questions", []) if (sec_data and isinstance(sec_data, dict)) else []
-            if not candidates:
-                sec_idx = blueprint.sections.index(sec)
-                if sec_idx < len(raw_sections) and isinstance(raw_sections[sec_idx], dict):
-                    candidates = raw_sections[sec_idx].get("questions", [])
+            batch_ch_ids = {str(g["chapter_id"]) for g in batch_all_groups if g.get("chapter_id")}
 
-            sec_questions = []
-            sec_difficulties = self._calculate_difficulty_distribution(difficulty, sec.question_count, easy_pct, med_pct, hard_pct)
+            if hasattr(self, "_chapter_contexts_map") and self._chapter_contexts_map and batch_ch_ids:
+                scoped_parts = [
+                    self._chapter_contexts_map[cid]
+                    for cid in batch_ch_ids
+                    if cid in self._chapter_contexts_map
+                ]
+                batch_context = "\n\n".join(scoped_parts) if scoped_parts else context_text
+            else:
+                batch_context = context_text
 
-            for cand in candidates:
-                if len(sec_questions) >= needed_items:
-                    break
+            if not batch_context or not batch_context.strip():
+                batch_context = context_text or "Educational source material context for selected chapters."
 
-                if self._validate_question_structure(cand, sec, existing_sec_questions=sec_questions):
-                    if not self._is_duplicate_question(cand, all_validated_questions + sec_questions):
-                        # Map chapter attribution
-                        cand_ch_num = cand.get("chapter_number")
-                        matched_item = None
-                        if cand_ch_num and cand_ch_num in ch_num_to_item:
-                            matched_item = ch_num_to_item[cand_ch_num]
-                        elif default_ch_item:
-                            matched_item = default_ch_item
+            # B. Scoped chapter weightages for this batch
+            if chapter_weightages_data:
+                batch_ch_weightages = [
+                    item for item in chapter_weightages_data
+                    if str(item.get("chapter_id")) in batch_ch_ids or str(item.get("chapter_number")) in batch_ch_ids
+                ]
+                if not batch_ch_weightages:
+                    batch_ch_weightages = chapter_weightages_data
+            else:
+                batch_ch_weightages = None
 
-                        if matched_item:
-                            cand["chapter_id"] = matched_item.get("chapter_id")
-                            cand["chapter_number"] = matched_item.get("chapter_number")
+            # C. Construct batch blueprint
+            batch_sections = []
+            for bs in batch_planned:
+                sec = bs["sec"]
+                grp_cnt = len(bs["groups"])
+                sec_copy = SectionBlueprint(
+                    name=bs["section_name"],
+                    question_type=sec.question_type,
+                    question_count=grp_cnt,
+                    marks_per_question=sec.marks_per_question,
+                    total_section_marks=grp_cnt * sec.marks_per_question,
+                    has_internal_choice=sec.has_internal_choice,
+                    alternatives_per_question=sec.alternatives_per_question,
+                    numerical_question_count=sum(1 for g in bs["groups"] if g.get("is_numerical")),
+                    reasoning_style=getattr(sec, "reasoning_style", None),
+                    section_description=getattr(sec, "section_description", None),
+                )
+                batch_sections.append(sec_copy)
 
-                        if generation_mode == GenerationMode.CUSTOM or not sec_ref:
-                            cand["source_type"] = "AI_GENERATED"
-                        else:
-                            cand_st = str(cand.get("source_type", "")).upper()
-                            cand_marks = sec.marks_per_question
+            batch_total_marks = sum(s.total_section_marks for s in batch_sections)
+            batch_bp = PaperBlueprint(
+                total_marks=batch_total_marks,
+                sections=batch_sections,
+                sample_questions=sample_questions or [],
+            )
 
-                            # Dual-Cap Reference Reuse Constraints:
-                            # 1. Overall paper limit (max 20% of total marks or at least 1 question item)
-                            max_overall_reused_marks = max(sec.marks_per_question, int(0.20 * blueprint.total_marks))
-                            max_overall_variation_marks = max(sec.marks_per_question, int(0.20 * blueprint.total_marks))
+            # D. Build prompt for this batch
+            prompt = self._build_complete_paper_prompt(
+                blueprint=batch_bp,
+                context_text=batch_context,
+                difficulty=difficulty,
+                generation_mode=generation_mode,
+                sample_questions=sample_questions,
+                easy_pct=easy_pct,
+                med_pct=med_pct,
+                hard_pct=hard_pct,
+                chapter_weightages_data=batch_ch_weightages,
+                planned_sections=batch_planned,
+            )
 
-                            cur_total_reused_marks = sum(
-                                q.get("marks", sec.marks_per_question)
-                                for q in (all_validated_questions + sec_questions)
-                                if q.get("source_type") == "REFERENCE_REUSED"
-                            )
-                            cur_total_variation_marks = sum(
-                                q.get("marks", sec.marks_per_question)
-                                for q in (all_validated_questions + sec_questions)
-                                if q.get("source_type") == "REFERENCE_VARIATION"
-                            )
+            # E. Token capacity check
+            token_count = self.ai_service.count_tokens(
+                prompt,
+                system_instruction=PAPER_GENERATION_SYSTEM_INSTRUCTION,
+            )
+            if token_count > MAX_INPUT_TOKENS:
+                logger.error(f"Batch {batch_idx} prompt tokens ({token_count}) exceed model context capacity ({MAX_INPUT_TOKENS}).")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Selected chapters contain too much educational content to generate this paper in a single model request. Please select fewer chapters and try again.",
+                )
 
-                            # 2. Per-chapter weightage cap (cannot exceed chapter allocated marks)
-                            ch_alloc_marks = matched_item.get("allocated_marks", blueprint.total_marks) if matched_item else blueprint.total_marks
-                            cur_ch_reused_marks = sum(
-                                q.get("marks", sec.marks_per_question)
-                                for q in (all_validated_questions + sec_questions)
-                                if q.get("chapter_id") == (matched_item["chapter_id"] if matched_item else None)
-                                and q.get("source_type") == "REFERENCE_REUSED"
-                            )
-                            cur_ch_variation_marks = sum(
-                                q.get("marks", sec.marks_per_question)
-                                for q in (all_validated_questions + sec_questions)
-                                if q.get("chapter_id") == (matched_item["chapter_id"] if matched_item else None)
-                                and q.get("source_type") == "REFERENCE_VARIATION"
-                            )
+            # F. Call Gemini
+            try:
+                response_text = self.ai_service.generate_response(
+                    prompt,
+                    system_instruction=PAPER_GENERATION_SYSTEM_INSTRUCTION,
+                    response_schema=GeminiCompletePaperSchema,
+                )
+            except TypeError:
+                try:
+                    response_text = self.ai_service.generate_response(
+                        prompt,
+                        system_instruction=PAPER_GENERATION_SYSTEM_INSTRUCTION,
+                    )
+                except TypeError:
+                    response_text = self.ai_service.generate_response(prompt)
+            parsed = self._parse_json_safely(response_text)
 
-                            if cand_st == "REFERENCE_REUSED":
-                                if (cur_total_reused_marks + cand_marks > max_overall_reused_marks) or (cur_ch_reused_marks + cand_marks > ch_alloc_marks):
-                                    logger.info(
-                                        f"REFERENCE_REUSED exceeds dual-cap (overall {cur_total_reused_marks}/{max_overall_reused_marks} marks, "
-                                        f"chapter {cur_ch_reused_marks}/{ch_alloc_marks} marks). Converting candidate to AI_GENERATED."
-                                    )
-                                    cand["source_type"] = "AI_GENERATED"
-                                else:
-                                    cand["source_type"] = "REFERENCE_REUSED"
-                            elif cand_st == "REFERENCE_VARIATION":
-                                if (cur_total_variation_marks + cand_marks > max_overall_variation_marks) or (cur_ch_variation_marks + cand_marks > ch_alloc_marks):
-                                    logger.info(
-                                        f"REFERENCE_VARIATION exceeds dual-cap (overall {cur_total_variation_marks}/{max_overall_variation_marks} marks, "
-                                        f"chapter {cur_ch_variation_marks}/{ch_alloc_marks} marks). Converting candidate to AI_GENERATED."
-                                    )
-                                    cand["source_type"] = "AI_GENERATED"
-                                else:
-                                    cand["source_type"] = "REFERENCE_VARIATION"
-                            else:
+            raw_sections = parsed.get("sections", []) if isinstance(parsed, dict) else []
+            if not raw_sections and isinstance(parsed, dict) and "questions" in parsed:
+                raw_sections = [{"section_name": sec.name, "questions": parsed["questions"]} for sec in batch_bp.sections]
+
+            # G. Ingest candidates for this batch's planned sections
+            for s_idx, s_data in enumerate(batch_planned):
+                sec = s_data["sec"]
+                planned_groups = s_data["groups"]
+                alts_per_q = sec.alternatives_per_question if (sec.has_internal_choice and sec.alternatives_per_question > 1) else 1
+                required_alts = planned_groups[0]["required_alts"] if planned_groups else [None]
+                sec_ref = self._get_section_aligned_sample_questions(sec, sample_questions) if (generation_mode == GenerationMode.REFERENCE and sample_questions) else None
+
+                sec_norm = _norm_sec_str(sec.name)
+                sec_resp = next(
+                    (
+                        s for s in raw_sections
+                        if isinstance(s, dict) and (
+                            _norm_sec_str(s.get("section_name", "")) == sec_norm or
+                            _norm_sec_str(s.get("section_name", "")) in sec_norm or
+                            sec_norm in _norm_sec_str(s.get("section_name", ""))
+                        )
+                    ),
+                    None
+                )
+                candidates = sec_resp.get("questions", []) if (sec_resp and isinstance(sec_resp, dict)) else []
+                if not candidates and s_idx < len(raw_sections) and isinstance(raw_sections[s_idx], dict):
+                    candidates = raw_sections[s_idx].get("questions", [])
+
+                for cand in candidates:
+                    unfilled = self._get_unfilled_slots(planned_groups, required_alts)
+                    if not unfilled:
+                        break
+
+                    current_sec_qs = [
+                        g["slots"][alt]
+                        for g in planned_groups
+                        for alt in required_alts
+                        if g["slots"].get(alt) is not None
+                    ]
+                    if self._validate_question_structure(cand, sec, existing_sec_questions=current_sec_qs):
+                        if not self._is_duplicate_question(cand, all_accepted_questions):
+                            if getattr(sec, "reasoning_style", None):
+                                cand["reasoning_style"] = cand.get("reasoning_style") or sec.reasoning_style
+                            cand_ch_num = cand.get("chapter_number")
+                            matched_item = None
+                            if cand_ch_num and cand_ch_num in ch_num_to_item:
+                                matched_item = ch_num_to_item[cand_ch_num]
+                            elif default_ch_item:
+                                matched_item = default_ch_item
+
+                            if matched_item:
+                                cand["chapter_id"] = matched_item.get("chapter_id")
+                                cand["chapter_number"] = matched_item.get("chapter_number")
+
+                            if generation_mode == GenerationMode.CUSTOM or not sec_ref:
                                 cand["source_type"] = "AI_GENERATED"
+                            else:
+                                cand_st = str(cand.get("source_type", "AI_GENERATED")).strip().upper()
+                                cand["source_type"] = cand_st if cand_st in ("REFERENCE_REUSED", "REFERENCE_VARIATION") else "AI_GENERATED"
 
-                        sec_questions.append(cand)
+                            assigned = self._assign_candidate_to_slot(
+                                cand=cand,
+                                planned_groups=planned_groups,
+                                required_alts=required_alts,
+                                targeted_missing_slots=None,
+                            )
+                            if assigned:
+                                all_accepted_questions.append(cand)
 
-            # Supplemental Batch Recovery Loop for Large Question Sections
-            MAX_RECOVERY_ATTEMPTS = 5
-            recovery_attempt = 0
+        # Helper function to collect unfilled slots across ALL sections
+        def _get_all_unfilled_slots() -> List[Dict[str, Any]]:
+            missing_slots = []
+            for s_data in planned_sections:
+                sec = s_data["sec"]
+                for g in s_data["groups"]:
+                    for alt in g["required_alts"]:
+                        if g["slots"].get(alt) is None:
+                            paired_q = g["slots"].get("a") if alt == "b" else (g["slots"].get("b") if alt == "a" else None)
+                            missing_slots.append({
+                                "section_name": s_data["section_name"],
+                                "sec": sec,
+                                "group": g,
+                                "group_idx": g["group_idx"],
+                                "question_order": g["question_order"],
+                                "choice_group": g["choice_group"],
+                                "alternative_label": alt,
+                                "difficulty": g["difficulty"],
+                                "chapter_id": g.get("chapter_id"),
+                                "chapter_number": g.get("chapter_number"),
+                                "chapter_name": g.get("chapter_name"),
+                                "question_type": g["question_type"],
+                                "marks": g["marks"],
+                                "is_numerical": g.get("is_numerical", False),
+                                "reasoning_style": getattr(sec, "reasoning_style", None),
+                                "paired_slot": paired_q,
+                            })
+            return missing_slots
 
-            while len(sec_questions) < needed_items and recovery_attempt < MAX_RECOVERY_ATTEMPTS:
-                recovery_attempt += 1
-                missing_cnt = needed_items - len(sec_questions)
-                logger.info(
-                    f"Supplemental recovery attempt {recovery_attempt}/{MAX_RECOVERY_ATTEMPTS} for section '{sec.name}': "
-                    f"got {len(sec_questions)}/{needed_items} items, requesting {missing_cnt} remaining questions."
-                )
+        # 3. Unified Whole-Paper Supplemental Recovery Loop (Max 5 Attempts, Batched up to MAX_QUESTIONS_PER_CALL)
+        MAX_UNIFIED_RECOVERY_ATTEMPTS = 5
+        recovery_attempt = 0
+        rejected_recovery_candidates: List[str] = []
 
-                sec_numerical_target = sec.numerical_question_count
-                current_numerical_cnt = sum(
-                    1 for q in sec_questions
-                    if q.get("is_numerical") is True or q.get("numerical_values") or q.get("question_type") == "NUMERICAL"
-                )
-                remaining_numerical_cnt = max(0, sec_numerical_target - current_numerical_cnt)
+        while recovery_attempt < MAX_UNIFIED_RECOVERY_ATTEMPTS:
+            all_missing = _get_all_unfilled_slots()
+            if not all_missing:
+                break
 
-                num_instruction = ""
-                if remaining_numerical_cnt > 0:
-                    num_instruction = f"\n- NUMERICAL REQUIREMENT: At least {remaining_numerical_cnt} of these {missing_cnt} questions MUST be calculation/numerical problems (set is_numerical: true)."
+            recovery_attempt += 1
+            missing_cnt = len(all_missing)
+            logger.info(
+                f"Unified whole-paper recovery attempt {recovery_attempt}/{MAX_UNIFIED_RECOVERY_ATTEMPTS}: "
+                f"{missing_cnt} missing slot(s) across all sections."
+            )
 
-                existing_texts = [q.get("question_text", "") for q in (all_validated_questions + sec_questions)]
-                existing_summary = json.dumps(existing_texts[-30:], ensure_ascii=False) if existing_texts else "None"
+            # Partition missing slots into chapter-clustered batches of <= 100 questions
+            recovery_batches = self._partition_missing_slots_into_batches(
+                missing_slots=all_missing,
+                max_batch_size=MAX_QUESTIONS_PER_CALL,
+            )
 
-                fill_prompt = f"""You are an examination author. Generate EXACTLY {missing_cnt} additional unique, non-repetitive questions for section '{sec.name}'.
+            for batch_missing in recovery_batches:
+                batch_missing_cnt = len(batch_missing)
+                num_candidates_to_request = batch_missing_cnt + 1 if batch_missing_cnt <= 2 else batch_missing_cnt
 
-SECTION BLUEPRINT:
-- Question Type: {sec.question_type.value}
-- Marks Per Question: {sec.marks_per_question}
-- Target Difficulty: {difficulty.value}{num_instruction}
+                # Scoped Context: Send context strictly for chapters with missing slots in this batch!
+                needed_ch_ids = {str(s["chapter_id"]) for s in batch_missing if s.get("chapter_id")}
+                if hasattr(self, "_chapter_contexts_map") and self._chapter_contexts_map and needed_ch_ids:
+                    scoped_chunks = [
+                        self._chapter_contexts_map[cid]
+                        for cid in needed_ch_ids
+                        if cid in self._chapter_contexts_map
+                    ]
+                    recovery_context = "\n\n".join(scoped_chunks) if scoped_chunks else context_text
+                else:
+                    recovery_context = context_text
 
+                # Group missing slots by section to provide rich pedagogical context
+                sections_missing_map: Dict[str, List[Dict[str, Any]]] = {}
+                for s_info in batch_missing:
+                    sections_missing_map.setdefault(s_info["section_name"], []).append(s_info)
+
+                sections_detail_blocks = []
+                for sec_name, sec_missing_slots in sections_missing_map.items():
+                    first_slot = sec_missing_slots[0]
+                    sec = first_slot["sec"]
+                    r_style = getattr(sec, "reasoning_style", None) or first_slot.get("reasoning_style")
+                    sec_desc = getattr(sec, "section_description", None)
+
+                    style_str = f"- Dominant Reasoning Style: {r_style}\n" if r_style else ""
+                    desc_str = f"- Section Pedagogical Description: {sec_desc}\n" if sec_desc else ""
+                    pedagogical_rule = ""
+                    if r_style:
+                        if any(kw in r_style for kw in ("SCENARIO", "CASE", "VIGNETTE", "APPLIED", "SITUATION")):
+                            pedagogical_rule = (
+                                f"- STRICT PEDAGOGICAL REQUIREMENT: Every replacement question for this section MUST be grounded in a realistic, "
+                                f"contextual case scenario, vignette, or applied situation (reasoning style: {r_style}). "
+                                f"Do NOT ask generic, bare textbook recall questions. Each question item MUST include "
+                                f"'reasoning_style': '{r_style}'.\n"
+                            )
+                        else:
+                            pedagogical_rule = (
+                                f"- STRICT PEDAGOGICAL REQUIREMENT: Every replacement question for this section MUST strictly embody the reasoning style "
+                                f"'{r_style}'. Do NOT deviate into other unrelated cognitive modes. Each question item MUST include "
+                                f"'reasoning_style': '{r_style}'.\n"
+                            )
+
+                    sec_desc_lower = str(sec_desc or "").lower()
+                    has_ar = "assertion" in sec_desc_lower or "reason" in sec_desc_lower
+                    sec_entry_match = next((s for s in planned_sections if _norm_sec_str(s["section_name"]) == _norm_sec_str(sec_name)), None)
+                    total_mcqs_in_sec = len(sec_entry_match["groups"]) if sec_entry_match else len(sec_missing_slots)
+                    ar_start_q = max(1, total_mcqs_in_sec - 1) if has_ar else 999999
+                    ar_rule = ""
+                    if has_ar:
+                        ar_rule = (
+                            f"- Question Format Distribution: For MCQ slots in this section, standard multiple-choice questions MUST be used for earlier questions (up to Question {ar_start_q - 1}). "
+                            f"ONLY the final 2 questions (Question {ar_start_q} onwards) may be Assertion-Reason items (formatted strictly as 'Assertion (A): ...\\nReason (R): ...'). "
+                            "Do NOT make all questions Assertion-Reason!\n"
+                        )
+
+                    slot_lines = []
+                    for s_info in sec_missing_slots:
+                        q_type = s_info["question_type"]
+                        marks = s_info["marks"]
+                        diff = s_info["difficulty"]
+                        ch_num = s_info.get("chapter_number")
+                        ch_name = s_info.get("chapter_name")
+                        if ch_num and ch_name:
+                            ch_str = f"Chapter {ch_num} (\"{ch_name}\")"
+                        elif ch_num:
+                            ch_str = f"Chapter {ch_num}"
+                        else:
+                            ch_str = "Designated Chapter"
+
+                        is_num_str = " | Numerical Calculation" if s_info.get("is_numerical") else ""
+                        cg = s_info["choice_group"]
+                        alt = s_info["alternative_label"]
+                        paired_q = s_info.get("paired_slot")
+                        q_ord = s_info.get("question_order") or 0
+
+                        format_str = ""
+                        if q_type == "MCQ" and has_ar:
+                            if q_ord < ar_start_q:
+                                format_str = " | Format: Standard MCQ (NOT Assertion-Reason)"
+                            else:
+                                format_str = " | Format: Assertion-Reasoning"
+
+                        if paired_q and cg and alt:
+                            p_text = str(paired_q.get("question_text", "")).strip()
+                            slot_lines.append(
+                                f"  * Choice Group '{cg}', Alternative '{alt}': {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}{format_str}. "
+                                f"Must be an internal choice alternative paired with: \"{p_text}\". "
+                                f"IMPORTANT: Must test a DIFFERENT formula or distinct educational concept from {ch_str} so it is not duplicate or repetitive."
+                            )
+                        elif cg and alt:
+                            slot_lines.append(
+                                f"  * Choice Group '{cg}', Alternative '{alt}': {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}{format_str}."
+                            )
+                        else:
+                            slot_lines.append(
+                                f"  * Question {q_ord}: {ch_str} | Difficulty: {diff} | Marks: {marks}{is_num_str}{format_str}."
+                            )
+
+                    slots_str = "\n".join(slot_lines)
+                    sec_q_type = getattr(sec.question_type, "value", sec.question_type) if hasattr(sec, "question_type") else first_slot["question_type"]
+                    sections_detail_blocks.append(
+                        f"SECTION: '{sec_name}'\n"
+                        f"- Question Type: {sec_q_type}\n"
+                        f"{style_str}{desc_str}{pedagogical_rule}{ar_rule}- Missing Question Slots to Generate:\n{slots_str}"
+                    )
+
+                slots_detail_str = "\n\n".join(sections_detail_blocks)
+
+                existing_texts = [
+                    str(q.get("question_text", "")).strip()
+                    for q in all_accepted_questions
+                    if q and q.get("question_text")
+                ]
+                existing_summary = json.dumps(existing_texts, ensure_ascii=False) if existing_texts else "None"
+
+                rejected_feedback_str = ""
+                if rejected_recovery_candidates:
+                    unique_rejected = list(dict.fromkeys(r.strip() for r in rejected_recovery_candidates if r and r.strip()))[-15:]
+                    rejected_feedback_str = f"""
+STRICT REJECTION FEEDBACK (DO NOT REPEAT OR GENERATE QUESTIONS SIMILAR TO THESE REJECTED CANDIDATES):
+{json.dumps(unique_rejected, ensure_ascii=False)}
+"""
+
+                diversity_directive = ""
+                if recovery_attempt >= 2 and batch_missing_cnt <= 3:
+                    diversity_directive = """
+CRITICAL DIVERSITY REQUIREMENT:
+A previous attempt to fill this slot generated a duplicate question.
+You MUST choose a fresh, DIFFERENT concept, formula, or subtopic from the selected material that has NOT been tested anywhere in this paper.
+"""
+
+                fill_prompt = f"""Generate {num_candidates_to_request} unique, non-repetitive candidate questions to fill the {batch_missing_cnt} missing slot(s) across the examination paper.
+
+TARGET MISSING SLOTS:
+{slots_detail_str}
+{diversity_directive}
 SOURCE EDUCATIONAL MATERIAL:
-{context_text[:100000]}
+{recovery_context}
 
 EXCLUSION RULE:
 Do NOT repeat or generate questions semantically equivalent to any of these previously generated questions:
 {existing_summary}
-
+{rejected_feedback_str}
 Return ONLY valid JSON matching this schema:
 {{
   "questions": [
     {{
+      "section_name": "<name of the section this question belongs to>",
+      "choice_group": "<e.g. Q1, Q2 or null>",
+      "alternative_label": "<'a' or 'b' if internal choice, else null>",
+      "question_order": <integer question order or null>,
       "question_text": "...",
-      "mcq_options": ["A. ...", "B. ...", "C. ...", "D. ..."],
-      "correct_answer": "...",
-      "expected_answer": "...",
-      "solution_explanation": "...",
+      "question_type": "<MCQ | VERY_SHORT_ANSWER | SHORT_ANSWER | LONG_ANSWER | NUMERICAL as specified for the slot>",
+      "marks": <marks per question as specified for the slot>,
+      "chapter_number": <1-based integer chapter number covering this question from the selected chapters>,
+      "difficulty": "<EASY, MEDIUM, or HARD as specified for the slot>",
+      "is_numerical": <true | false>,
+      "reasoning_style": "<Reasoning style matching section requirement, e.g. SCENARIO_BASED, DIRECT_RECALL, or custom style>",
+      "section_description": "<Brief pedagogical description matching section focus or null>",
+      "mcq_options": ["A. ...", "B. ...", "C. ...", "D. ..."] or null,
       "visual": null
     }}
   ]
 }}"""
                 try:
-                    fill_response_text = self.ai_service.generate_response(fill_prompt)
+                    try:
+                        fill_response_text = self.ai_service.generate_response(
+                            fill_prompt,
+                            system_instruction=PAPER_RECOVERY_SYSTEM_INSTRUCTION,
+                        )
+                    except TypeError:
+                        fill_response_text = self.ai_service.generate_response(fill_prompt)
                     fill_parsed = self._parse_json_safely(fill_response_text)
                     fill_candidates = []
                     if isinstance(fill_parsed, dict):
@@ -732,53 +1552,136 @@ Return ONLY valid JSON matching this schema:
                                     fill_candidates.extend(s["questions"])
 
                     for cand in fill_candidates:
-                        if len(sec_questions) >= needed_items:
-                            break
-                        if self._validate_question_structure(cand, sec, existing_sec_questions=sec_questions):
-                            if not self._is_duplicate_question(cand, all_validated_questions + sec_questions):
-                                if generation_mode == GenerationMode.REFERENCE:
-                                    cand_st = str(cand.get("source_type", "")).upper()
-                                    if cand_st in ["REFERENCE_REUSED", "REFERENCE_VARIATION"]:
-                                        cand["source_type"] = cand_st
-                                    else:
-                                        cand["source_type"] = "AI_GENERATED"
-                                else:
-                                    cand["source_type"] = "AI_GENERATED"
-                                sec_questions.append(cand)
+                        if not isinstance(cand, dict):
+                            continue
+                        cand_sec_name = str(cand.get("section_name", "")).strip()
+                        target_sec_data = None
+                        if cand_sec_name:
+                            target_sec_data = next(
+                                (
+                                    s for s in planned_sections
+                                    if _norm_sec_str(s["section_name"]) == _norm_sec_str(cand_sec_name)
+                                    or _norm_sec_str(cand_sec_name) in _norm_sec_str(s["section_name"])
+                                    or _norm_sec_str(s["section_name"]) in _norm_sec_str(cand_sec_name)
+                                ),
+                                None
+                            )
+                        if not target_sec_data:
+                            current_missing = _get_all_unfilled_slots()
+                            if current_missing:
+                                target_sec_name = current_missing[0]["section_name"]
+                                target_sec_data = next((s for s in planned_sections if s["section_name"] == target_sec_name), None)
+
+                        if not target_sec_data:
+                            continue
+
+                        sec = target_sec_data["sec"]
+                        planned_groups = target_sec_data["groups"]
+                        required_alts = planned_groups[0]["required_alts"] if planned_groups else [None]
+
+                        missing_in_sec = self._get_unfilled_slots(planned_groups, required_alts)
+                        if not missing_in_sec:
+                            continue
+
+                        current_sec_qs = [
+                            g["slots"][alt]
+                            for g in planned_groups
+                            for alt in required_alts
+                            if g["slots"].get(alt) is not None
+                        ]
+                        cand_q_text = str(cand.get("question_text", "")).strip()
+
+                        if self._validate_question_structure(cand, sec, existing_sec_questions=current_sec_qs):
+                            if not self._is_duplicate_question(cand, all_accepted_questions):
+                                cand_ch_num = cand.get("chapter_number")
+                                matched_item = None
+                                if cand_ch_num and cand_ch_num in ch_num_to_item:
+                                    matched_item = ch_num_to_item[cand_ch_num]
+                                elif default_ch_item:
+                                    matched_item = default_ch_item
+
+                                if matched_item:
+                                    cand["chapter_id"] = matched_item.get("chapter_id")
+                                    cand["chapter_number"] = matched_item.get("chapter_number")
+
+                                cand["source_type"] = "AI_GENERATED"
+
+                                assigned = self._assign_candidate_to_slot(
+                                    cand=cand,
+                                    planned_groups=planned_groups,
+                                    required_alts=required_alts,
+                                    targeted_missing_slots=missing_in_sec,
+                                )
+                                if assigned:
+                                    all_accepted_questions.append(cand)
+                            else:
+                                if cand_q_text:
+                                    rejected_recovery_candidates.append(cand_q_text)
+                        else:
+                            if cand_q_text:
+                                rejected_recovery_candidates.append(cand_q_text)
                 except Exception as fill_err:
-                    logger.warning(f"Supplemental recovery attempt {recovery_attempt} for section '{sec.name}' failed: {fill_err}")
+                    logger.warning(f"Unified recovery attempt {recovery_attempt} batch failed: {fill_err}")
 
-            if len(sec_questions) < needed_items:
-                logger.error(
-                    f"Complete-paper generation section validation failed for section '{sec.name}': "
-                    f"needed {needed_items} items, got {len(sec_questions)} after {MAX_RECOVERY_ATTEMPTS} recovery attempts."
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Generated paper section '{sec.name}' returned fewer valid questions ({len(sec_questions)}) than requested ({needed_items}). Please try again.",
-                )
+        # 4. Deterministic Fallback Completion (Guarantees zero unhandled 400 errors)
+        remaining_missing = _get_all_unfilled_slots()
+        for m in remaining_missing:
+            g = m["group"]
+            alt = m["alternative_label"]
+            sec = m["sec"]
+            logger.info(
+                f"Populating fallback question for unfilled slot in section '{sec.name}', "
+                f"order={m['question_order']}, choice_group={m['choice_group']}, alt={alt}"
+            )
+            fallback = self._create_fallback_question(
+                sec=sec,
+                order=m["question_order"],
+                difficulty=m["difficulty"],
+                choice_group=m["choice_group"],
+                alternative_label=alt,
+            )
+            fallback["chapter_id"] = m.get("chapter_id")
+            fallback["chapter_number"] = m.get("chapter_number")
+            g["slots"][alt] = fallback
+            all_accepted_questions.append(fallback)
 
-            # Randomly shuffle candidates to guarantee REFERENCE_REUSED items are scattered non-sequentially
-            if generation_mode == GenerationMode.REFERENCE:
-                import random
-                random.shuffle(sec_questions)
+        # 5. Flatten Planned Matrix into Ordered Examination Questions
+        all_validated_questions: List[Dict[str, Any]] = []
+        current_q_order = 1
+        for s_data in planned_sections:
+            sec = s_data["sec"]
+            groups = s_data["groups"]
+            alts_per_q = sec.alternatives_per_question if (sec.has_internal_choice and sec.alternatives_per_question > 1) else 1
+            required_alts = groups[0]["required_alts"] if groups else [None]
 
-            # Assign sequential question numbers and metadata to the scattered candidates
-            for cand_idx, cand in enumerate(sec_questions):
-                group_idx = cand_idx // alts_per_q
-                target_diff = sec_difficulties[group_idx] if group_idx < len(sec_difficulties) else "MEDIUM"
-                order = current_q_order + group_idx
-                cand["question_order"] = order
-                cand["section_name"] = sec.name
-                cand["question_type"] = sec.question_type.value
-                cand["marks"] = sec.marks_per_question
-                cand["difficulty"] = target_diff
-                if alts_per_q > 1:
-                    cand["choice_group"] = f"Q{order}"
-                    cand["alternative_label"] = chr(ord("a") + (cand_idx % alts_per_q))
-                else:
-                    cand["choice_group"] = None
-                    cand["alternative_label"] = None
+            sec_questions = []
+            for new_idx, g in enumerate(groups):
+                order = current_q_order + new_idx
+                g_choice = f"Q{order}" if alts_per_q > 1 else None
+                for alt in required_alts:
+                    cand = g["slots"][alt]
+                    cand["question_order"] = order
+                    cand["section_name"] = sec.name
+                    cand["question_type"] = sec.question_type.value
+                    cand["marks"] = sec.marks_per_question
+                    cand["difficulty"] = g["difficulty"]
+                    if getattr(sec, "reasoning_style", None):
+                        cand["reasoning_style"] = cand.get("reasoning_style") or sec.reasoning_style
+                    if getattr(sec, "section_description", None):
+                        cand["section_description"] = cand.get("section_description") or sec.section_description
+                    if g.get("chapter_id"):
+                        cand["chapter_id"] = g["chapter_id"]
+                    if g.get("chapter_number"):
+                        cand["chapter_number"] = g["chapter_number"]
+                    if sec.question_type.value != "MCQ":
+                        cand["mcq_options"] = None
+                    if alts_per_q > 1:
+                        cand["choice_group"] = g_choice
+                        cand["alternative_label"] = alt
+                    else:
+                        cand["choice_group"] = None
+                        cand["alternative_label"] = None
+                    sec_questions.append(cand)
 
             all_validated_questions.extend(sec_questions)
             current_q_order += sec.question_count
@@ -842,7 +1745,6 @@ Return ONLY valid JSON matching this schema:
         self,
         blueprint: PaperBlueprint,
         context_text: str,
-        topic_focus: Optional[str],
         difficulty: DifficultyLevel,
         generation_mode: GenerationMode,
         sample_questions: Optional[List[Dict[str, Any]]] = None,
@@ -850,6 +1752,8 @@ Return ONLY valid JSON matching this schema:
         med_pct: Optional[int] = None,
         hard_pct: Optional[int] = None,
         chapter_weightages_data: Optional[List[Dict[str, Any]]] = None,
+        planned_sections: Optional[List[Dict[str, Any]]] = None,
+        **kwargs,
     ) -> str:
         """
         Construct a single complete-paper generation prompt asking Gemini to generate all sections
@@ -857,45 +1761,110 @@ Return ONLY valid JSON matching this schema:
         """
         sections_info = []
         start_q_num = 1
-        for sec in blueprint.sections:
+        for sec_idx, sec in enumerate(blueprint.sections):
             alts_per_q = sec.alternatives_per_question if (sec.has_internal_choice and sec.alternatives_per_question > 1) else 1
-            sec_difficulties = self._calculate_difficulty_distribution(difficulty, sec.question_count, easy_pct, med_pct, hard_pct)
+            sec_difficulties = self._calculate_difficulty_distribution(
+                difficulty=difficulty,
+                count=sec.question_count,
+                easy_pct=easy_pct,
+                med_pct=med_pct,
+                hard_pct=hard_pct,
+                marks_per_q=sec.marks_per_question,
+            )
 
             choice_str = "None"
             if sec.has_internal_choice and sec.alternatives_per_question > 1:
                 end_num = start_q_num + sec.question_count - 1
-                choice_str = f"Internal choice for Q{start_q_num} through Q{end_num}. Each question group has {sec.alternatives_per_question} alternatives (labels 'a', 'b', etc.). Set choice_group: 'Q<N>' and alternative_label: 'a'/'b'."
+                mcq_choice_note = " Each alternative ('a', 'b') is an independent Multiple-Choice Question and MUST include exactly 4 distinct options in 'mcq_options'." if sec.question_type.value == "MCQ" else ""
+                choice_str = f"Internal choice for Q{start_q_num} through Q{end_num}. Each question group has {sec.alternatives_per_question} alternatives (labels 'a', 'b', etc.). Set choice_group: 'Q<N>' and alternative_label: 'a'/'b'.{mcq_choice_note}"
 
             num_str = "None"
             if sec.numerical_question_count > 0:
                 num_str = f"EXACTLY {sec.numerical_question_count} questions in this section MUST be calculation/numerical problems (set is_numerical: true)."
 
+            sec_desc_lower = str(getattr(sec, "section_description", "") or "").lower()
+            has_ar = "assertion" in sec_desc_lower or "reason" in sec_desc_lower
+            ar_count = min(3, max(2, sec.question_count // 5)) if (has_ar and sec.question_count >= 5) else (1 if has_ar else 0)
+            ar_start_q = start_q_num + sec.question_count - ar_count if ar_count > 0 else 999999
+            ar_end_q = start_q_num + sec.question_count - 1 if ar_count > 0 else 999999
+
+            slot_breakdown_lines = []
+            if planned_sections and sec_idx < len(planned_sections):
+                s_plan = planned_sections[sec_idx]
+                sec_q_type = sec.question_type.value
+                for g in s_plan["groups"]:
+                    ch_num_val = g.get("chapter_number")
+                    ch_name_val = g.get("chapter_name", "")
+                    diff_val = g.get("difficulty", "MEDIUM")
+                    marks_val = g.get("marks", sec.marks_per_question)
+                    if g.get("choice_group"):
+                        mcq_req = " Each alternative MUST include 'mcq_options' with exactly 4 options (['A. ...', 'B. ...', 'C. ...', 'D. ...'])." if sec_q_type == "MCQ" else ""
+                        slot_breakdown_lines.append(
+                            f"  * {g['choice_group']} (Internal Choice, Type: {sec_q_type}): Chapter {ch_num_val} (\"{ch_name_val}\") | Difficulty: {diff_val} | Marks: {marks_val}. "
+                            f"Both Alternative 'a' and Alternative 'b' MUST be authored from Chapter {ch_num_val} and test distinct concepts/formulas.{mcq_req}"
+                        )
+                    else:
+                        is_num_str = " | Numerical Calculation" if g.get("is_numerical") else ""
+                        q_ord_val = g.get("question_order", 0)
+                        ar_slot_str = ""
+                        if has_ar:
+                            if q_ord_val >= ar_start_q:
+                                ar_slot_str = " | Format: Assertion-Reasoning"
+                            else:
+                                ar_slot_str = " | Format: Standard MCQ (NOT Assertion-Reason)"
+                        slot_breakdown_lines.append(
+                            f"  * Question {q_ord_val}: Chapter {ch_num_val} (\"{ch_name_val}\") | Difficulty: {diff_val} | Marks: {marks_val}{is_num_str}{ar_slot_str}"
+                        )
+
+            slot_breakdown_str = ("\n- Planned Question Slot Grid:\n" + "\n".join(slot_breakdown_lines)) if slot_breakdown_lines else ""
+
+            style_str = f"- Dominant Reasoning Style: {sec.reasoning_style}\n" if getattr(sec, "reasoning_style", None) else ""
+            desc_str = f"- Section Pedagogical Description: {sec.section_description}\n" if getattr(sec, "section_description", None) else ""
+            pedagogical_rule = ""
+            if getattr(sec, "reasoning_style", None):
+                r_style = sec.reasoning_style
+                if any(kw in r_style for kw in ("SCENARIO", "CASE", "VIGNETTE", "APPLIED", "SITUATION")):
+                    pedagogical_rule = (
+                        f"- STRICT PEDAGOGICAL REQUIREMENT: Every question in this section MUST be grounded in a realistic, "
+                        f"contextual case scenario, vignette, or applied situation (reasoning style: {r_style}). "
+                        f"Do NOT ask generic, bare textbook recall questions. Each question item MUST include "
+                        f"'reasoning_style': '{r_style}'.\n"
+                    )
+                else:
+                    pedagogical_rule = (
+                        f"- STRICT PEDAGOGICAL REQUIREMENT: Every question in this section MUST strictly embody the reasoning style "
+                        f"'{r_style}'. Do NOT deviate into other unrelated cognitive modes. Each question item MUST include "
+                        f"'reasoning_style': '{r_style}'.\n"
+                    )
+
+            ar_directive = ""
+            if has_ar and ar_count > 0:
+                std_mcq_end = ar_start_q - 1
+                ar_directive = (
+                    f"- QUESTION FORMAT BREAKDOWN & COMPOSITION:\n"
+                    f"  * Questions {start_q_num} through {std_mcq_end} MUST be STANDARD MULTIPLE-CHOICE QUESTIONS (clinical vignettes, conceptual questions, or applied problem setups with four distinct answer options). DO NOT use Assertion-Reason format for these questions.\n"
+                    f"  * ONLY the final {ar_count} question(s) (Questions {ar_start_q} through {ar_end_q}) MUST be Assertion-Reasoning items. Format their 'question_text' strictly as:\n"
+                    f"    \"Assertion (A): [Direct, unambiguous claim].\\nReason (R): [Supporting or explanatory statement].\"\n"
+                    f"    and their 'mcq_options' strictly as exactly 4 standard options:\n"
+                    f"    [\"A. Both Assertion (A) and Reason (R) are true, and Reason (R) is the correct explanation of Assertion (A).\", "
+                    f"\"B. Both Assertion (A) and Reason (R) are true, but Reason (R) is NOT the correct explanation of Assertion (A).\", "
+                    f"\"C. Assertion (A) is true, but Reason (R) is false.\", "
+                    f"\"D. Assertion (A) is false, but Reason (R) is true.\"]\n"
+                )
+
             sections_info.append(f"""
 ---
 SECTION NAME: '{sec.name}'
 - Question Type: {sec.question_type.value}
-- Logical Question Count: {sec.question_count}
+{style_str}{desc_str}{pedagogical_rule}{ar_directive}- Logical Question Count: {sec.question_count}
 - Alternatives Per Question: {sec.alternatives_per_question}
 - Total Question Items To Generate: {sec.question_count * alts_per_q}
 - Marks Per Question Item: {sec.marks_per_question} (Total Section Marks: {sec.total_section_marks})
 - Target Difficulty Distribution: {json.dumps(sec_difficulties)}
 - Internal Choice Requirement: {choice_str}
-- Numerical Requirement: {num_str}
+- Numerical Requirement: {num_str}{slot_breakdown_str}
 """)
             start_q_num += sec.question_count
-
-        topic_instruction_str = ""
-        if topic_focus and topic_focus.strip():
-            topic_instruction_str = f"""
-USER TOPIC FOCUS:
-"{topic_focus.strip()}"
-
-STRICT RULE:
-Check whether this concept exists in the SOURCE EDUCATIONAL MATERIAL.
-- If it exists, prioritize it where appropriate.
-- If it does not exist, completely ignore it.
-- Never introduce content solely because it appears in TOPIC FOCUS.
-"""
 
         ch_weightage_lines = []
         if chapter_weightages_data:
@@ -909,8 +1878,10 @@ Check whether this concept exists in the SOURCE EDUCATIONAL MATERIAL.
                 ch_weightage_lines.append(f"- Chapter {c_num}: \"{c_name}\" -> {c_pct:.1f}% weightage (~{c_marks} marks allocated)")
             ch_weightage_lines.append("\nSTRICT CHAPTER DISTRIBUTION & ATTRIBUTION RULE:")
             ch_weightage_lines.append("- Every generated question MUST include \"chapter_number\": <int> indicating which selected chapter it covers.")
-            ch_weightage_lines.append("- The cumulative marks for questions assigned to each chapter MUST adhere strictly to its allocated weightage percentage.")
-            ch_weightage_lines.append("- Do NOT concentrate questions in any single chapter; distribute questions across all selected chapters strictly according to these allocated weightages.\n")
+            ch_weightage_lines.append("- For questions with internal choice (e.g., Q1a / Q1b), count only ONE alternative toward the chapter mark total (logical attempted marks), since students only attempt one alternative.")
+            ch_weightage_lines.append("- The cumulative logical attempted marks for questions assigned to each chapter MUST adhere strictly to its allocated marks listed above.")
+            ch_weightage_lines.append("- The Planned Question Slot Grid in each section already implements this exact distribution. Follow the slot-by-slot chapter assignment to automatically fulfill this rule.")
+            ch_weightage_lines.append("- Do NOT concentrate questions in any single chapter; distribute questions across all selected chapters strictly according to these allocated marks.\n")
         ch_weightage_instruction_str = "\n".join(ch_weightage_lines)
 
         ref_instruction_str = ""
@@ -924,37 +1895,34 @@ Check whether this concept exists in the SOURCE EDUCATIONAL MATERIAL.
 REFERENCE PAPER SAMPLE QUESTIONS & COGNITIVE STYLE PROFILE:
 {samples_formatted}
 
-CRITICAL: REFERENCE MODE SEMANTIC EXAMINATION STYLE & PEDAGOGICAL EMULATION:
-You are generating an examination paper in REFERENCE MODE. You MUST capture and emulate the DEEP SEMANTIC AND PEDAGOGICAL QUESTION-SETTING PHILOSOPHY of the reference examiner, NOT merely copy vocabulary, keywords, or surface phrasing.
+CRITICAL: REFERENCE MODE EXAMINATION REUSE & EMULATION RULES:
+You are generating an examination paper in REFERENCE MODE.
 
-1. PEDAGOGICAL & COGNITIVE DEMAND EMULATION:
-   - Analyze HOW the reference paper converts textbook concepts into questions (the pattern: concept → physical scenario → given parameters → cognitive reasoning required → operation expected → answer depth).
-   - Match the examiner's cognitive burden: whether questions test direct recall, conceptual comprehension, scenario-based application, multi-step derivation, or numerical calculation.
-   - For numerical problems, replicate the reasoning depth (e.g. single-step direct formula substitution vs. multi-step parameter setup and derivation).
-   - For MCQs, emulate distractor construction strategy (targeting common student misconceptions or subtle conceptual errors rather than trivial options).
-   - Real difficulty must reflect actual reasoning burden, regardless of superficial terminology.
+1. PRIORITIZED REUSE OF REFERENCE QUESTIONS (UP TO 10% TO 20% OF TOTAL PAPER MARKS):
+   - Scope & Cap: When matching reference questions exist for the user's selected chapters, PRIORITIZE reusing them word-by-word into compatible question slots, up to a cumulative limit of 10% to 20% of total paper marks (no more than {max_overall_ref_marks} marks total across the entire paper).
+   - Chapter & Slot Alignment:
+     * A reference question is ONLY eligible for reuse if its underlying topic/concept belongs to one of the user's SELECTED CHAPTERS in the SOURCE EDUCATIONAL MATERIAL.
+     * Match eligible reference questions to a compatible slot in the "Planned Question Slot Grid" that has the SAME chapter_number and the SAME marks.
+     * If a selected chapter has NO matching reference questions in the sample list, do NOT force reuse for that chapter—fill its slots with fresh questions instead.
+   - Word-by-Word Fidelity & Options Formatting:
+     * For each matched slot, copy the question text EXACTLY WORD-FOR-WORD from the reference sample question without alteration, rephrasing, or adding extraneous scenarios.
+     * If the reference question is a multiple-choice question (MCQ), ensure the question stem is placed in "question_text" and its four options are cleanly provided in "mcq_options" as ["A. ...", "B. ...", "C. ...", "D. ..."] (even if the reference sample had options embedded inline in its text).
+     * Mark ONLY these questions that are directly copied from the reference paper sample list as "source_type": "REFERENCE_REUSED". NEVER label fresh questions authored from textbook materials as "REFERENCE_REUSED".
+     * EXEMPTION: Questions with "source_type": "REFERENCE_REUSED" are completely EXEMPT from section reasoning-style or vignette rewriting mandates; retain their original phrasing as given in the reference paper.
 
-2. CHAPTER ALIGNMENT, WEIGHTAGE & DUAL-CAP REUSE ELIGIBILITY RULE:
-   - Check if any sample questions in REFERENCE PAPER SAMPLE QUESTIONS belong to the concepts in SOURCE EDUCATIONAL MATERIAL (the selected chapters).
-   - DUAL-CAP REUSE CONSTRAINTS:
-     * Overall Paper Reuse Limit: You may directly reuse matching reference questions as "REFERENCE_REUSED" up to a MAXIMUM of 10% to 20% of total paper marks (no more than {max_overall_ref_marks} marks total across the entire paper).
-     * Per-Chapter Weightage Cap: For any individual chapter C, the total questions/marks for chapter C (reused + variations + fresh) MUST NOT exceed chapter C's allocated weightage percentage.
-     * Furthermore, the total marks of reused questions for chapter C CANNOT exceed min(chapter C allocated marks, overall allowed reference reuse marks).
-     * BALANCED 50/50 SPLIT PREFERENCE (IF FEASIBLE): For any selected chapter C where reference questions exist, IF POSSIBLE and if question marks/counts can be divided (e.g. Chapter 1 has 10 marks consisting of two 5-mark questions or multiple items), prefer reusing reference questions for ~half of chapter C's marks/questions and generating fresh "AI_GENERATED" questions for the remaining ~half. If NOT feasible to divide (e.g. only 1 question in that chapter or indivisible section marks), you may reuse up to the full chapter weightage cap (up to {max_overall_ref_marks} marks).
-     * If the reference paper ONLY contains questions for a single chapter (e.g. Chapter 1 with 10% weightage = 10 marks), you can reuse AT MOST 10 marks of Chapter 1 questions (NEVER more, with a 50/50 reuse/fresh split if feasible), and 100% of the remaining questions for other selected chapters MUST be fresh "AI_GENERATED" questions from SOURCE EDUCATIONAL MATERIAL.
-   - IF NO MATCHING QUESTIONS EXIST in the reference paper for a selected chapter:
-     * 100% of questions for that chapter MUST be fresh, newly authored questions ("AI_GENERATED") from SOURCE EDUCATIONAL MATERIAL.
+2. SYLLABUS & FRESH QUESTIONS (80% TO 90% OF TOTAL PAPER MARKS):
+   - For all remaining slots, or for selected chapters that have NO matching questions in the reference paper:
+     * Author fresh, original questions strictly from the SOURCE EDUCATIONAL MATERIAL.
+     * Emulate the reference paper's cognitive depth, difficulty, and question-setting style.
+     * Set "source_type": "AI_GENERATED" (or "REFERENCE_VARIATION" if adapting the parameters or scenario of an existing reference question).
 
-3. STRICT ANTI-CLUSTERING & NON-SEQUENTIAL REUSE RULE:
-   - NEVER copy reference paper questions sequentially in order (e.g. DO NOT copy Reference Q1, Q2, Q3... as generated Q1, Q2, Q3...).
-   - NEVER cluster or place all reused/variation questions together in the first section or in a single block at the beginning of the paper.
-   - Randomly SCATTER any allowed REFERENCE_REUSED or REFERENCE_VARIATION questions across different question numbers throughout the paper, interspersing them evenly among fresh AI_GENERATED questions.
+3. CHAPTER WEIGHTAGE & SLOT FIDELITY:
+   - Every question (whether reused or fresh) MUST strictly occupy its designated chapter_number and marks as defined in the Planned Question Slot Grid.
+   - Never violate the chapter marks allocation.
 
-4. ADAPTATION & TRACEABILITY (source_type):
-   For each generated question, set "source_type" as:
-   - "REFERENCE_REUSED": Use ONLY when a question from the reference paper matches the selected textbook chapters and is directly reused.
-   - "REFERENCE_VARIATION": Use ONLY when a question from the reference paper matches the selected textbook chapters and its parameters/scenario are modified.
-   - "AI_GENERATED": Use for ALL newly created questions derived from the SOURCE EDUCATIONAL MATERIAL (mandatory when chapter differs or when exceeding 20% reuse/variation).
+4. STRICT ANTI-CLUSTERING & NON-SEQUENTIAL REUSE:
+   - Do NOT cluster all reused questions together at the beginning of the paper.
+   - Place any allowed "REFERENCE_REUSED" or "REFERENCE_VARIATION" questions into their matching chapter/mark slots throughout the paper, interspersing them naturally among fresh "AI_GENERATED" questions.
 
 5. USER BLUEPRINT AUTHORITATIVENESS:
    - The user's requested TOTAL EXAMINATION MARKS ({blueprint.total_marks}), section counts, question types, marks per question, requested difficulty ({difficulty.value}), and selected textbook chapters are AUTHORITATIVE and MUST be strictly respected.
@@ -967,7 +1935,7 @@ You are generating an examination paper in REFERENCE MODE. You MUST capture and 
         )
 
         prompt = f"""
-You are an expert educational examination author. Generate the COMPLETE examination paper according to the blueprint below in ONE unified response.
+Generate the COMPLETE examination paper according to the blueprint below in ONE unified response.
 
 TOTAL EXAMINATION MARKS: {blueprint.total_marks}
 OVERALL DIFFICULTY: {difficulty.value}
@@ -976,35 +1944,57 @@ EXAMINATION BLUEPRINT SECTIONS:
 {"".join(sections_info)}
 
 QUESTION TYPE DEFINITIONS:
-- MCQ: Multiple-choice question with exactly 4 options ("A. ...", "B. ...", "C. ...", "D. ...") and one unambiguously correct answer.
+- MCQ: Multiple-choice question with exactly 4 options ("A. ...", "B. ...", "C. ...", "D. ..."). Do NOT generate answers or explanations.
 - VERY_SHORT_ANSWER: Question requiring a very brief answer (word, phrase, term, formula, value, definition).
 - SHORT_ANSWER: Question requiring a concise explanation, comparison, application, or short solution.
 - LONG_ANSWER: Detailed, well-structured answer requiring multi-step reasoning or synthesis.
 - NUMERICAL: Calculation/computation problem requiring quantitative work or mathematical derivation.
 
-DIFFICULTY & COGNITIVE DEMAND:
-- EASY: Direct recall or recognition of explicit facts stated in the source.
-- MEDIUM: Comprehension and simple application. Explain, summarize, compare, classify, or connect information.
-- HARD: Analysis, synthesis, multi-step reasoning, or supported inference.
+COGNITIVE DIFFICULTY & ANTI-VERBOSITY SPECIFICATIONS:
+1. ANTI-VERBOSITY & LANGUAGE ACCESSIBILITY MANDATE (APPLIES TO ALL DIFFICULTIES: EASY, MEDIUM, HARD):
+   - The difficulty of a question MUST lie exclusively in the cognitive reasoning, conceptual depth, problem setup, or analytical deduction—NEVER in obscure, bombastic, convoluted language, or dictionary lookups.
+   - Write in clear, natural, direct academic English.
+   - STRICT PROHIBITION: Do NOT use pretentious, polysyllabic, or hyper-inflated vocabulary to disguise simple recall questions as "hard". A definition question wrapped in complex jargon is still an easy question. Keep phrasing crisp, precise, and student-accessible across all difficulty levels.
+
+2. DIFFICULTY & COGNITIVE DEMAND:
+   - EASY: Direct recall or recognition of explicit facts, fundamental definitions, standard laws, or foundational formulas directly stated in the source educational material.
+   - MEDIUM: Conceptual comprehension and standard application of principles.
+   - HARD: Analysis, synthesis, multi-step reasoning, and evaluation in novel scenarios.
+   - You are NOT restricted to any fixed list of verbs. Vary question formulations naturally across the paper so questions do not feel repetitive or formulaic. Focus on the cognitive operation demanded of the student:
+   
+   - EASY (Bloom's Level 1 & 2 - Recall & Recognition):
+     * Cognitive Burden: Direct recall or recognition of explicit facts, fundamental definitions, standard laws, or foundational formulas directly stated in the source educational material.
+     * Phrasing & Style: Keep language simple, clear, and direct. Question style can vary naturally (e.g., asking to identify a term, state a law, name a component, recall a formula, or select which item belongs to a category). Single-step recognition requiring only direct memory retrieval.
+     * MCQ Distractor Design: Clear, distinct, plausible categories or terms from the syllabus. Tests fundamental familiarity without deceptive traps.
+
+   - MEDIUM (Bloom's Level 2 & 3 - Comprehension & Standard Application):
+     * Cognitive Burden: Explain a principle in own words, compare/contrast two related mechanisms, interpret a standard diagram/graph, or apply a known formula/concept to a realistic, familiar scenario.
+     * Phrasing & Style: Frame questions around understanding and application (e.g. explaining why or how something works, distinguishing between two concepts, illustrating with an example, calculating a standard 1-to-2 step result, or describing a mechanism). Use varied, natural phrasing rather than repetitive formulaic sentence starters.
+     * MCQ Distractor Design: Plausible options reflecting common student misunderstandings, sign/unit slips, or confusion between closely adjacent concepts.
+
+   - HARD (Bloom's Level 4, 5 & 6 - Analysis, Evaluation, Synthesis & Multi-Step Deduction):
+     * Cognitive Burden: Multi-step reasoning where the student must integrate two or more distinct concepts, deduce an unstated consequence, evaluate boundary conditions, or predict outcomes when constraints change or conflict.
+     * Phrasing & Style: Use rich, varied problem setups, novel scenarios, diagnostic questions, or comparative inquiries that require active thinking (e.g. analyzing causes, evaluating competing explanations, justifying a choice, predicting the effect of changing a parameter, critique, or synthesis).
+     * ANTI-TRIVIALITY RULE: NEVER author bare definition or simple recall questions (e.g. merely asking "Define X", "State the formula of Y", or "List the 3 types of Z") for questions designated as HARD. The question must require active critical reasoning or multi-step problem solving, not memory recall.
+     * MCQ Distractor Design: High-discrimination options targeting deep misconceptions, borderline edge-cases, or subtle causal inversions. All four options MUST appear plausible to a student who only memorized definitions; only deep conceptual reasoning eliminates the distractors.
 
 CONTENT AUTHORITY, SOURCE FIDELITY & ANTI-EMBELLISHMENT RULES:
 1. SOURCE EDUCATIONAL MATERIAL is the ONLY authoritative source for question content, facts, formulas, terminology, and subject matter.
 2. Every generated question MUST be strictly derived from and answerable using ONLY the provided SOURCE EDUCATIONAL MATERIAL.
 3. DO NOT use external knowledge, pretrained/model general knowledge, assumptions, or information outside the provided SOURCE EDUCATIONAL MATERIAL.
-4. CHAPTER COVERAGE & ATTRIBUTION RULE: Distribute questions strictly according to the requested chapter weightages. If no custom weightages are provided, distribute coverage reasonably across all selected chapters. Include "chapter_number": <1-based integer chapter number> for each question.
-5. NUMERICAL CALCULATION ACCURACY RULE: You MUST perform exact step-by-step arithmetic verification for all numerical calculations. Double-check powers of 10, exponents, signs, and unit conversions (e.g. 10⁹ × 10⁻⁷ × 10⁻⁷ / (0.3)² = 5.4 × 10⁻³ / 0.09 = 6.0 × 10⁻³ N). Ensure the calculated result matches the selected MCQ option exactly.
+4. CHAPTER ATTRIBUTION & SLOTS FIDELITY RULE: Strictly follow the designated chapter assigned to each question slot in the Planned Question Slot Grid. Every generated question MUST include "chapter_number": <1-based integer chapter number> matching its designated slot.
+5. NUMERICAL CALCULATION ACCURACY RULE: You MUST perform exact step-by-step arithmetic verification for all numerical calculations. Double-check powers of 10, exponents, signs, and unit conversions (e.g. 10⁹ × 10⁻⁷ × 10⁻⁷ / (0.3)² = 5.4 × 10⁻³ / 0.09 = 6.0 × 10⁻³ N).
 6. VARIABLE DISAMBIGUATION RULE: NEVER use the same variable letter or symbol for two different physical quantities in the same question (e.g. do NOT use 'a' for both an electric field coefficient and a cube edge length; use distinct symbols like 'k' and 'L', or 'a' and 'd').
 7. SELF-CONTAINED QUESTION RULE: EVERY single question MUST be 100% self-contained and independent. NEVER use phrases like 'the previous problem', 'above question', 'from question X', or 'from the previous result'. Each question must supply all its own parameters, definitions, and context.
-8. INTERNAL CHOICE ALTERNATIVES RULE: For questions with internal choice, alternatives 'a' and 'b' MUST be completely distinct, independent, non-identical questions covering valid topics.
+8. INTERNAL CHOICE ALTERNATIVES RULE: For questions with internal choice, alternatives 'a' and 'b' MUST be from the same designated chapter, and MUST be completely distinct, independent, non-identical questions testing distinct concepts/formulas.
 9. VISUAL ILLUSTRATION & DIAGRAM GUIDELINES:
    - EXAMINATION VISUAL VARIETY: Real-world examination papers feature a natural, balanced mix of both pure-text questions (definitions, derivations, statements of laws) and diagram-based questions. When the source material covers topics with physical arrangements, component networks, geometric figures, function/signal curves, multi-stage workflows, or comparative data distributions, you MUST author some questions as diagram-based questions (where the question explicitly presents and refers to a figure, e.g. "In the circuit diagram shown below...", "In the figure shown below...", "From the graph plotted below..."), populating the complete structured "visual" object with "required": true. Do NOT make 100% of the paper purely text-based word problems when visual concepts are available.
    - CORE PRINCIPLE: A visual specification is a STRICT SEMANTIC REPRESENTATION of the question, NOT a decorative or representative illustration. Never simplify a complex visual problem into a smaller representative diagram.
    - VISUAL NECESSITY: Use a visual when it materially improves the question, represents information the student must interpret or calculate from (e.g. an explicit circuit network, geometric figure, or graph curve), or presents an explicit illustration. For purely conceptual definitions, statements of laws, or derivations that do not present a figure, set "visual": null.
-   - COMPONENT & QUANTITY COMPLETENESS RULE: Every single physical entity, component, node, vertex, and stage described in "question_text" and "solution_explanation" MUST be explicitly represented in "spec". If the question mentions "12 resistors", "spec" MUST contain exactly 12 resistor components. If it mentions "four capacitors", "spec" MUST contain 4 capacitors. If it mentions "triangle ABC with altitude BD", "spec" MUST contain points A, B, C, D and segments AB, BC, AC, BD. NEVER generate a simplified subset or generic loop.
+   - COMPONENT & QUANTITY COMPLETENESS RULE: Every single physical entity, component, node, vertex, and stage described in "question_text" MUST be explicitly represented in "spec". If the question mentions "12 resistors", "spec" MUST contain exactly 12 resistor components. If it mentions "four capacitors", "spec" MUST contain 4 capacitors. If it mentions "triangle ABC with altitude BD", "spec" MUST contain points A, B, C, D and segments AB, BC, AC, BD. NEVER generate a simplified subset or generic loop.
    - NUMERICAL & PARAMETER CONSISTENCY RULE: Every numerical value, voltage (e.g. '500 V', '220 V, 50 Hz'), resistance ('1 Ω', '200 Ω'), capacitance ('10 µF'), dimension ('5 cm'), and equation ('10*sin(100*pi*x)') stated in "question_text" MUST 100% match the parameters and labels in "spec".
    - TOPOLOGY & RELATIONSHIP PRESERVATION: Named topologies (e.g. 'cubical network', 'Wheatstone bridge', 'parallel branches', 'ladder network') MUST be constructed with their exact graph connections and vertices, NOT collapsed into a simple loop. Use 'routing': 'direct' for diagonal/isometric edges where appropriate.
    - PHYSICAL STATES & SYMBOLS: Explicit physical states (e.g. switch open/closed -> state='open'/'closed', AC source -> type='ac_source', iron-core inductor -> type='inductor' with iron_core=true, lamp/bulb -> type='lamp') MUST be specified.
-   - QUESTION ↔ SOLUTION ↔ VISUAL TRI-CONSISTENCY: Before finalizing, verify that "question_text", "solution_explanation", and "visual" describe the exact same physical system, component counts, values, and circuit/geometry structure.
    - NEVER generate raw SVG markup, XML, or HTML. Populate "spec" with clean semantic elements:
      * For "circuit": "spec": {{"junctions": [{{"id": "A", "x": 50, "y": 150, "label": "A"}}], "components": [{{"id": "AC1", "type": "ac_source", "label": "220 V, 50 Hz"}}, {{"id": "L1", "type": "inductor", "label": "50 mH", "iron_core": true}}, {{"id": "K1", "type": "switch", "label": "Key", "state": "closed"}}], "connections": [{{"from": "AC1", "to": "K1", "routing": "orthogonal"}}]}}
      * For "geometry": "spec": {{"points": [{{"id": "A", "label": "A"}}, {{"id": "B", "label": "B"}}, {{"id": "C", "label": "C"}}, {{"id": "D", "label": "D"}}], "segments": [{{"from": "A", "to": "B", "label": "5 cm"}}, {{"from": "B", "to": "D", "label": "Altitude"}}], "polygons": [{{"points": ["A", "B", "C"]}}], "angles": [{{"vertex": "B", "p1": "A", "p2": "C", "label": "90°", "right_angle": true}}]}}
@@ -1014,10 +2004,10 @@ CONTENT AUTHORITY, SOURCE FIDELITY & ANTI-EMBELLISHMENT RULES:
    - CRITICAL SPEC REQUIREMENT: When "visual" is not null, "spec" MUST NOT be empty. You MUST populate the full internal structure (e.g. "components" & "connections" for circuit; "points", "segments" & "polygons" for geometry; "functions" & ranges for graph).
    - INTERNAL CHOICE INDEPENDENCE: For questions with internal choice, each alternative ('a' and 'b') independently specifies its own "visual" object (or null).
 {ch_weightage_instruction_str}
-{topic_instruction_str}
 {ref_instruction_str}
 OUTPUT FORMAT REQUIREMENT:
-Return ONLY a valid JSON object containing a "sections" array. Do NOT wrap in markdown text outside the JSON.
+Return ONLY a valid JSON object containing a "sections" array. Author ONLY question text and MCQ options. Do NOT author answer keys, expected answers, or solutions. Do NOT wrap in markdown text outside the JSON.
+CRITICAL MCQ REQUIREMENT: For EVERY question in an MCQ section (including both alternatives 'a' and 'b' of internal choice questions), "mcq_options" is MANDATORY and MUST contain exactly 4 distinct options (["A. ...", "B. ...", "C. ...", "D. ..."]). NEVER output null or an empty array for "mcq_options" on any MCQ question item!
 {{
   "sections": [
     {{
@@ -1032,10 +2022,9 @@ Return ONLY a valid JSON object containing a "sections" array. Do NOT wrap in ma
           "alternative_label": "<e.g. a, b or null>",
           "chapter_number": <1-based integer chapter number>,
           "is_numerical": <true | false>,
-          "mcq_options": ["A. ...", "B. ...", "C. ...", "D. ..."] or null,
-          "correct_answer": "<correct option for MCQ or numerical result>",
-          "expected_answer": "<expected model answer for non-MCQ>",
-          "solution_explanation": "<step-by-step marking key & explanation>",
+          "reasoning_style": "<Reasoning style matching section requirement, e.g. SCENARIO_BASED, DIRECT_RECALL, or custom style>",
+          "section_description": "<Brief pedagogical description matching section focus or null>",
+          "mcq_options": ["A. ...", "B. ...", "C. ...", "D. ..."] (MANDATORY for MCQ, null ONLY for non-MCQ types),
           "visual": {{
             "required": true,
             "type": "circuit",
@@ -1101,67 +2090,68 @@ SOURCE EDUCATIONAL MATERIAL:
                 return False
             symbol_map[sym] = (val, unit)
 
-        # 3. Answer field non-emptiness validation & MCQ consistency
+        # 3. MCQ option structure & uniqueness validation (pure question paper: answer fields are optional)
         corr = str(q.get("correct_answer") or "").strip()
-        exp = str(q.get("expected_answer") or "").strip()
-        sol = str(q.get("solution_explanation") or "").strip()
-
         q_type = sec.question_type.value
 
         if q_type == "MCQ":
-            if not corr:
-                logger.warning("Rejecting MCQ with empty correct_answer")
-                return False
             opts = q.get("mcq_options")
-            if not isinstance(opts, list) or len(opts) < 2:
-                logger.warning(f"Rejecting MCQ with invalid options list: {opts}")
+            if not isinstance(opts, list) or len(opts) != 4:
+                logger.warning(f"Rejecting MCQ with invalid options list (must be exactly 4 options): {opts}")
+                return False
+            if any(not str(opt).strip() for opt in opts):
+                logger.warning(f"Rejecting MCQ with empty option string in options: {opts}")
                 return False
 
-            # Check option uniqueness
-            def _clean_opt(opt_str: str) -> str:
-                cleaned = re.sub(r"^[A-Da-d][\.\)]\s*", "", str(opt_str)).strip()
-                cleaned = cleaned.replace("$", "").replace("\\", "").strip().lower()
-                return cleaned
+            # Check option uniqueness without lowercasing variables in formulas
+            def _clean_content_exact(s: str) -> str:
+                s_clean = re.sub(r"^\s*(?:option\s+)?(?:\([A-Da-d]\)|[A-Da-d][\.\:\)])\s*", "", str(s)).strip()
+                return s_clean.replace("$", "").replace("\\", "").strip()
 
-            clean_opts = [_clean_opt(opt) for opt in opts]
-            if len(set(clean_opts)) < len(clean_opts):
+            clean_opts_exact = [_clean_content_exact(opt) for opt in opts]
+            if len(set(clean_opts_exact)) < len(clean_opts_exact):
                 logger.warning(f"Rejecting MCQ with duplicate/ambiguous options: {opts}")
                 return False
 
-            clean_corr = _clean_opt(corr)
-            matches = [i for i, c_opt in enumerate(clean_opts) if clean_corr == c_opt or clean_corr in c_opt or c_opt in clean_corr]
-            if not matches:
-                logger.warning(f"Rejecting MCQ: correct_answer '{corr}' does not match any option in {opts}")
-                return False
-        else:
-            if not exp and not corr and not sol:
-                logger.warning("Rejecting question with missing answer and solution fields")
-                return False
-
-        # 4. Content-based numerical detection and slot alignment
-        has_numbers = bool(re.search(r"\b\d+(\.\d+)?\s*(×\s*10|e[+-]?\d+|[a-zA-ZΩ°µμ%C|N|m|V|J|A|Hz])\b", q_text + " " + sol, re.IGNORECASE))
-        has_math_ops = bool(re.search(r"[=\+\-\*/\^]", q_text + " " + sol))
-        is_calc_text = bool(re.search(r"\b(calculate|compute|find the magnitude|determine the value)\b", q_text, re.IGNORECASE))
-
-        inferred_numerical = has_numbers or (has_math_ops and is_calc_text) or (q_type == "NUMERICAL")
-
-        if existing_sec_questions is not None and sec.numerical_question_count > 0:
-            current_num_cnt = sum(1 for item in existing_sec_questions if item.get("is_numerical") is True)
-            needed_num_cnt = sec.numerical_question_count
-            total_items_needed = sec.question_count * sec.alternatives_per_question
-            remaining_slots = total_items_needed - len(existing_sec_questions)
-            remaining_num_needed = needed_num_cnt - current_num_cnt
-
-            if remaining_num_needed > 0 and remaining_num_needed >= remaining_slots:
-                if not inferred_numerical:
-                    logger.warning(f"Rejecting conceptual question in mandatory numerical slot for section '{sec.name}'")
-                    return False
-            elif remaining_num_needed <= 0 and inferred_numerical and q_type != "NUMERICAL":
-                if len(existing_sec_questions) < sec.question_count:
-                    logger.warning(f"Rejecting calculation question in conceptual slot for section '{sec.name}'")
+            # If correct_answer happens to be provided, verify it matches one of the options
+            if corr:
+                letter_match = re.match(r"^\s*(?:option\s+)?\(?([A-Da-d])\)?[\.\:\)]?\s*$", corr)
+                if letter_match:
+                    letter_idx = ord(letter_match.group(1).upper()) - ord("A")
+                    matches = [letter_idx] if 0 <= letter_idx < len(opts) else []
+                else:
+                    clean_corr = _clean_content_exact(corr).lower()
+                    clean_opts_lower = [c.lower() for c in clean_opts_exact]
+                    matches = [
+                        i for i, c_opt in enumerate(clean_opts_lower)
+                        if clean_corr == c_opt or (clean_corr and clean_corr in c_opt) or (c_opt and c_opt in clean_corr)
+                    ]
+                if not matches:
+                    logger.warning(f"Rejecting MCQ: correct_answer '{corr}' does not match any option in {opts}")
                     return False
 
-        q["is_numerical"] = bool(inferred_numerical)
+        # 4. Numerical indicator retention and safe fallback detection (no slot rejection)
+        is_num = q.get("is_numerical")
+        if is_num is None:
+            sol = str(q.get("solution_explanation") or "").strip()
+            search_corpus = q_text + (" " + sol if sol else "")
+            # Physical/math units or scientific notation (avoid bare [a-zA-Z] which matches ordinary words)
+            has_num_units = bool(re.search(r"\b\d+(\.\d+)?\s*(×\s*10|e[+-]?\d+|[Ω°µμ%CNmVJAhz]|kg|km|cm|mm|ms|mol|watt|joule|newton|volt|amp)\b", search_corpus, re.IGNORECASE))
+            has_math_ops = bool(re.search(r"[=\+\-\*/\^]", search_corpus))
+            is_calc_text = bool(re.search(r"\b(calculate|compute|find the magnitude|determine the value)\b", q_text, re.IGNORECASE))
+            is_num = (q_type == "NUMERICAL") or (has_num_units and has_math_ops) or (is_calc_text and (has_num_units or has_math_ops))
+        q["is_numerical"] = bool(is_num)
+
+        # 5. Cognitive reasoning style validation & metadata retention
+        if not q.get("section_name"):
+            q["section_name"] = sec.name
+
+        cand_style = normalize_reasoning_style(q.get("reasoning_style"))
+        expected_style = getattr(sec, "reasoning_style", None)
+        if cand_style:
+            q["reasoning_style"] = cand_style
+        elif expected_style:
+            q["reasoning_style"] = expected_style
 
         return True
 
@@ -1195,12 +2185,45 @@ SOURCE EDUCATIONAL MATERIAL:
                 detail=f"Final paper validation failed: Total generated question items ({len(generated_questions)}) does not match blueprint item count ({total_blueprint_items}).",
             )
 
-        # 2. Total marks accounting
+        # 1. Blueprint Section Verification & Section Question Counts
+        default_sec_name = blueprint.sections[0].name if len(blueprint.sections) == 1 else None
+        for q in generated_questions:
+            if not q.get("section_name") and default_sec_name:
+                q["section_name"] = default_sec_name
+
+        bp_sec_map = {sec.name: sec for sec in blueprint.sections}
+        actual_sec_names = set(q.get("section_name") for q in generated_questions)
+        for sec in blueprint.sections:
+            if sec.name not in actual_sec_names:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Final paper validation failed: Missing section '{sec.name}' in generated paper.",
+                )
+            sec_items = [q for q in generated_questions if q.get("section_name") == sec.name]
+            alts_per_q = sec.alternatives_per_question if (sec.has_internal_choice and sec.alternatives_per_question > 1) else 1
+            expected_sec_items = sec.question_count * alts_per_q
+            if len(sec_items) != expected_sec_items:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Final paper validation failed: Section '{sec.name}' has {len(sec_items)} items, expected {expected_sec_items}.",
+                )
+            if alts_per_q > 1:
+                sec_cgs = set(q.get("choice_group") for q in sec_items if q.get("choice_group"))
+                if len(sec_cgs) != sec.question_count:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Final paper validation failed: Section '{sec.name}' has {len(sec_cgs)} distinct choice groups, expected {sec.question_count}.",
+                    )
+
+        # 2. Total marks accounting & Choice Group Integrity
         computed_marks = 0
         seen_choice_groups = set()
+        choice_group_map: Dict[str, List[Dict[str, Any]]] = {}
+
         for q in generated_questions:
             cg = q.get("choice_group")
             if cg:
+                choice_group_map.setdefault(cg, []).append(q)
                 if cg not in seen_choice_groups:
                     seen_choice_groups.add(cg)
                     computed_marks += q.get("marks", 0)
@@ -1213,13 +2236,43 @@ SOURCE EDUCATIONAL MATERIAL:
                 detail=f"Final paper validation failed: Computed total marks ({computed_marks}) does not match requested paper total marks ({blueprint.total_marks}).",
             )
 
+        # Verify each choice group has exactly 2 alternatives ('a' and 'b') with matching metadata
+        for cg, items in choice_group_map.items():
+            if len(items) != 2:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Final paper validation failed: Choice group '{cg}' has {len(items)} items, expected exactly 2.",
+                )
+            labels = sorted([str(item.get("alternative_label", "")).lower() for item in items])
+            if labels != ["a", "b"]:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Final paper validation failed: Choice group '{cg}' labels {labels} do not match expected ['a', 'b'].",
+                )
+            # Uniform marks, question_order, difficulty, and section
+            if len(set(item.get("marks") for item in items)) > 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Final paper validation failed: Choice group '{cg}' items have mismatched marks.",
+                )
+            if len(set(item.get("question_order") for item in items)) > 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Final paper validation failed: Choice group '{cg}' items have mismatched question_order.",
+                )
+            if len(set(item.get("difficulty") for item in items)) > 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Final paper validation failed: Choice group '{cg}' items have mismatched difficulty.",
+                )
+
         # 3. Paper-level target numerical count validation
         target_num_count = sum(sec.numerical_question_count for sec in blueprint.sections)
         actual_num_count = sum(1 for q in generated_questions if q.get("is_numerical") is True)
         if target_num_count > 0 and actual_num_count != target_num_count:
             logger.warning(f"Final paper numerical validation notice: target={target_num_count}, actual={actual_num_count}")
 
-        # 4. Answer completeness & self-containment check across all items
+        # 4. Answer completeness, MCQ option structure & self-containment check across all items
         dep_patterns = [
             r"\bprevious (problem|question|result|part|example|computation|value)\b",
             r"\babove (problem|question|result|part|computation|value)\b",
@@ -1231,6 +2284,7 @@ SOURCE EDUCATIONAL MATERIAL:
             r"\bthe result obtained above\b",
             r"\bfrom part \([a-d]\)\b",
         ]
+        seen_texts: List[str] = []
         for q in generated_questions:
             q_text = str(q.get("question_text", "")).strip()
             if not q_text:
@@ -1239,12 +2293,69 @@ SOURCE EDUCATIONAL MATERIAL:
                     detail="Final paper validation failed: Found question item with empty text.",
                 )
 
+            # Duplicate text check across all items in the paper
+            q_lower = q_text.lower()
+            if q_lower in seen_texts:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Final paper validation failed: Duplicate question text detected: '{q_text[:50]}...'.",
+                )
+            seen_texts.append(q_lower)
+
             for pat in dep_patterns:
                 if re.search(pat, q_text, re.IGNORECASE):
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"Final paper validation failed: Cross-question dependency detected in item '{q_text[:40]}'.",
                     )
+
+            # MCQ validation
+            q_type = q.get("question_type")
+            if not q_type and q.get("section_name") in bp_sec_map:
+                q_type = bp_sec_map[q.get("section_name")].question_type.value
+
+            if q_type == "MCQ":
+                opts = q.get("mcq_options")
+                if not isinstance(opts, list) or len(opts) != 4:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Final paper validation failed: MCQ item '{q_text[:40]}' must have exactly 4 options.",
+                    )
+                if any(not str(opt).strip() for opt in opts):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Final paper validation failed: MCQ item '{q_text[:40]}' has empty option text.",
+                    )
+                def _clean_content_exact(s: str) -> str:
+                    s_clean = re.sub(r"^\s*(?:option\s+)?(?:\([A-Da-d]\)|[A-Da-d][\.\:\)])\s*", "", str(s)).strip()
+                    return s_clean.replace("$", "").replace("\\", "").strip()
+
+                clean_opts_exact = [_clean_content_exact(opt) for opt in opts]
+                if len(set(clean_opts_exact)) < len(clean_opts_exact):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Final paper validation failed: MCQ item '{q_text[:40]}' has duplicate/ambiguous options.",
+                    )
+                corr = str(q.get("correct_answer") or "").strip()
+                if corr:
+                    letter_match = re.match(r"^\s*(?:option\s+)?\(?([A-Da-d])\)?[\.\:\)]?\s*$", corr)
+                    if letter_match:
+                        letter_idx = ord(letter_match.group(1).upper()) - ord("A")
+                        matches = [letter_idx] if 0 <= letter_idx < len(opts) else []
+                    else:
+                        clean_corr = _clean_content_exact(corr).lower()
+                        clean_opts_lower = [c.lower() for c in clean_opts_exact]
+                        matches = [
+                            i for i, c_opt in enumerate(clean_opts_lower)
+                            if clean_corr == c_opt or (clean_corr and clean_corr in c_opt) or (c_opt and c_opt in clean_corr)
+                        ]
+                    if not matches:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Final paper validation failed: MCQ item '{q_text[:40]}' correct_answer does not match any option.",
+                        )
+            else:
+                q["mcq_options"] = None
 
         # 5. Chapter attribution and reference reuse dual-cap validation
         if selected_chapter_ids:
@@ -1254,6 +2365,27 @@ SOURCE EDUCATIONAL MATERIAL:
                 if ch_id and str(ch_id) not in selected_id_strs:
                     logger.warning(f"Question chapter_id '{ch_id}' outside selected_chapter_ids; remapping.")
                     q["chapter_id"] = str(selected_chapter_ids[0])
+
+        if chapter_weightages_data:
+            # Check chapter marks distribution
+            ch_marks_map: Dict[str, int] = {}
+            for q in generated_questions:
+                cid = str(q.get("chapter_id", ""))
+                # internal choice: count only once per choice group
+                cg = q.get("choice_group")
+                if cg and q.get("alternative_label") == "b":
+                    continue
+                ch_marks_map[cid] = ch_marks_map.get(cid, 0) + q.get("marks", 0)
+
+            for ch_item in chapter_weightages_data:
+                cid = str(ch_item.get("chapter_id", ""))
+                alloc = ch_item.get("allocated_marks", 0)
+                actual = ch_marks_map.get(cid, 0)
+                if not _is_mock(ch_item.get("chapter_id")) and not _is_mock(alloc) and alloc > 0 and actual == 0:
+                    logger.warning(
+                        f"Final integrity notice: Selected Chapter {ch_item.get('chapter_number')} "
+                        f"('{ch_item.get('chapter_name')}') has {alloc} allocated marks but 0 questions assigned."
+                    )
 
         if generation_mode == GenerationMode.REFERENCE and chapter_weightages_data:
             max_overall_reused = max(1, int(0.20 * blueprint.total_marks))
@@ -1268,14 +2400,15 @@ SOURCE EDUCATIONAL MATERIAL:
                 if ch_reused > ch_alloc:
                     logger.warning(f"Final integrity notice: chapter {ch_id} reused marks ({ch_reused}) exceeds allocated weightage ({ch_alloc}).")
 
-        logger.info(f"Monolithic final paper validation passed cleanly: {len(generated_questions)} items, {computed_marks} total marks.")
+        # 6. Cognitive reasoning style retention check
+        for sec in blueprint.sections:
+            if getattr(sec, "reasoning_style", None):
+                for q in generated_questions:
+                    if q.get("section_name") == sec.name:
+                        if not q.get("reasoning_style"):
+                            q["reasoning_style"] = sec.reasoning_style
 
-    def _is_question_grounded(self, q: Dict[str, Any], context_text: str = "") -> bool:
-        """
-        Legacy grounding check stub. Post-generation educational rejection is completely disabled.
-        Always returns True to ensure model-generated content within scope is accepted.
-        """
-        return True
+        logger.info(f"Monolithic final paper validation passed cleanly: {len(generated_questions)} items, {computed_marks} total marks.")
 
     def _is_duplicate_question(
         self,
@@ -1283,27 +2416,18 @@ SOURCE EDUCATIONAL MATERIAL:
         existing_questions: List[Dict[str, Any]],
     ) -> bool:
         """
-        Check if candidate question text is a semantic/phrasing duplicate of any existing question.
-        Rejects exact text match or high fuzzy text overlap.
+        Check if candidate question text is a duplicate of any existing question in the paper.
+        Rejects 100% exact normalized text matches (case-insensitive, punctuation stripped, whitespace normalized).
         """
         cand_text = self._normalize_text(candidate.get("question_text", ""))
+        if not cand_text:
+            return False
 
         for ex in existing_questions:
             ex_text = self._normalize_text(ex.get("question_text", ""))
             if cand_text == ex_text:
+                logger.info(f"Duplicate question rejected (100% exact match): '{cand_text[:60]}'")
                 return True
-
-            # Fuzzy text overlap / Jaccard token similarity
-            cand_tokens = set(cand_text.split())
-            ex_tokens = set(ex_text.split())
-
-            if cand_tokens and ex_tokens:
-                intersection = cand_tokens.intersection(ex_tokens)
-                union = cand_tokens.union(ex_tokens)
-                jaccard = len(intersection) / float(len(union))
-                if jaccard > 0.75:
-                    logger.info(f"Duplicate question rejected (Jaccard similarity {jaccard:.2f}): '{cand_text[:40]}'")
-                    return True
 
         return False
 
@@ -1314,26 +2438,81 @@ SOURCE EDUCATIONAL MATERIAL:
         easy_pct: Optional[int] = None,
         med_pct: Optional[int] = None,
         hard_pct: Optional[int] = None,
+        marks_per_q: Optional[int] = None,
     ) -> List[str]:
-        if easy_pct is not None and med_pct is not None and hard_pct is not None:
-            easy_cnt = int(round(count * (easy_pct / 100.0)))
-            hard_cnt = int(round(count * (hard_pct / 100.0)))
-            med_cnt = max(0, count - easy_cnt - hard_cnt)
+        if count <= 0:
+            return []
 
-            dist = (["EASY"] * easy_cnt) + (["MEDIUM"] * med_cnt) + (["HARD"] * hard_cnt)
-            if len(dist) < count:
-                dist.extend(["MEDIUM"] * (count - len(dist)))
-            return dist[:count]
-
-        if difficulty != DifficultyLevel.MIXED:
+        # If user explicitly selected a uniform single difficulty (e.g. DifficultyLevel.EASY)
+        # without custom percentages, return uniform distribution.
+        if difficulty != DifficultyLevel.MIXED and (easy_pct is None or med_pct is None or hard_pct is None):
             return [difficulty.value] * count
 
-        # MIXED distribution: ~30% Easy, ~50% Medium, ~20% Hard
-        easy_cnt = max(1 if count >= 3 else 0, int(round(count * 0.3)))
-        hard_cnt = max(1 if count >= 5 else 0, int(round(count * 0.2)))
-        med_cnt = max(1, count - easy_cnt - hard_cnt)
+        # Determine target percentage weights
+        if easy_pct is not None and med_pct is not None and hard_pct is not None:
+            e_pct = float(easy_pct)
+            m_pct = float(med_pct)
+            h_pct = float(hard_pct)
+        else:
+            # Default MIXED distribution: ~30% Easy, ~50% Medium, ~20% Hard
+            e_pct = 30.0
+            m_pct = 50.0
+            h_pct = 20.0
 
-        dist = (["EASY"] * easy_cnt) + (["MEDIUM"] * med_cnt) + (["HARD"] * hard_cnt)
+        # Special Case: Single question in section (count == 1)
+        if count == 1:
+            # If equal split between Easy and Hard (e.g. 50% Easy / 50% Hard), choose MEDIUM as neutral midpoint
+            if e_pct == h_pct and e_pct > 0 and (m_pct == 0 or e_pct == m_pct):
+                return ["MEDIUM"]
+            # Otherwise, pick the tier with strictly the highest configured percentage
+            best_tier = max(
+                [("EASY", e_pct), ("MEDIUM", m_pct), ("HARD", h_pct)],
+                key=lambda x: x[1]
+            )[0]
+            return [best_tier]
+
+        # Largest Remainder Method (Hamilton Method) for exact integer distribution
+        quotas = {
+            "EASY": count * (e_pct / 100.0),
+            "MEDIUM": count * (m_pct / 100.0),
+            "HARD": count * (h_pct / 100.0),
+        }
+
+        # Base integer counts
+        counts = {tier: int(math.floor(q)) for tier, q in quotas.items()}
+        allocated = sum(counts.values())
+        needed = count - allocated
+
+        if needed > 0:
+            # Calculate fractional remainders
+            remainders = {tier: quotas[tier] - counts[tier] for tier in quotas}
+
+            # Tie-breaker priorities when remainders are identical:
+            # For 2 questions on 33/33/34 (0.66 Easy, 0.66 Medium, 0.68 Hard):
+            # Hard wins 1st slot (0.68). Easy and Medium tie at 0.66.
+            # Breaking tie in favor of EASY gives [EASY, HARD], a balanced spectrum.
+            # If marks_per_q >= 4, lean HARD > MEDIUM > EASY.
+            # If marks_per_q <= 2, lean EASY > MEDIUM > HARD.
+            if marks_per_q is not None and marks_per_q >= 4:
+                tie_order = {"HARD": 3, "MEDIUM": 2, "EASY": 1}
+            elif marks_per_q is not None and marks_per_q <= 2:
+                tie_order = {"EASY": 3, "MEDIUM": 2, "HARD": 1}
+            else:
+                tie_order = {"EASY": 3, "HARD": 2, "MEDIUM": 1}
+
+            # Sort tiers by (remainder descending, tie_order descending)
+            ranked_tiers = sorted(
+                ["EASY", "MEDIUM", "HARD"],
+                key=lambda t: (round(remainders[t], 6), tie_order[t]),
+                reverse=True,
+            )
+
+            for i in range(needed):
+                tier_to_increment = ranked_tiers[i % len(ranked_tiers)]
+                counts[tier_to_increment] += 1
+
+        # Intra-section progression: Easy -> Medium -> Hard
+        dist = (["EASY"] * counts["EASY"]) + (["MEDIUM"] * counts["MEDIUM"]) + (["HARD"] * counts["HARD"])
         return dist[:count]
 
     def _create_fallback_question(
@@ -1361,8 +2540,8 @@ SOURCE EDUCATIONAL MATERIAL:
                     "C. It specifies network protocol headers.",
                     "D. It controls hardware clock cycles.",
                 ],
-                "correct_answer": "A. It defines the primary execution mechanism.",
-                "solution_explanation": "Option A correctly describes the primary execution mechanism.",
+                "correct_answer": None,
+                "solution_explanation": None,
             }
         elif q_type == "NUMERICAL":
             res = {
@@ -1373,9 +2552,9 @@ SOURCE EDUCATIONAL MATERIAL:
                 "marks": sec.marks_per_question,
                 "difficulty": difficulty,
                 "source_type": "AI_GENERATED",
-                "numerical_values": {"arrival_time_ms": order, "burst_time_ms": order * 2},
-                "correct_answer": f"{order * 3} ms",
-                "solution_explanation": f"Total time = Arrival ({order}) + Burst ({order * 2}) = {order * 3} ms.",
+                "numerical_values": None,
+                "correct_answer": None,
+                "solution_explanation": None,
                 "unit": "ms",
             }
         else:
@@ -1387,12 +2566,20 @@ SOURCE EDUCATIONAL MATERIAL:
                 "marks": sec.marks_per_question,
                 "difficulty": difficulty,
                 "source_type": "AI_GENERATED",
-                "expected_answer": f"Concept{suffix} involves defining operational steps, execution boundaries, and resource utilization.",
-                "solution_explanation": "Full marks awarded for detailing operational steps and execution boundaries.",
+                "expected_answer": None,
+                "solution_explanation": None,
             }
 
         res["choice_group"] = choice_group
         res["alternative_label"] = alternative_label
+
+        r_style = getattr(sec, "reasoning_style", None)
+        if r_style and any(kw in r_style for kw in ("SCENARIO", "CASE", "VIGNETTE")):
+            res["question_text"] = f"In an applied case study scenario{suffix}, an organization encounters unexpected behavioral variations. Analyze the situation and discuss the primary factors influencing this outcome."
+            res["reasoning_style"] = r_style
+        elif r_style:
+            res["reasoning_style"] = r_style
+
         return res
 
     def _normalize_text(self, text: str) -> str:
@@ -1459,6 +2646,16 @@ SOURCE EDUCATIONAL MATERIAL:
         """
         question_responses: List[PaperQuestionResponse] = []
 
+        sec_style_map: Dict[str, Optional[str]] = {}
+        sec_desc_map: Dict[str, Optional[str]] = {}
+        raw_bp = getattr(paper, "blueprint_json", None)
+        if isinstance(raw_bp, dict) and "sections" in raw_bp and isinstance(raw_bp["sections"], list):
+            for s in raw_bp["sections"]:
+                if isinstance(s, dict) and "name" in s:
+                    s_key = str(s["name"]).strip().lower()
+                    sec_style_map[s_key] = s.get("reasoning_style")
+                    sec_desc_map[s_key] = s.get("section_description")
+
         for q in paper.questions:
             mcq_opts = q.mcq_options
             corr_ans = q.correct_answer if include_answers else None
@@ -1506,6 +2703,25 @@ SOURCE EDUCATIONAL MATERIAL:
             alt_lbl = getattr(q, "alternative_label", None)
             alt_lbl = None if _is_mock(alt_lbl) else alt_lbl
 
+            q_sec_name_clean = str(q.section_name or "").strip().lower()
+            raw_style = getattr(q, "reasoning_style", None)
+            if _is_mock(raw_style):
+                raw_style = None
+            if not raw_style and q_sec_name_clean:
+                raw_style = sec_style_map.get(q_sec_name_clean)
+            if _is_mock(raw_style):
+                raw_style = None
+            q_reasoning_style = str(raw_style) if raw_style else None
+
+            raw_desc = getattr(q, "section_description", None)
+            if _is_mock(raw_desc):
+                raw_desc = None
+            if not raw_desc and q_sec_name_clean:
+                raw_desc = sec_desc_map.get(q_sec_name_clean)
+            if _is_mock(raw_desc):
+                raw_desc = None
+            q_section_desc = str(raw_desc) if raw_desc else None
+
             question_responses.append(
                 PaperQuestionResponse(
                     id=q_id,
@@ -1520,6 +2736,8 @@ SOURCE EDUCATIONAL MATERIAL:
                     is_numerical=is_num,
                     choice_group=choice_grp,
                     alternative_label=alt_lbl,
+                    reasoning_style=q_reasoning_style,
+                    section_description=q_section_desc,
                     mcq_options=mcq_opts,
                     correct_answer=corr_ans,
                     expected_answer=exp_ans,
@@ -1582,40 +2800,114 @@ SOURCE EDUCATIONAL MATERIAL:
 
         reference_eligible = bool(has_saved_pdf and proc_status == "READY" and getattr(paper, "deleted_at", None) is None)
 
+        raw_id = getattr(paper, "id", None)
+        paper_id = uuid4() if (_is_mock(raw_id) or not raw_id) else (UUID(str(raw_id)) if not isinstance(raw_id, UUID) else raw_id)
+
+        raw_ws_id = getattr(paper, "workspace_id", None)
+        ws_id = uuid4() if (_is_mock(raw_ws_id) or not raw_ws_id) else (UUID(str(raw_ws_id)) if not isinstance(raw_ws_id, UUID) else raw_ws_id)
+
+        raw_sub_id = getattr(paper, "subject_id", None)
+        sub_id = uuid4() if (_is_mock(raw_sub_id) or not raw_sub_id) else (UUID(str(raw_sub_id)) if not isinstance(raw_sub_id, UUID) else raw_sub_id)
+
+        raw_book_id = getattr(paper, "book_id", None)
+        book_id = uuid4() if (_is_mock(raw_book_id) or not raw_book_id) else (UUID(str(raw_book_id)) if not isinstance(raw_book_id, UUID) else raw_book_id)
+
+        raw_ref_id = getattr(paper, "reference_paper_id", None)
+        ref_id = None if (_is_mock(raw_ref_id) or not raw_ref_id) else (UUID(str(raw_ref_id)) if not isinstance(raw_ref_id, UUID) else raw_ref_id)
+
+        raw_title = getattr(paper, "title", None)
+        title_val = "Generated Paper" if (_is_mock(raw_title) or not raw_title) else str(raw_title)
+
+        raw_bp = getattr(paper, "blueprint_json", None)
+        bp_val = None if _is_mock(raw_bp) else raw_bp
+
+        raw_err = getattr(paper, "error_message", None)
+        err_val = None if _is_mock(raw_err) else raw_err
+
+        raw_easy = getattr(paper, "easy_percentage", None)
+        easy_val = None if _is_mock(raw_easy) else raw_easy
+
+        raw_med = getattr(paper, "medium_percentage", None)
+        med_val = None if _is_mock(raw_med) else raw_med
+
+        raw_hard = getattr(paper, "hard_percentage", None)
+        hard_val = None if _is_mock(raw_hard) else raw_hard
+
         raw_time = getattr(paper, "time_allowed_minutes", None)
         time_allowed = None if _is_mock(raw_time) else raw_time
 
         raw_class = getattr(paper, "class_name", None)
         cls_name = None if _is_mock(raw_class) else raw_class
 
+        raw_mode = getattr(paper, "generation_mode", None)
+        if _is_mock(raw_mode) or not raw_mode:
+            gen_mode = GenerationMode.CUSTOM
+        else:
+            try:
+                gen_mode = GenerationMode(str(getattr(raw_mode, "value", raw_mode)))
+            except Exception:
+                gen_mode = GenerationMode.CUSTOM
+
+        raw_diff = getattr(paper, "difficulty", None)
+        if _is_mock(raw_diff) or not raw_diff:
+            diff_mode = DifficultyLevel.MIXED
+        else:
+            try:
+                diff_mode = DifficultyLevel(str(getattr(raw_diff, "value", raw_diff)))
+            except Exception:
+                diff_mode = DifficultyLevel.MIXED
+
+        raw_status = getattr(paper, "status", None)
+        if _is_mock(raw_status) or not raw_status:
+            status_val = "COMPLETED"
+        else:
+            status_val = str(getattr(raw_status, "value", raw_status))
+
+        raw_marks = getattr(paper, "total_marks", None)
+        if _is_mock(raw_marks) or raw_marks is None:
+            total_marks_val = sum(q.marks for q in question_responses) if question_responses else 100
+        else:
+            try:
+                total_marks_val = int(raw_marks)
+            except Exception:
+                total_marks_val = sum(q.marks for q in question_responses) if question_responses else 100
+
+        raw_inc_ans = getattr(paper, "include_answers", None)
+        inc_ans_val = False if (_is_mock(raw_inc_ans) or raw_inc_ans is None) else bool(raw_inc_ans)
+
+        raw_created = getattr(paper, "created_at", None)
+        created_val = datetime.now(timezone.utc) if (_is_mock(raw_created) or not raw_created) else raw_created
+
+        raw_updated = getattr(paper, "updated_at", None)
+        updated_val = datetime.now(timezone.utc) if (_is_mock(raw_updated) or not raw_updated) else raw_updated
+
         return PaperResponse(
-            id=paper.id,
-            workspace_id=paper.workspace_id,
-            subject_id=paper.subject_id,
-            book_id=paper.book_id,
-            reference_paper_id=paper.reference_paper_id,
-            title=paper.title,
-            generation_mode=GenerationMode(paper.generation_mode),
-            status=paper.status,
-            total_marks=paper.total_marks,
+            id=paper_id,
+            workspace_id=ws_id,
+            subject_id=sub_id,
+            book_id=book_id,
+            reference_paper_id=ref_id,
+            title=title_val,
+            generation_mode=gen_mode,
+            status=status_val,
+            total_marks=total_marks_val,
             time_allowed_minutes=time_allowed,
             class_name=cls_name,
-            difficulty=DifficultyLevel(paper.difficulty),
-            easy_percentage=getattr(paper, "easy_percentage", None),
-            medium_percentage=getattr(paper, "medium_percentage", None),
-            hard_percentage=getattr(paper, "hard_percentage", None),
-            topic_focus=paper.topic_focus,
+            difficulty=diff_mode,
+            easy_percentage=easy_val,
+            medium_percentage=med_val,
+            hard_percentage=hard_val,
             selected_chapters=weightage_responses or [],
-            include_answers=paper.include_answers,
-            blueprint_json=paper.blueprint_json,
-            error_message=paper.error_message,
+            include_answers=inc_ans_val,
+            blueprint_json=bp_val,
+            error_message=err_val,
             has_saved_pdf=has_saved_pdf,
             pdf_url=pdf_url,
             processing_status=proc_status,
             reference_eligible=reference_eligible,
             questions=question_responses,
-            created_at=paper.created_at,
-            updated_at=paper.updated_at,
+            created_at=created_val,
+            updated_at=updated_val,
         )
 
     def save_pdf(
@@ -1759,10 +3051,36 @@ SOURCE EDUCATIONAL MATERIAL:
                 self.doc_repo.save_document_chunks(doc_id, chunks_data)
 
             self.doc_repo.mark_ready(doc_id)
-            self.paper_repo.update_saved_pdf(paper_id=paper_id, pdf_path=stored_path, document_id=doc_id, processing_status="READY")
+
+            # Analyze edited PDF text to generate updated blueprint reflecting user edits
+            pages_text = [p.get("text_content", "") for p in pages_data if p.get("text_content")]
+            updated_blueprint_dict = None
+            if pages_text:
+                try:
+                    updated_bp = self.blueprint_service.analyze_reference_paper(
+                        paper_pages_text=pages_text,
+                        requested_total_marks=None,
+                    )
+                    if updated_bp:
+                        updated_blueprint_dict = updated_bp.model_dump()
+                except Exception as bp_err:
+                    logger.warning(f"Could not extract updated blueprint from saved PDF for paper {paper_id}: {bp_err}")
+
+            self.paper_repo.update_saved_pdf(
+                paper_id=paper_id,
+                pdf_path=stored_path,
+                document_id=doc_id,
+                processing_status="READY",
+                blueprint_json=updated_blueprint_dict,
+            )
         except Exception as exc:
             logger.error(f"Failed processing saved paper PDF for paper {paper_id}: {exc}")
-            self.paper_repo.update_saved_pdf(paper_id=paper_id, pdf_path=stored_path, document_id=doc_id, processing_status="READY")
+            self.paper_repo.update_saved_pdf(
+                paper_id=paper_id,
+                pdf_path=stored_path,
+                document_id=doc_id,
+                processing_status="READY",
+            )
 
     def get_paper_pdf_path(self, paper_id: UUID, current_user_id: UUID) -> Tuple[str, str]:
         """

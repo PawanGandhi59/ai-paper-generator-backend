@@ -34,6 +34,10 @@ class Document(Base):
     processing_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     processing_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     processing_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    embedding_status: Mapped[str] = mapped_column(String(50), default="NOT_STARTED", nullable=False, index=True)
+    embedding_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    embedding_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)

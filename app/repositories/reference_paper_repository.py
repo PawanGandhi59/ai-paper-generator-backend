@@ -56,11 +56,12 @@ class ReferencePaperRepository:
 
         created_pages = []
         for p_info in pages_data:
+            clean_text = (p_info.get("text_content") or "").replace("\x00", "")
             page = ReferencePaperPage(
                 reference_paper_id=paper_id,
                 page_number=p_info["page_number"],
                 content_type=p_info.get("content_type", "PAGE"),
-                text_content=p_info.get("text_content", ""),
+                text_content=clean_text,
             )
             self.db.add(page)
             created_pages.append(page)
