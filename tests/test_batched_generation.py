@@ -448,3 +448,116 @@ def test_recovery_max_attempts_is_five():
     assert questions[0]["source_type"] == "AI_GENERATED"
     assert "concept" in questions[0]["question_text"]
 
+
+def test_partition_planned_sections_counts_internal_choice_alternatives():
+    """
+    Test that when questions have internal choices (alternatives), each alternative
+    slot counts towards the max_batch_size (100) limit.
+    60 questions with 2 alternatives each = 120 total questions to generate.
+    Must be split into 2 batches (50 questions = 100 items, and 10 questions = 20 items).
+    """
+    svc = PaperGeneratorService(db=MagicMock())
+    sec = SectionBlueprint(
+        name="Section A",
+        question_type=QuestionType.SHORT_ANSWER,
+        question_count=60,
+        marks_per_question=2,
+        total_section_marks=120,
+        has_internal_choice=True,
+        alternatives_per_question=2,
+    )
+    bp = PaperBlueprint(total_marks=120, sections=[sec])
+    planned = svc.preplan_blueprint_matrix(bp, difficulty=DifficultyLevel.EASY)
+
+    batches = svc._partition_planned_sections_into_batches(planned, max_batch_size=100)
+    assert len(batches) == 2
+
+    # Batch 1: 50 question groups * 2 alternatives = 100 question items
+    b1_groups = [g for bs in batches[0] for g in bs["groups"]]
+    assert len(b1_groups) == 50
+    b1_items = sum(len(g["required_alts"]) for g in b1_groups)
+    assert b1_items == 100
+
+    # Batch 2: remaining 10 question groups * 2 alternatives = 20 question items
+    b2_groups = [g for bs in batches[1] for g in bs["groups"]]
+    assert len(b2_groups) == 10
+    b2_items = sum(len(g["required_alts"]) for g in b2_groups)
+    assert b2_items == 20
+
+
+def test_partition_planned_sections_100_questions_with_alternatives_meaning_200_total():
+    """
+    User scenario:
+    100 questions with alternatives (2 alternatives per question = 200 total items).
+    Must NOT be packed into a single batch of 100 groups (200 items).
+    Must be partitioned into 2 batches of 50 groups (100 items) each.
+    """
+    svc = PaperGeneratorService(db=MagicMock())
+    sec = SectionBlueprint(
+        name="Section A",
+        question_type=QuestionType.MCQ,
+        question_count=100,
+        marks_per_question=1,
+        total_section_marks=100,
+        has_internal_choice=True,
+        alternatives_per_question=2,
+    )
+    bp = PaperBlueprint(total_marks=100, sections=[sec])
+    planned = svc.preplan_blueprint_matrix(bp, difficulty=DifficultyLevel.EASY)
+
+    batches = svc._partition_planned_sections_into_batches(planned, max_batch_size=100)
+    assert len(batches) == 2
+
+    # Batch 1: 50 groups * 2 alts = 100 items
+    b1_groups = [g for bs in batches[0] for g in bs["groups"]]
+    assert len(b1_groups) == 50
+    assert sum(len(g["required_alts"]) for g in b1_groups) == 100
+
+    # Batch 2: 50 groups * 2 alts = 100 items
+    b2_groups = [g for bs in batches[1] for g in bs["groups"]]
+    assert len(b2_groups) == 50
+    assert sum(len(g["required_alts"]) for g in b2_groups) == 100
+
+
+def test_partition_planned_sections_mixed_choices_and_standard_questions():
+    """
+    Test mix of questions with and without internal choice:
+    - Section A: 40 questions with 1 alternative (40 items).
+    - Section B: 40 questions with 2 alternatives (80 items).
+    Total items = 40 + 80 = 120 items.
+    Batch 1: 40 from Sec A + 30 from Sec B = 40 + (30 * 2) = 100 items.
+    Batch 2: remaining 10 from Sec B = 10 * 2 = 20 items.
+    """
+    svc = PaperGeneratorService(db=MagicMock())
+    sec_a = SectionBlueprint(
+        name="Section A",
+        question_type=QuestionType.MCQ,
+        question_count=40,
+        marks_per_question=1,
+        total_section_marks=40,
+        has_internal_choice=False,
+        alternatives_per_question=1,
+    )
+    sec_b = SectionBlueprint(
+        name="Section B",
+        question_type=QuestionType.SHORT_ANSWER,
+        question_count=40,
+        marks_per_question=2,
+        total_section_marks=80,
+        has_internal_choice=True,
+        alternatives_per_question=2,
+    )
+    bp = PaperBlueprint(total_marks=120, sections=[sec_a, sec_b])
+    planned = svc.preplan_blueprint_matrix(bp, difficulty=DifficultyLevel.EASY)
+
+    batches = svc._partition_planned_sections_into_batches(planned, max_batch_size=100)
+    assert len(batches) == 2
+
+    # Batch 1: Sec A (40 groups, 40 items) + Sec B (30 groups, 60 items) = 100 items
+    b1_items = sum(len(g["required_alts"]) for bs in batches[0] for g in bs["groups"])
+    assert b1_items == 100
+
+    # Batch 2: Sec B (10 groups, 20 items) = 20 items
+    b2_items = sum(len(g["required_alts"]) for bs in batches[1] for g in bs["groups"])
+    assert b2_items == 20
+
