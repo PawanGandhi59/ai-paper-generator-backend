@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.repositories.document_repository import DocumentRepository
+from app.services.storage import storage_service
 from app.repositories.workspace_repository import WorkspaceRepository
 from app.services.ai.chapter_detection_service import ChapterDetectionService
 from app.services.ai.chapter_digest_service import ChapterDigestService
@@ -66,6 +67,7 @@ def cleanup_failed_document(db: Session, document_id_str: str, error_msg: str):
         if os.path.exists(doc_dir):
             shutil.rmtree(doc_dir, ignore_errors=True)
             logger.info(f"Cleaned up disk storage for failed document_id={document_id_str}")
+        storage_service.delete_prefix(f"documents/{document_id_str}")
 
         doc_repo = DocumentRepository(db)
         doc_repo.delete_document(doc_id)
@@ -119,15 +121,25 @@ def process_document(self, document_id_str: str) -> dict:
             cleanup_failed_document(db, document_id_str, "Missing stored_path")
             return {"status": "FAILED", "reason": "Missing stored_path"}
 
-        doc_dir = os.path.dirname(doc.stored_path)
+        # Resolve local file path (downloading from S3 if running in S3 mode and not cached locally)
+        local_file_path = storage_service.get_local_path(doc.stored_path)
+        if not os.path.exists(local_file_path):
+            try:
+                storage_service.download_file(doc.stored_path, local_file_path)
+            except Exception as dl_exc:
+                logger.error(f"Failed downloading document from storage: {dl_exc}")
+                cleanup_failed_document(db, document_id_str, f"Storage download failed: {dl_exc}")
+                return {"status": "FAILED", "reason": f"Storage download failed: {dl_exc}"}
+
+        doc_dir = os.path.dirname(local_file_path)
         _, ext = os.path.splitext(doc.original_filename)
         ext_lower = ext.lower()
 
         # 2. Extract Document Pages (using fast OCR mode for textbooks and long books)
         if ext_lower == ".pdf":
-            pages_data = PDFProcessor.process_pdf(doc.stored_path, doc_dir, ocr_mode="fast")
+            pages_data = PDFProcessor.process_pdf(local_file_path, doc_dir, ocr_mode="fast")
         elif ext_lower == ".pptx":
-            pages_data = PPTXProcessor.process_pptx(doc.stored_path, doc_dir)
+            pages_data = PPTXProcessor.process_pptx(local_file_path, doc_dir)
         else:
             cleanup_failed_document(db, document_id_str, f"Unsupported extension {ext_lower}")
             return {"status": "FAILED", "reason": f"Unsupported extension {ext_lower}"}

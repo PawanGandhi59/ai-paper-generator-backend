@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     CELERY_RESULT_BACKEND: str = "redis://redis:6379/1"
 
     LOCAL_STORAGE_PATH: str = "/app/storage"
+    STORAGE_BACKEND: str = "local"  # "local" or "s3"
+    AWS_S3_BUCKET: str = ""
+    AWS_REGION: str = "ap-south-1"
+    AWS_ACCESS_KEY_ID: str = ""
+    AWS_SECRET_ACCESS_KEY: str = ""
     MAX_UPLOAD_SIZE_MB: int = 500
 
     OCR_ENABLED: bool = True

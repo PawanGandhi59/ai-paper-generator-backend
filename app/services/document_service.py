@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.repositories.document_repository import DocumentRepository
+from app.services.storage import storage_service
 from app.services.workspace_service import WorkspaceService
 from app.worker import generate_document_embeddings, process_document
 
@@ -141,11 +142,18 @@ class DocumentService:
             # 4. Validate Magic File Signature & Structure
             validate_file_signature(header_bytes, ext_lower, stored_path)
 
+            # 4.5. Upload to persistent storage (S3 or local)
+            remote_key = f"documents/{doc_id}/original{ext_lower}"
+            storage_service.upload_file(stored_path, remote_key, content_type=content_type)
+            stored_record_path = remote_key if storage_service.is_s3_enabled else stored_path
+
         except HTTPException:
             shutil.rmtree(doc_dir, ignore_errors=True)
+            storage_service.delete_prefix(f"documents/{doc_id}")
             raise
         except Exception as exc:
             shutil.rmtree(doc_dir, ignore_errors=True)
+            storage_service.delete_prefix(f"documents/{doc_id}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Failed to process uploaded file: {str(exc)}",
@@ -157,7 +165,7 @@ class DocumentService:
             book_id=book.id,
             chapter_id=chapter_id,
             original_filename=original_filename,
-            stored_path=stored_path,
+            stored_path=stored_record_path,
             mime_type=content_type,
             file_size=total_written,
             processing_status="UPLOADED",
@@ -169,6 +177,7 @@ class DocumentService:
         except Exception as queue_exc:
             print(f"Error: Celery task enqueue failed: {queue_exc}")
             shutil.rmtree(doc_dir, ignore_errors=True)
+            storage_service.delete_prefix(f"documents/{doc_id}")
             self.doc_repo.delete_document(doc.id)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

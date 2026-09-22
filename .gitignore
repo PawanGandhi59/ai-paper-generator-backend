@@ -51,7 +51,7 @@ htmlcov/
 # Database / Docker persistent data
 *.sqlite3
 postgres_data/
-storage/
+/storage/
 
 # Documentation
 API_DOCUMENTATION.md

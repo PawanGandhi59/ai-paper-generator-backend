@@ -16,6 +16,7 @@ from app.schemas.book import (
     MinimalSubjectRef,
     MinimalWorkspaceRef,
 )
+from app.services.storage import storage_service
 from app.utils.storage_utils import get_document_storage_url, is_textbook_document
 
 
@@ -81,6 +82,7 @@ class WorkspaceService:
         for path in dirs_to_delete:
             if os.path.exists(path):
                 shutil.rmtree(path, ignore_errors=True)
+            storage_service.delete_prefix(path)
 
     # Subject operations
     def create_subject(self, workspace_id: UUID, current_user_id: UUID, name: str) -> Subject:
@@ -155,10 +157,11 @@ class WorkspaceService:
         # Soft delete DB records recursively
         self.repo.delete_subject(subject)
 
-        # Hard delete physical files on disk
+        # Hard delete physical files on disk and storage
         for path in dirs_to_delete:
             if os.path.exists(path):
                 shutil.rmtree(path, ignore_errors=True)
+            storage_service.delete_prefix(path)
 
     # Book operations
     def create_book(self, subject_id: UUID, current_user_id: UUID, name: str) -> Book:
@@ -278,10 +281,11 @@ class WorkspaceService:
         # Soft delete DB records
         self.repo.delete_book(book)
 
-        # Hard delete physical files on disk
+        # Hard delete physical files on disk and storage
         for path in dirs_to_delete:
             if os.path.exists(path):
                 shutil.rmtree(path, ignore_errors=True)
+            storage_service.delete_prefix(path)
 
 
     # Chapter operations
@@ -440,8 +444,9 @@ class WorkspaceService:
         # Soft delete DB records
         self.repo.delete_chapter(chapter)
 
-        # Hard delete physical files on disk
+        # Hard delete physical files on disk and storage
         for path in dirs_to_delete:
             if os.path.exists(path):
                 shutil.rmtree(path, ignore_errors=True)
+            storage_service.delete_prefix(path)
 

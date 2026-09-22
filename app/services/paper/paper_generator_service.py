@@ -44,6 +44,7 @@ from app.services.paper.blueprint_service import BlueprintService, PaperBlueprin
 from app.services.processors.pdf_processor import PDFProcessor
 from app.services.retrieval.chunking_service import ChunkingService
 from app.services.retrieval.retrieval_service import RetrievalService
+from app.services.storage import storage_service
 from app.services.workspace_service import WorkspaceService
 
 logger = logging.getLogger(__name__)
@@ -3066,25 +3067,35 @@ SOURCE EDUCATIONAL MATERIAL:
                 except Exception as bp_err:
                     logger.warning(f"Could not extract updated blueprint from saved PDF for paper {paper_id}: {bp_err}")
 
+            # Upload to persistent storage (S3 or local)
+            remote_key = f"generated_papers/{paper_id}/final.pdf"
+            storage_service.upload_file(stored_path, remote_key, content_type="application/pdf")
+            stored_record_path = remote_key if storage_service.is_s3_enabled else stored_path
+
             self.paper_repo.update_saved_pdf(
                 paper_id=paper_id,
-                pdf_path=stored_path,
+                pdf_path=stored_record_path,
                 document_id=doc_id,
                 processing_status="READY",
                 blueprint_json=updated_blueprint_dict,
             )
         except Exception as exc:
             logger.error(f"Failed processing saved paper PDF for paper {paper_id}: {exc}")
+            remote_key = f"generated_papers/{paper_id}/final.pdf"
+            if os.path.exists(stored_path):
+                storage_service.upload_file(stored_path, remote_key, content_type="application/pdf")
+            stored_record_path = remote_key if storage_service.is_s3_enabled else stored_path
             self.paper_repo.update_saved_pdf(
                 paper_id=paper_id,
-                pdf_path=stored_path,
+                pdf_path=stored_record_path,
                 document_id=doc_id,
                 processing_status="READY",
             )
 
-    def get_paper_pdf_path(self, paper_id: UUID, current_user_id: UUID) -> Tuple[str, str]:
+    def get_paper_pdf_stream(self, paper_id: UUID, current_user_id: UUID) -> Tuple[Any, int, str, str]:
         """
-        Returns (file_path, paper_title) for secure PDF streaming preview/download.
+        Returns (stream, content_length, media_type, paper_title) for secure PDF streaming preview/download.
+        Works seamlessly across both AWS S3 and Local storage.
         """
         paper = self.paper_repo.get_paper(paper_id)
         if not paper or paper.deleted_at is not None:
@@ -3096,13 +3107,41 @@ SOURCE EDUCATIONAL MATERIAL:
         # Authorization check
         self.workspace_service.get_subject(paper.subject_id, current_user_id)
 
-        if not paper.pdf_path or not os.path.exists(paper.pdf_path):
+        if not paper.pdf_path or not storage_service.exists(paper.pdf_path):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Saved PDF not found for this paper.",
             )
 
-        return paper.pdf_path, paper.title
+        stream, length, mime = storage_service.get_stream(paper.pdf_path)
+        return stream, length, mime, paper.title
+
+    def get_paper_pdf_path(self, paper_id: UUID, current_user_id: UUID) -> Tuple[str, str]:
+        """
+        Returns (file_path, paper_title) for secure PDF streaming preview/download.
+        If file is on S3, ensures a local copy exists before returning path.
+        """
+        paper = self.paper_repo.get_paper(paper_id)
+        if not paper or paper.deleted_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Paper not found.",
+            )
+
+        # Authorization check
+        self.workspace_service.get_subject(paper.subject_id, current_user_id)
+
+        if not paper.pdf_path or not storage_service.exists(paper.pdf_path):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Saved PDF not found for this paper.",
+            )
+
+        local_path = storage_service.get_local_path(paper.pdf_path)
+        if not os.path.exists(local_path):
+            storage_service.download_file(paper.pdf_path, local_path)
+
+        return local_path, paper.title
 
     def delete_paper(self, paper_id: UUID, current_user_id: UUID) -> Dict[str, Any]:
         """
@@ -3122,16 +3161,18 @@ SOURCE EDUCATIONAL MATERIAL:
         # 1. Soft-delete paper DB record
         self.paper_repo.soft_delete_paper(paper.id)
 
-        # 2. Hard-delete physical PDF directory
+        # 2. Hard-delete physical PDF directory from storage
         paper_dir = os.path.join(settings.LOCAL_STORAGE_PATH, "generated_papers", str(paper.id))
         if os.path.exists(paper_dir):
             shutil.rmtree(paper_dir, ignore_errors=True)
+        storage_service.delete_prefix(f"generated_papers/{paper.id}")
 
         # 3. Hard-delete associated Document, Pages, Chunks & Embeddings
         if paper.document_id:
             doc_dir = os.path.join(settings.LOCAL_STORAGE_PATH, "documents", str(paper.document_id))
             if os.path.exists(doc_dir):
                 shutil.rmtree(doc_dir, ignore_errors=True)
+            storage_service.delete_prefix(f"documents/{paper.document_id}")
             self.doc_repo.delete_document(paper.document_id)
 
         return {"status": "deleted", "paper_id": str(paper.id)}

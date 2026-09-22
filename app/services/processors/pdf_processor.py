@@ -113,40 +113,14 @@ class PDFProcessor:
                         ocr_failed = True
                         ocr_error = f"OCR failed to extract readable text on page {page_number}"
 
-                # 3. Image extraction
-                page_images_dir = os.path.join(doc_dir, "pages", f"{page_number:04d}", "images")
-                os.makedirs(page_images_dir, exist_ok=True)
-
-                saved_image_paths = []
-                image_list = page.get_images(full=True)
-
-                for img_idx, img_info in enumerate(image_list):
-                    try:
-                        xref = img_info[0]
-                        base_image = pdf_doc.extract_image(xref)
-                        image_bytes = base_image["image"]
-                        image_ext = base_image["ext"]
-
-                        image_filename = f"image_{img_idx + 1}.{image_ext}"
-                        full_img_path = os.path.join(page_images_dir, image_filename)
-
-                        with open(full_img_path, "wb") as img_file:
-                            img_file.write(image_bytes)
-
-                        saved_image_paths.append(full_img_path)
-                    except Exception as img_exc:
-                        print(f"Image extraction warning on page {page_number}, img {img_idx}: {img_exc}")
-
-                first_image_path = saved_image_paths[0] if saved_image_paths else None
-
                 pages_data.append({
                     "page_number": page_number,
                     "content_type": "PAGE",
                     "text_content": usable_text,
-                    "image_path": first_image_path,
+                    "image_path": None,
                     "metadata_json": {
-                        "image_count": len(saved_image_paths),
-                        "extracted_image_paths": saved_image_paths,
+                        "image_count": 0,
+                        "extracted_image_paths": [],
                         "ocr_applied": ocr_applied,
                         "ocr_failed": ocr_failed,
                         "ocr_error": ocr_error,

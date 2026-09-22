@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.repositories.reference_paper_repository import ReferencePaperRepository
 from app.services.processors.pdf_processor import PDFProcessor
+from app.services.storage import storage_service
 from app.services.workspace_service import WorkspaceService
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,11 @@ class ReferencePaperService:
                     detail="Could not extract readable text content from reference paper pages. OCR processing failed or text is unreadable.",
                 )
 
+            # 4.5. Upload to persistent storage (S3 or local)
+            remote_key = f"reference_papers/{paper_id}/original.pdf"
+            storage_service.upload_file(stored_path, remote_key, content_type="application/pdf")
+            stored_record_path = remote_key if storage_service.is_s3_enabled else stored_path
+
             # 5. Create database records
             paper = self.repo.create_reference_paper(
                 paper_id=paper_id,
@@ -125,7 +131,7 @@ class ReferencePaperService:
                 subject_id=subject.id,
                 title=title,
                 original_filename=original_filename,
-                stored_path=stored_path,
+                stored_path=stored_record_path,
                 mime_type=content_type,
                 file_size=total_written,
                 year=year,
@@ -142,14 +148,16 @@ class ReferencePaperService:
 
         except HTTPException as http_exc:
             shutil.rmtree(paper_dir, ignore_errors=True)
+            storage_service.delete_prefix(f"reference_papers/{paper_id}")
             logger.warning(f"HTTPException processing reference paper '{original_filename}': {http_exc.detail}")
             raise
         except Exception as exc:
             shutil.rmtree(paper_dir, ignore_errors=True)
+            storage_service.delete_prefix(f"reference_papers/{paper_id}")
             logger.exception(f"Unexpected error processing reference paper '{original_filename}': {exc}")
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Failed to process uploaded reference paper: {str(exc)}",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to process reference paper: {str(exc)}",
             )
 
     def list_reference_papers(self, current_user_id: UUID, subject_id: Optional[UUID] = None):
@@ -183,10 +191,5 @@ class ReferencePaperService:
         # 2. Delete storage files
         if paper_dir and os.path.exists(paper_dir):
             shutil.rmtree(paper_dir, ignore_errors=True)
-
-
-
-
-
-
+        storage_service.delete_prefix(f"reference_papers/{paper.id}")
 

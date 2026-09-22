@@ -2,7 +2,7 @@ from typing import List
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -83,16 +83,39 @@ def get_paper_pdf(
     """
     Securely stream stored PDF file for inline preview or attachment download.
     Enforces authentication and workspace ownership.
+    Works transparently with both AWS S3 and Local storage.
     """
     service = PaperGeneratorService(db)
-    pdf_path, title = service.get_paper_pdf_path(paper_id=paper_id, current_user_id=current_user.id)
+    stream, length, media_type, title = service.get_paper_pdf_stream(paper_id=paper_id, current_user_id=current_user.id)
     safe_filename = "".join(c for c in title if c.isalnum() or c in (" ", "_", "-")).strip() or "paper"
-    return FileResponse(
-        path=pdf_path,
-        media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'{disposition}; filename="{safe_filename}.pdf"'
-        },
+    headers = {
+        "Content-Disposition": f'{disposition}; filename="{safe_filename}.pdf"'
+    }
+    if length > 0:
+        headers["Content-Length"] = str(length)
+
+    def iter_stream():
+        try:
+            if hasattr(stream, "iter_chunks"):
+                for chunk in stream.iter_chunks(chunk_size=65536):
+                    yield chunk
+            elif hasattr(stream, "read"):
+                while True:
+                    chunk = stream.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+            else:
+                for chunk in stream:
+                    yield chunk
+        finally:
+            if hasattr(stream, "close"):
+                stream.close()
+
+    return StreamingResponse(
+        iter_stream(),
+        media_type=media_type or "application/pdf",
+        headers=headers,
     )
 
 
