@@ -987,9 +987,16 @@ class PaperGeneratorService:
         for ck in unique_ch_keys:
             ch_to_groups[ck].sort(key=lambda g: g["question_order"])
 
-        # 3. Fill batches chapter-by-chapter
+        # 3. Fill batches chapter-by-chapter, counting individual question items (including alternatives)
         batches: List[List[Dict[str, Any]]] = []
         current_batch_groups: List[Dict[str, Any]] = []
+        current_batch_items = 0
+
+        def _group_item_count(g: Dict[str, Any]) -> int:
+            alts = g.get("required_alts")
+            if alts and isinstance(alts, list):
+                return len(alts)
+            return max(1, int(g.get("alts_per_q") or 1))
 
         def _seal_batch(groups_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             batch_sections: List[Dict[str, Any]] = []
@@ -1005,16 +1012,20 @@ class PaperGeneratorService:
 
         for ck in unique_ch_keys:
             c_groups = ch_to_groups[ck]
-            idx = 0
-            while idx < len(c_groups):
-                space_left = max_batch_size - len(current_batch_groups)
-                take = min(len(c_groups) - idx, space_left)
-                current_batch_groups.extend(c_groups[idx : idx + take])
-                idx += take
-
-                if len(current_batch_groups) >= max_batch_size:
+            for g in c_groups:
+                g_count = _group_item_count(g)
+                if current_batch_groups and (current_batch_items + g_count > max_batch_size):
                     batches.append(_seal_batch(current_batch_groups))
                     current_batch_groups = []
+                    current_batch_items = 0
+
+                current_batch_groups.append(g)
+                current_batch_items += g_count
+
+                if current_batch_items >= max_batch_size:
+                    batches.append(_seal_batch(current_batch_groups))
+                    current_batch_groups = []
+                    current_batch_items = 0
 
         if current_batch_groups:
             batches.append(_seal_batch(current_batch_groups))
@@ -1123,12 +1134,25 @@ class PaperGeneratorService:
             planned_sections=planned_sections,
             max_batch_size=MAX_QUESTIONS_PER_CALL,
         )
+        total_items_to_gen = sum(
+            len(g.get("required_alts") or [None])
+            for s_data in planned_sections
+            for g in s_data["groups"]
+        )
+        logger.info(
+            f"Partitioned {total_items_to_gen} total question items (including internal choice alternatives) into "
+            f"{len(batches)} batch(es) (max {MAX_QUESTIONS_PER_CALL} items per LLM call)."
+        )
 
         MAX_INPUT_TOKENS = 980_000
 
         for batch_idx, batch_planned in enumerate(batches, start=1):
-            # A. Extract scoped chapter context for this batch
             batch_all_groups = [g for bs in batch_planned for g in bs["groups"]]
+            batch_items_cnt = sum(len(g.get("required_alts") or [None]) for g in batch_all_groups)
+            logger.info(
+                f"Processing batch {batch_idx}/{len(batches)}: {len(batch_all_groups)} question groups, "
+                f"{batch_items_cnt} total question items (including alternatives)."
+            )
             batch_ch_ids = {str(g["chapter_id"]) for g in batch_all_groups if g.get("chapter_id")}
 
             if hasattr(self, "_chapter_contexts_map") and self._chapter_contexts_map and batch_ch_ids:
@@ -1800,7 +1824,8 @@ Return ONLY valid JSON matching this schema:
             choice_str = "None"
             if sec.has_internal_choice and sec.alternatives_per_question > 1:
                 end_num = start_q_num + sec.question_count - 1
-                choice_str = f"Internal choice for Q{start_q_num} through Q{end_num}. Each question group has {sec.alternatives_per_question} alternatives (labels 'a', 'b', etc.). Set choice_group: 'Q<N>' and alternative_label: 'a'/'b'."
+                mcq_choice_note = " Each alternative ('a', 'b') is an independent Multiple-Choice Question and MUST include exactly 4 distinct options in 'mcq_options'." if sec.question_type.value == "MCQ" else ""
+                choice_str = f"Internal choice for Q{start_q_num} through Q{end_num}. Each question group has {sec.alternatives_per_question} alternatives (labels 'a', 'b', etc.). Set choice_group: 'Q<N>' and alternative_label: 'a'/'b'.{mcq_choice_note}"
 
             num_str = "None"
             if sec.numerical_question_count > 0:
@@ -1815,15 +1840,17 @@ Return ONLY valid JSON matching this schema:
             slot_breakdown_lines = []
             if planned_sections and sec_idx < len(planned_sections):
                 s_plan = planned_sections[sec_idx]
+                sec_q_type = sec.question_type.value
                 for g in s_plan["groups"]:
                     ch_num_val = g.get("chapter_number")
                     ch_name_val = g.get("chapter_name", "")
                     diff_val = g.get("difficulty", "MEDIUM")
                     marks_val = g.get("marks", sec.marks_per_question)
                     if g.get("choice_group"):
+                        mcq_req = " Each alternative MUST include 'mcq_options' with exactly 4 options (['A. ...', 'B. ...', 'C. ...', 'D. ...'])." if sec_q_type == "MCQ" else ""
                         slot_breakdown_lines.append(
-                            f"  * {g['choice_group']} (Internal Choice): Chapter {ch_num_val} (\"{ch_name_val}\") | Difficulty: {diff_val} | Marks: {marks_val}. "
-                            f"Both Alternative 'a' and Alternative 'b' MUST be authored from Chapter {ch_num_val} and test distinct concepts/formulas."
+                            f"  * {g['choice_group']} (Internal Choice, Type: {sec_q_type}): Chapter {ch_num_val} (\"{ch_name_val}\") | Difficulty: {diff_val} | Marks: {marks_val}. "
+                            f"Both Alternative 'a' and Alternative 'b' MUST be authored from Chapter {ch_num_val} and test distinct concepts/formulas.{mcq_req}"
                         )
                     else:
                         is_num_str = " | Numerical Calculation" if g.get("is_numerical") else ""
@@ -2043,6 +2070,7 @@ CONTENT AUTHORITY, SOURCE FIDELITY & ANTI-EMBELLISHMENT RULES:
 {ref_instruction_str}
 OUTPUT FORMAT REQUIREMENT:
 Return ONLY a valid JSON object containing a "sections" array. Author ONLY question text and MCQ options. Do NOT author answer keys, expected answers, or solutions. Do NOT wrap in markdown text outside the JSON.
+CRITICAL MCQ REQUIREMENT: For EVERY question in an MCQ section (including both alternatives 'a' and 'b' of internal choice questions), "mcq_options" is MANDATORY and MUST contain exactly 4 distinct options (["A. ...", "B. ...", "C. ...", "D. ..."]). NEVER output null or an empty array for "mcq_options" on any MCQ question item!
 {{
   "sections": [
     {{
@@ -2059,7 +2087,7 @@ Return ONLY a valid JSON object containing a "sections" array. Author ONLY quest
           "is_numerical": <true | false>,
           "reasoning_style": "<Reasoning style matching section requirement, e.g. SCENARIO_BASED, DIRECT_RECALL, or custom style>",
           "section_description": "<Brief pedagogical description matching section focus or null>",
-          "mcq_options": ["A. ...", "B. ...", "C. ...", "D. ..."] or null,
+          "mcq_options": ["A. ...", "B. ...", "C. ...", "D. ..."] (MANDATORY for MCQ, null ONLY for non-MCQ types),
           "visual": {{
             "required": true,
             "type": "circuit",

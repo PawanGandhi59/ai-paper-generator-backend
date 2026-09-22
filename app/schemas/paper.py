@@ -280,13 +280,21 @@ class PaperResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+def _require_critical_fields_in_schema(schema: Dict[str, Any], _model: Any) -> None:
+    req = schema.get("required", [])
+    for field_name in ["question_type", "marks", "mcq_options", "chapter_number", "choice_group", "alternative_label", "difficulty"]:
+        if field_name not in req:
+            req.append(field_name)
+    schema["required"] = req
+
+
 class GeminiGeneratedQuestionSchema(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", json_schema_extra=_require_critical_fields_in_schema)
 
     question_text: str = Field(..., description="Full text of the question item")
     question_type: Optional[str] = Field(None, description="Question type e.g. MCQ, SHORT_ANSWER, LONG_ANSWER, NUMERICAL")
     marks: Optional[int] = Field(None, description="Marks assigned to this question")
-    mcq_options: Optional[List[str]] = Field(None, description="Exactly 4 option strings for MCQs ('A. ...', 'B. ...', 'C. ...', 'D. ...')")
+    mcq_options: Optional[List[str]] = Field(None, description="MANDATORY for MCQs: exactly 4 option strings ('A. ...', 'B. ...', 'C. ...', 'D. ...'). Set null ONLY for non-MCQ question types.")
     is_numerical: bool = Field(False, description="Whether question involves quantitative calculation")
     chapter_number: Optional[int] = Field(None, description="1-based integer chapter number for chapter attribution")
     choice_group: Optional[str] = Field(None, description="Internal choice group identifier e.g. 'Q4'")
