@@ -42,6 +42,8 @@ class QuestionConfigItem(BaseModel):
     marks_per_question: int = Field(..., ge=1, description="Marks assigned to each question")
     section_name: Optional[str] = Field(None, max_length=100)
     alternatives_per_question: int = Field(1, ge=1, description="Number of alternatives per question number (e.g. 1 for mandatory, 2 for (a) OR (b))")
+    reasoning_style: Optional[str] = Field(None, description="Cognitive reasoning style e.g. SCENARIO_BASED, DIRECT_RECALL, etc.")
+    section_description: Optional[str] = Field(None, description="Optional pedagogical guidance or description for the section")
 
     @property
     def has_internal_choice(self) -> bool:
@@ -84,7 +86,8 @@ class PaperGenerateRequest(BaseModel):
     medium_percentage: Optional[int] = Field(None, ge=0, le=100, description="Optional percentage of Medium questions (0-100%)")
     hard_percentage: Optional[int] = Field(None, ge=0, le=100, description="Optional percentage of Hard questions (0-100%)")
 
-    topic_focus: Optional[str] = Field(None, max_length=1000, description="Optional natural language topic focus/preference")
+    model_config = ConfigDict(extra="ignore")
+
     include_answers: bool = Field(True, description="Whether to include answer keys in API response")
     title: Optional[str] = Field(None, max_length=255)
 
@@ -129,15 +132,6 @@ class PaperGenerateRequest(BaseModel):
     @classmethod
     def validate_title(cls, v: Optional[str]) -> Optional[str]:
 
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-        return v
-
-    @field_validator("topic_focus")
-    @classmethod
-    def validate_topic_focus(cls, v: Optional[str]) -> Optional[str]:
         if v is not None:
             v = v.strip()
             if not v:
@@ -221,6 +215,8 @@ class PaperQuestionResponse(BaseModel):
 
     choice_group: Optional[str] = None
     alternative_label: Optional[str] = None
+    reasoning_style: Optional[str] = None
+    section_description: Optional[str] = None
 
     # Answer fields (conditionally included based on include_answers)
     mcq_options: Optional[List[str]] = None
@@ -258,7 +254,6 @@ class PaperResponse(BaseModel):
     medium_percentage: Optional[int] = None
     hard_percentage: Optional[int] = None
 
-    topic_focus: Optional[str] = None
     selected_chapters: List[ChapterWeightageResponse] = Field(default_factory=list)
     include_answers: bool
     blueprint_json: Optional[Dict[str, Any]] = None
@@ -276,18 +271,29 @@ class PaperResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+def _require_critical_fields_in_schema(schema: Dict[str, Any], _model: Any) -> None:
+    req = schema.get("required", [])
+    for field_name in ["question_type", "marks", "mcq_options", "chapter_number", "choice_group", "alternative_label", "difficulty"]:
+        if field_name not in req:
+            req.append(field_name)
+    schema["required"] = req
+
+
 class GeminiGeneratedQuestionSchema(BaseModel):
+    model_config = ConfigDict(extra="ignore", json_schema_extra=_require_critical_fields_in_schema)
+
     question_text: str = Field(..., description="Full text of the question item")
-    mcq_options: Optional[List[str]] = Field(None, description="Exactly 4 option strings for MCQs ('A. ...', 'B. ...', 'C. ...', 'D. ...')")
-    correct_answer: str = Field(..., description="Unambiguously correct option or short answer")
-    expected_answer: Optional[str] = Field(None, description="Detailed expected answer or model solution")
-    solution_explanation: str = Field(..., description="Step-by-step solution, derivation, or explanation")
+    question_type: Optional[str] = Field(None, description="Question type e.g. MCQ, SHORT_ANSWER, LONG_ANSWER, NUMERICAL")
+    marks: Optional[int] = Field(None, description="Marks assigned to this question")
+    mcq_options: Optional[List[str]] = Field(None, description="MANDATORY for MCQs: exactly 4 option strings ('A. ...', 'B. ...', 'C. ...', 'D. ...'). Set null ONLY for non-MCQ question types.")
     is_numerical: bool = Field(False, description="Whether question involves quantitative calculation")
     chapter_number: Optional[int] = Field(None, description="1-based integer chapter number for chapter attribution")
     choice_group: Optional[str] = Field(None, description="Internal choice group identifier e.g. 'Q4'")
     alternative_label: Optional[str] = Field(None, description="Internal choice alternative label e.g. 'a', 'b'")
     difficulty: Optional[str] = Field(None, description="'EASY', 'MEDIUM', or 'HARD'")
     source_type: Optional[str] = Field(None, description="'AI_GENERATED', 'REFERENCE_REUSED', or 'REFERENCE_VARIATION'")
+    reasoning_style: Optional[str] = Field(None, description="Reasoning style of the question e.g. SCENARIO_BASED, DIRECT_RECALL, etc.")
+    section_description: Optional[str] = Field(None, description="Detailed pedagogical guidance or focus for the section")
     visual: Optional[GeminiVisualRequirementSchema] = Field(None, description="Optional structured visual specification if question requires a diagram, circuit, geometry, graph, or chart")
 
 

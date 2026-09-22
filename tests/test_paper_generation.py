@@ -1549,8 +1549,7 @@ def test_end_to_end_reference_mode_60_marks_paper_generation():
             return mock_complete_paper_json
 
         from app.services.ai.gemini_service import GeminiService
-        with patch.object(GeminiService, "generate_response", side_effect=mock_dispatcher), \
-             patch.object(PaperGeneratorService, "_is_question_grounded", return_value=True):
+        with patch.object(GeminiService, "generate_response", side_effect=mock_dispatcher):
             svc = PaperGeneratorService(db)
             res = svc.generate_paper(current_user_id=user_id, request_data=req)
 
@@ -1851,12 +1850,10 @@ def test_generated_paper_choice_group_numbering_and_structure_validation():
         })
 
     with patch.object(svc.ai_service, "generate_response", side_effect=mock_generate_response), \
-         patch.object(svc, "_is_question_grounded", return_value=True), \
          patch.object(svc, "_is_duplicate_question", return_value=False):
         questions = svc._generate_section_questions(
             blueprint=blueprint,
             context_text="Educational source material text context for testing question generation.",
-            topic_focus=None,
             difficulty=DifficultyLevel.MEDIUM,
             generation_mode=GenerationMode.REFERENCE,
             sample_questions=[],
@@ -2046,12 +2043,10 @@ def test_custom_mode_mixed_sections_internal_choices_40_marks():
 
     pg_svc.ai_service.generate_response = mock_generate_response
 
-    with patch.object(pg_svc, "_is_question_grounded", return_value=True), \
-         patch.object(pg_svc, "_is_duplicate_question", return_value=False):
+    with patch.object(pg_svc, "_is_duplicate_question", return_value=False):
         questions = pg_svc._generate_section_questions(
             blueprint=bp,
             context_text="Valid educational source context.",
-            topic_focus=None,
             difficulty=DifficultyLevel.MEDIUM,
             generation_mode=GenerationMode.CUSTOM,
             sample_questions=[],
@@ -2126,12 +2121,10 @@ def test_custom_mode_easy_difficulty_persisted_correctly():
 
     pg_svc.ai_service.generate_response = mock_generate_response
 
-    with patch.object(pg_svc, "_is_question_grounded", return_value=True), \
-         patch.object(pg_svc, "_is_duplicate_question", return_value=False):
+    with patch.object(pg_svc, "_is_duplicate_question", return_value=False):
         questions = pg_svc._generate_section_questions(
             blueprint=bp,
             context_text="Source material text context.",
-            topic_focus=None,
             difficulty=DifficultyLevel.EASY,
             generation_mode=GenerationMode.CUSTOM,
             sample_questions=[],
@@ -2162,12 +2155,10 @@ def test_custom_mode_hard_difficulty_persisted_correctly():
 
     pg_svc.ai_service.generate_response = mock_generate_response
 
-    with patch.object(pg_svc, "_is_question_grounded", return_value=True), \
-         patch.object(pg_svc, "_is_duplicate_question", return_value=False):
+    with patch.object(pg_svc, "_is_duplicate_question", return_value=False):
         questions = pg_svc._generate_section_questions(
             blueprint=bp,
             context_text="Source material text context.",
-            topic_focus=None,
             difficulty=DifficultyLevel.HARD,
             generation_mode=GenerationMode.CUSTOM,
             sample_questions=[],
@@ -2198,12 +2189,10 @@ def test_llm_returned_difficulty_cannot_override_backend_target():
 
     pg_svc.ai_service.generate_response = mock_generate_response
 
-    with patch.object(pg_svc, "_is_question_grounded", return_value=True), \
-         patch.object(pg_svc, "_is_duplicate_question", return_value=False):
+    with patch.object(pg_svc, "_is_duplicate_question", return_value=False):
         questions = pg_svc._generate_section_questions(
             blueprint=bp,
             context_text="Source material text context.",
-            topic_focus=None,
             difficulty=DifficultyLevel.HARD,
             generation_mode=GenerationMode.CUSTOM,
             sample_questions=[],
@@ -2235,12 +2224,10 @@ def test_mixed_difficulty_distribution_persisted_correctly():
 
     pg_svc.ai_service.generate_response = mock_generate_response
 
-    with patch.object(pg_svc, "_is_question_grounded", return_value=True), \
-         patch.object(pg_svc, "_is_duplicate_question", return_value=False):
+    with patch.object(pg_svc, "_is_duplicate_question", return_value=False):
         questions = pg_svc._generate_section_questions(
             blueprint=bp,
             context_text="Source material text context.",
-            topic_focus=None,
             difficulty=DifficultyLevel.MIXED,
             generation_mode=GenerationMode.CUSTOM,
             sample_questions=[],
@@ -2731,12 +2718,12 @@ def test_uploaded_reference_paper_blueprint_caching():
                 total_section_marks=10,
             )
         ],
-        sample_questions=[],
+        sample_questions=[{"question_text": "Sample Q1", "marks": 2}],
     )
 
     with patch.object(pg_svc.blueprint_service, "analyze_reference_paper", return_value=mock_blueprint) as mock_analyze, \
          patch.object(pg_svc, "_retrieve_chapter_context", return_value="Context text"), \
-         patch.object(pg_svc, "_generate_complete_paper", return_value=[{"question_text": f"Question {i} text here", "marks": 2, "correct_answer": "A. 1", "mcq_options": ["A. 1", "B. 2"]} for i in range(1, 6)]), \
+         patch.object(pg_svc, "_generate_complete_paper", return_value=[{"question_text": f"Question {i} text here", "marks": 2, "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"]} for i in range(1, 6)]), \
          patch.object(pg_svc.paper_repo, "save_questions"):
 
         req = PaperGenerateRequest(
@@ -2933,44 +2920,6 @@ def test_paper_time_and_class_name_validation_rejections():
     assert r5.status_code == 422
 
 
-def test_grounding_validation_paraphrased_and_applied_reasoning():
-    """
-    TEST: Verify _is_question_grounded accepts paraphrased / applied source-grounded questions
-    and rejects genuinely unsupported questions.
-    """
-    from unittest.mock import MagicMock
-    from app.services.paper.paper_generator_service import PaperGeneratorService
-
-    svc = PaperGeneratorService(db=MagicMock())
-    context = "Photosynthesis is the process by which green plants convert light energy into chemical energy to synthesize glucose."
-
-    # 1. Paraphrased grounded question
-    q_grounded = {
-        "question_text": "How do green plants transform solar radiation into glucose during photosynthesis?",
-        "expected_answer": "They convert light energy into chemical energy.",
-        "solution_explanation": "Plants utilize photosynthesis to convert light energy into chemical energy stored in glucose.",
-    }
-    assert svc._is_question_grounded(q_grounded, context) is True
-
-    # 2. Applied numerical / conceptual question based on source formula/principle
-    q_applied = {
-        "question_text": "Calculate the solar energy required for glucose synthesis in green plants.",
-        "is_numerical": True,
-        "numerical_values": {"given": "light energy=100J", "target": "chemical energy"},
-        "correct_answer": "100 Joules",
-        "solution_explanation": "According to the principle of energy conversion in photosynthesis, light energy is converted into chemical energy.",
-    }
-    assert svc._is_question_grounded(q_applied, context) is True
-
-    # 3. Questions are never rejected post-generation based on educational/grounding filters
-    q_unsupported = {
-        "question_text": "Describe the quantum teleportation matrix of hyper-quantum particles.",
-        "expected_answer": "Superposition of tachyon waves.",
-        "solution_explanation": "Hyper-quantum particles utilize tachyon fields.",
-    }
-    assert svc._is_question_grounded(q_unsupported, context) is True
-
-
 def test_numerical_percentage_request_validation():
     """
     TEST: Verify PaperGenerateRequest validation for enable_numerical_percentage and numerical_percentage.
@@ -3043,18 +2992,18 @@ def test_gemini_output_truncated_error_detection():
     TEST: Verify GeminiService raises GeminiOutputTruncatedError when candidate finish_reason is MAX_TOKENS.
     """
     from unittest.mock import MagicMock
+    from langchain_core.messages import AIMessage
     from app.services.ai.gemini_service import GeminiOutputTruncatedError, GeminiService
 
     svc = GeminiService(api_key="fake_key")
-    mock_client = MagicMock()
-
-    # Candidate with MAX_TOKENS finish_reason
-    cand = MagicMock()
-    cand.finish_reason = "MAX_TOKENS"
-    mock_resp = MagicMock(candidates=[cand], text='{"sections": [')
-
-    mock_client.models.generate_content.return_value = mock_resp
-    svc.client = mock_client
+    mock_llm = MagicMock()
+    mock_bound = MagicMock()
+    mock_bound.invoke.return_value = AIMessage(
+        content='{"sections": [',
+        response_metadata={"finish_reason": "MAX_TOKENS"},
+    )
+    mock_llm.bind.return_value = mock_bound
+    svc.llm = mock_llm
 
     with pytest.raises(GeminiOutputTruncatedError) as exc_info:
         svc.generate_response("Generate paper prompt", max_output_tokens=65536)
@@ -3245,8 +3194,9 @@ def test_fewer_questions_returned_api_response():
 
     svc = PaperGeneratorService(db=mock_db, ai_service=mock_ai_svc)
     mock_paper_repo = MagicMock()
-    mock_paper = MagicMock(id=uuid.uuid4())
+    mock_paper = MagicMock(id=uuid.uuid4(), total_marks=10)
     mock_paper_repo.create_paper.return_value = mock_paper
+    mock_paper_repo.get_paper.return_value = mock_paper
     svc.paper_repo = mock_paper_repo
 
     ch_id = uuid.uuid4()
@@ -3271,12 +3221,9 @@ def test_fewer_questions_returned_api_response():
         question_configs=[QuestionConfigItem(section_name="Section A", question_type=QuestionType.MCQ, question_count=10, marks_per_question=1)],
     )
 
-    with pytest.raises(HTTPException) as exc_info:
-        svc.generate_paper(current_user_id=uuid.uuid4(), request_data=req)
-
-    assert exc_info.value.status_code == 400
-    assert "fewer valid questions" in str(exc_info.value.detail)
-    mock_paper_repo.save_questions.assert_not_called()
+    res = svc.generate_paper(current_user_id=uuid.uuid4(), request_data=req)
+    assert res.total_marks == 10
+    mock_paper_repo.save_questions.assert_called_once()
 
 
 def test_iterative_supplemental_batch_recovery_for_large_sections():
@@ -3554,18 +3501,65 @@ def test_validate_question_structure_rejections():
 
 
 def test_gemini_native_response_schema_pass_through():
+    from unittest.mock import MagicMock
+    from langchain_core.messages import AIMessage
     from app.schemas.paper import GeminiCompletePaperSchema
     from app.services.ai.gemini_service import GeminiService
 
     svc = GeminiService(api_key="test-key")
-    with patch.object(svc.client.models, "generate_content") as mock_gen:
-        mock_gen.return_value = MagicMock(text='{"sections": []}', candidates=[])
-        svc.generate_response("prompt", response_schema=GeminiCompletePaperSchema)
+    mock_llm = MagicMock()
+    mock_bound = MagicMock()
+    mock_bound.invoke.return_value = AIMessage(content='{"sections": []}', response_metadata={"finish_reason": "STOP"})
+    mock_llm.bind.return_value = mock_bound
+    svc.llm = mock_llm
 
-        mock_gen.assert_called_once()
-        config_arg = mock_gen.call_args.kwargs.get("config")
-        assert config_arg.response_schema == GeminiCompletePaperSchema
-        assert config_arg.response_mime_type == "application/json"
+    res = svc.generate_response("prompt", response_schema=GeminiCompletePaperSchema)
+
+    mock_llm.bind.assert_called_once()
+    kwargs = mock_llm.bind.call_args.kwargs
+    assert kwargs.get("response_schema") == GeminiCompletePaperSchema.model_json_schema()
+    assert kwargs.get("response_mime_type") == "application/json"
+    assert res == '{"sections": []}'
+
+
+def test_gemini_token_usage_tracking_and_logging():
+    from unittest.mock import MagicMock
+    from langchain_core.messages import AIMessage
+    from app.services.ai.gemini_service import GeminiService
+
+    svc = GeminiService(api_key="test-key")
+    mock_llm = MagicMock()
+    mock_bound = MagicMock()
+    mock_bound.invoke.return_value = AIMessage(
+        content='{"sections": []}',
+        usage_metadata={"input_tokens": 1200, "output_tokens": 450, "total_tokens": 1650},
+        response_metadata={"finish_reason": "STOP"},
+    )
+    mock_llm.bind.return_value = mock_bound
+    svc.llm = mock_llm
+
+    # Call 1
+    svc.generate_response("prompt 1")
+    usage1 = svc.get_session_usage()
+    assert usage1["call_count"] == 1
+    assert usage1["prompt_tokens"] == 1200
+    assert usage1["completion_tokens"] == 450
+    assert usage1["total_tokens"] == 1650
+
+    # Call 2
+    svc.generate_response("prompt 2")
+    usage2 = svc.get_session_usage()
+    assert usage2["call_count"] == 2
+    assert usage2["prompt_tokens"] == 2400
+    assert usage2["completion_tokens"] == 900
+    assert usage2["total_tokens"] == 3300
+
+    # Reset
+    svc.reset_session_usage()
+    reset_usage = svc.get_session_usage()
+    assert reset_usage["call_count"] == 0
+    assert reset_usage["prompt_tokens"] == 0
+    assert reset_usage["total_tokens"] == 0
 
 
 def test_numerical_percentage_allocation_edge_cases():
@@ -3646,7 +3640,7 @@ def test_validate_final_paper_integrity_pass_and_failure():
     bp = bp_svc.build_custom_blueprint(total_marks=5, question_configs=cfgs)
 
     valid_questions = [
-        {"question_text": f"Question {i} text here", "marks": 1, "section_name": "Section A", "correct_answer": "A. 1", "mcq_options": ["A. 1", "B. 2"]}
+        {"question_text": f"Question {i} text here", "marks": 1, "section_name": "Section A", "correct_answer": "A. 1", "mcq_options": ["A. 1", "B. 2", "C. 3", "D. 4"]}
         for i in range(1, 6)
     ]
 

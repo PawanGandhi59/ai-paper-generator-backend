@@ -110,10 +110,37 @@ class DocumentRepository:
     def mark_embedding_started(self, document_id: UUID) -> Optional[Document]:
         doc = self.get_document_by_id(document_id)
         if doc:
-            doc.processing_status = "EMBEDDING"
+            doc.embedding_status = "PROCESSING"
+            doc.embedding_error = None
             self.db.commit()
             self.db.refresh(doc)
         return doc
+
+    def mark_embedding_status(
+        self,
+        document_id: UUID,
+        embedding_status: str,
+        error_message: Optional[str] = None,
+    ) -> Optional[Document]:
+        doc = self.get_document_by_id(document_id)
+        if doc:
+            doc.embedding_status = embedding_status
+            if error_message is not None:
+                doc.embedding_error = str(error_message)[:1024]
+            if embedding_status == "COMPLETED":
+                doc.embedding_completed_at = datetime.now(timezone.utc)
+                doc.embedding_error = None
+            elif embedding_status == "PROCESSING":
+                doc.embedding_error = None
+            self.db.commit()
+            self.db.refresh(doc)
+        return doc
+
+    def get_document_embedding_stats(self, document_id: UUID) -> Tuple[int, int]:
+        chunks = self.get_document_chunks(document_id)
+        total = len(chunks)
+        embedded = sum(1 for c in chunks if c.embedding is not None)
+        return total, embedded
 
     def mark_ready(self, document_id: UUID) -> Optional[Document]:
         doc = self.get_document_by_id(document_id)
@@ -145,11 +172,13 @@ class DocumentRepository:
 
         created_pages = []
         for page_info in pages_data:
+            raw_text = page_info.get("text_content", "") or ""
+            clean_text = raw_text.replace("\x00", "") if isinstance(raw_text, str) else ""
             page = DocumentPage(
                 document_id=document_id,
                 page_number=page_info["page_number"],
                 content_type=page_info.get("content_type", "PAGE"),
-                text_content=page_info.get("text_content", ""),
+                text_content=clean_text,
                 image_path=page_info.get("image_path"),
                 metadata_json=page_info.get("metadata_json"),
             )
@@ -179,6 +208,8 @@ class DocumentRepository:
 
         created_chunks = []
         for c_info in chunks_data:
+            raw_content = c_info.get("content", "") or ""
+            clean_content = raw_content.replace("\x00", "") if isinstance(raw_content, str) else ""
             chunk = DocumentChunk(
                 document_id=document_id,
                 document_page_id=c_info.get("document_page_id"),
@@ -188,7 +219,7 @@ class DocumentRepository:
                 workspace_id=c_info["workspace_id"],
                 chunk_index=c_info["chunk_index"],
                 page_number=c_info.get("page_number", 1),
-                content=c_info["content"],
+                content=clean_content,
                 content_type=c_info.get("content_type", "TEXT"),
                 metadata_json=c_info.get("metadata_json"),
                 embedding=c_info.get("embedding"),
@@ -211,6 +242,20 @@ class DocumentRepository:
         stmt = update(DocumentChunk).where(DocumentChunk.id == chunk_id).values(embedding=embedding)
         self.db.execute(stmt)
         self.db.commit()
+
+    def clear_document_chunk_embeddings(self, document_id: UUID) -> int:
+        """
+        Clear (set to NULL) any vector embeddings for all chunks belonging to this document.
+        Leaves document, pages, chunks, and content untouched.
+        """
+        stmt = (
+            update(DocumentChunk)
+            .where(DocumentChunk.document_id == document_id)
+            .values(embedding=None)
+        )
+        res = self.db.execute(stmt)
+        self.db.commit()
+        return res.rowcount or 0
 
     def search_similar_chunks(
         self,

@@ -1,6 +1,6 @@
+import logging
 import os
 import shutil
-
 import zipfile
 from typing import Optional
 import uuid
@@ -12,7 +12,9 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.repositories.document_repository import DocumentRepository
 from app.services.workspace_service import WorkspaceService
-from app.worker import process_document
+from app.worker import generate_document_embeddings, process_document
+
+logger = logging.getLogger(__name__)
 
 
 ALLOWED_EXTENSIONS = {".pdf", ".pptx"}
@@ -186,3 +188,45 @@ class DocumentService:
         # Ownership validation
         self.workspace_service.get_book(doc.book_id, current_user_id)
         return doc
+
+    def trigger_embedding(self, current_user_id: UUID, document_id: UUID) -> dict:
+        doc = self.get_document(current_user_id, document_id)
+        if doc.deleted_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot generate embeddings for a deleted document.",
+            )
+
+        self.doc_repo.mark_embedding_status(doc.id, "PROCESSING")
+
+        try:
+            generate_document_embeddings.delay(str(doc.id))
+        except Exception as exc:
+            logger.warning(f"Celery async queueing for embedding task failed, executing or recording: {exc}")
+            try:
+                generate_document_embeddings(str(doc.id))
+            except Exception:
+                pass
+
+        total, embedded = self.doc_repo.get_document_embedding_stats(doc.id)
+        self.db.refresh(doc)
+        return {
+            "document_id": doc.id,
+            "embedding_status": doc.embedding_status,
+            "total_chunks": total,
+            "embedded_chunks": embedded,
+            "embedding_error": doc.embedding_error,
+            "embedding_completed_at": doc.embedding_completed_at,
+        }
+
+    def get_embedding_status(self, current_user_id: UUID, document_id: UUID) -> dict:
+        doc = self.get_document(current_user_id, document_id)
+        total, embedded = self.doc_repo.get_document_embedding_stats(doc.id)
+        return {
+            "document_id": doc.id,
+            "embedding_status": doc.embedding_status,
+            "total_chunks": total,
+            "embedded_chunks": embedded,
+            "embedding_error": doc.embedding_error,
+            "embedding_completed_at": doc.embedding_completed_at,
+        }

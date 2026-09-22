@@ -51,3 +51,38 @@ class BookDetailResponse(BookResponse):
     file_url: Optional[str] = None
 
 
+class MinimalWorkspaceRef(BaseModel):
+    id: UUID
+    name: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class MinimalSubjectRef(BaseModel):
+    id: UUID
+    name: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class MinimalChapterItem(BaseModel):
+    id: UUID
+    chapter_number: int
+    name: str
+    pdf_url: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class MinimalBookListItem(BaseModel):
+    id: UUID
+    name: str
+    pdf_url: Optional[str] = None
+    workspace: MinimalWorkspaceRef
+    subject: MinimalSubjectRef
+    chapters: List[MinimalChapterItem] = []
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+

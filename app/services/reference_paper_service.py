@@ -1,3 +1,5 @@
+import io
+import logging
 import os
 import shutil
 from typing import List, Optional
@@ -11,6 +13,8 @@ from app.core.config import settings
 from app.repositories.reference_paper_repository import ReferencePaperRepository
 from app.services.processors.pdf_processor import PDFProcessor
 from app.services.workspace_service import WorkspaceService
+
+logger = logging.getLogger(__name__)
 
 
 class ReferencePaperService:
@@ -37,7 +41,10 @@ class ReferencePaperService:
         _, ext = os.path.splitext(original_filename)
         ext_lower = ext.lower()
 
+        logger.info(f"Processing reference paper upload: filename='{original_filename}', title='{title}', subject_id={subject_id}")
+
         if ext_lower != ".pdf":
+            logger.warning(f"Reference paper upload rejected: unsupported extension '{ext}'")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Unsupported file extension '{ext}'. Only .pdf files are allowed for reference papers.",
@@ -70,6 +77,7 @@ class ReferencePaperService:
                     if total_written > max_bytes:
                         out_file.close()
                         shutil.rmtree(paper_dir, ignore_errors=True)
+                        logger.warning(f"Reference paper upload rejected: size {total_written} exceeds max {max_bytes}")
                         raise HTTPException(
                             status_code=status.HTTP_400_BAD_REQUEST,
                             detail=f"File size exceeds maximum limit of {settings.MAX_UPLOAD_SIZE_MB}MB.",
@@ -78,6 +86,7 @@ class ReferencePaperService:
 
             if total_written == 0:
                 shutil.rmtree(paper_dir, ignore_errors=True)
+                logger.warning("Reference paper upload rejected: uploaded file is empty")
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Uploaded file is empty.",
@@ -86,21 +95,24 @@ class ReferencePaperService:
             # Validate magic PDF header %PDF-
             if not header_bytes.startswith(b"%PDF-"):
                 shutil.rmtree(paper_dir, ignore_errors=True)
+                logger.warning("Reference paper upload rejected: missing %PDF- header")
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Invalid PDF file format. Missing %PDF header signature.",
                 )
 
-            # 4. Extract PDF text pages using PDFProcessor
-            pages_data = PDFProcessor.process_pdf(stored_path, paper_dir)
+            # 4. Extract PDF text pages using PDFProcessor with high-fidelity thorough OCR
+            pages_data = PDFProcessor.process_pdf(stored_path, paper_dir, ocr_mode="thorough")
 
             # Validate overall text quality across all extracted pages
             has_readable_text = any(
                 PDFProcessor.is_meaningful_text(p.get("text_content", ""))
+                or len((p.get("text_content") or "").strip()) >= 20
                 for p in pages_data
             )
             if not has_readable_text:
                 shutil.rmtree(paper_dir, ignore_errors=True)
+                logger.warning(f"Reference paper '{original_filename}' text extraction produced no readable text across {len(pages_data)} pages.")
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Could not extract readable text content from reference paper pages. OCR processing failed or text is unreadable.",
@@ -125,13 +137,16 @@ class ReferencePaperService:
 
             # Refresh to load pages relationship
             self.db.refresh(paper)
+            logger.info(f"Successfully uploaded and saved reference paper '{original_filename}' (id={paper_id}) with {len(pages_data)} pages.")
             return paper
 
-        except HTTPException:
+        except HTTPException as http_exc:
             shutil.rmtree(paper_dir, ignore_errors=True)
+            logger.warning(f"HTTPException processing reference paper '{original_filename}': {http_exc.detail}")
             raise
         except Exception as exc:
             shutil.rmtree(paper_dir, ignore_errors=True)
+            logger.exception(f"Unexpected error processing reference paper '{original_filename}': {exc}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Failed to process uploaded reference paper: {str(exc)}",

@@ -1,12 +1,24 @@
+import logging
 import os
+import sys
 import typing
 import json
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from fastapi.middleware.cors import CORSMiddleware
+
 from app.api.router import api_router
 from app.core.config import settings
+
+# Ensure application logs at INFO level to console stdout
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logging.getLogger("app").setLevel(logging.INFO)
 
 
 class UnicodeJSONResponse(JSONResponse):
@@ -29,6 +41,14 @@ app = FastAPI(
     title=settings.APP_NAME,
     debug=settings.DEBUG,
     default_response_class=UnicodeJSONResponse,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Ensure local storage directory exists and mount static files (matching vigilens-backend pattern)
