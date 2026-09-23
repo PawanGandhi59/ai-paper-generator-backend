@@ -148,11 +148,11 @@ class PaperGeneratorService:
     def preplan_blueprint_matrix(
         self,
         blueprint: PaperBlueprint,
-        difficulty: DifficultyLevel,
         chapter_weightages_data: Optional[List[Dict[str, Any]]] = None,
         easy_pct: Optional[int] = None,
         med_pct: Optional[int] = None,
         hard_pct: Optional[int] = None,
+        **kwargs,
     ) -> List[Dict[str, Any]]:
         """
         Pre-plans the authoritative question slot matrix before invoking Gemini.
@@ -221,7 +221,6 @@ class PaperGeneratorService:
         for sec in blueprint.sections:
             sec_groups = [g for g in logical_groups if g["section_name"] == sec.name]
             sec_diffs = self._calculate_difficulty_distribution(
-                difficulty=difficulty,
                 count=len(sec_groups),
                 easy_pct=easy_pct,
                 med_pct=med_pct,
@@ -415,10 +414,8 @@ class PaperGeneratorService:
             total_marks=request_data.total_marks,
             time_allowed_minutes=request_data.time_allowed_minutes,
             class_name=request_data.class_name,
-            difficulty=request_data.difficulty.value,
             selected_chapter_ids=selected_ch_ids,
             chapter_weightages=chapter_weightages_data,
-            include_answers=request_data.include_answers,
             title=request_data.title,
             reference_paper_id=request_data.reference_paper_id,
             easy_percentage=request_data.easy_percentage,
@@ -540,7 +537,6 @@ class PaperGeneratorService:
             generated_questions = self._generate_complete_paper(
                 blueprint=blueprint,
                 context_text=context_text,
-                difficulty=request_data.difficulty,
                 generation_mode=request_data.generation_mode,
                 sample_questions=blueprint.sample_questions,
                 easy_pct=request_data.easy_percentage,
@@ -583,7 +579,7 @@ class PaperGeneratorService:
 
             # Refresh paper from DB
             final_paper = self.paper_repo.get_paper(paper.id)
-            return self._build_paper_response(final_paper, include_answers=request_data.include_answers)
+            return self._build_paper_response(final_paper)
 
         except GeminiOutputTruncatedError as trunc_exc:
             logger.error(f"Paper generation output limit reached for paper_id {paper.id}: {trunc_exc}")
@@ -1091,7 +1087,6 @@ class PaperGeneratorService:
         self,
         blueprint: PaperBlueprint,
         context_text: str,
-        difficulty: DifficultyLevel,
         generation_mode: GenerationMode,
         sample_questions: Optional[List[Dict[str, Any]]],
         easy_pct: Optional[int] = None,
@@ -1111,7 +1106,6 @@ class PaperGeneratorService:
         # 1. Deterministic Blueprint Slot Matrix Pre-Planning
         planned_sections = self.preplan_blueprint_matrix(
             blueprint=blueprint,
-            difficulty=difficulty,
             chapter_weightages_data=chapter_weightages_data,
             easy_pct=easy_pct,
             med_pct=med_pct,
@@ -1206,7 +1200,6 @@ class PaperGeneratorService:
             prompt = self._build_complete_paper_prompt(
                 blueprint=batch_bp,
                 context_text=batch_context,
-                difficulty=difficulty,
                 generation_mode=generation_mode,
                 sample_questions=sample_questions,
                 easy_pct=easy_pct,
@@ -1746,7 +1739,6 @@ Return ONLY valid JSON matching this schema:
         self,
         blueprint: PaperBlueprint,
         context_text: str,
-        difficulty: DifficultyLevel,
         generation_mode: GenerationMode,
         sample_questions: Optional[List[Dict[str, Any]]] = None,
         easy_pct: Optional[int] = None,
@@ -1765,7 +1757,6 @@ Return ONLY valid JSON matching this schema:
         for sec_idx, sec in enumerate(blueprint.sections):
             alts_per_q = sec.alternatives_per_question if (sec.has_internal_choice and sec.alternatives_per_question > 1) else 1
             sec_difficulties = self._calculate_difficulty_distribution(
-                difficulty=difficulty,
                 count=sec.question_count,
                 easy_pct=easy_pct,
                 med_pct=med_pct,
@@ -1926,7 +1917,7 @@ You are generating an examination paper in REFERENCE MODE.
    - Place any allowed "REFERENCE_REUSED" or "REFERENCE_VARIATION" questions into their matching chapter/mark slots throughout the paper, interspersing them naturally among fresh "AI_GENERATED" questions.
 
 5. USER BLUEPRINT AUTHORITATIVENESS:
-   - The user's requested TOTAL EXAMINATION MARKS ({blueprint.total_marks}), section counts, question types, marks per question, requested difficulty ({difficulty.value}), and selected textbook chapters are AUTHORITATIVE and MUST be strictly respected.
+   - The user's requested TOTAL EXAMINATION MARKS ({blueprint.total_marks}), section counts, question types, marks per question, and selected textbook chapters are AUTHORITATIVE and MUST be strictly respected.
 """
 
         source_type_desc = (
@@ -1935,11 +1926,13 @@ You are generating an examination paper in REFERENCE MODE.
             else '"source_type": "AI_GENERATED"'
         )
 
+        diff_dist_str = f"Easy: {easy_pct}%, Medium: {med_pct}%, Hard: {hard_pct}%" if (easy_pct is not None and med_pct is not None and hard_pct is not None) else "Balanced standard distribution"
+
         prompt = f"""
 Generate the COMPLETE examination paper according to the blueprint below in ONE unified response.
 
 TOTAL EXAMINATION MARKS: {blueprint.total_marks}
-OVERALL DIFFICULTY: {difficulty.value}
+DIFFICULTY DISTRIBUTION: {diff_dist_str}
 
 EXAMINATION BLUEPRINT SECTIONS:
 {"".join(sections_info)}
@@ -2434,20 +2427,15 @@ SOURCE EDUCATIONAL MATERIAL:
 
     def _calculate_difficulty_distribution(
         self,
-        difficulty: DifficultyLevel,
         count: int,
         easy_pct: Optional[int] = None,
         med_pct: Optional[int] = None,
         hard_pct: Optional[int] = None,
         marks_per_q: Optional[int] = None,
+        **kwargs,
     ) -> List[str]:
         if count <= 0:
             return []
-
-        # If user explicitly selected a uniform single difficulty (e.g. DifficultyLevel.EASY)
-        # without custom percentages, return uniform distribution.
-        if difficulty != DifficultyLevel.MIXED and (easy_pct is None or med_pct is None or hard_pct is None):
-            return [difficulty.value] * count
 
         # Determine target percentage weights
         if easy_pct is not None and med_pct is not None and hard_pct is not None:
@@ -2455,7 +2443,7 @@ SOURCE EDUCATIONAL MATERIAL:
             m_pct = float(med_pct)
             h_pct = float(hard_pct)
         else:
-            # Default MIXED distribution: ~30% Easy, ~50% Medium, ~20% Hard
+            # Default distribution: ~30% Easy, ~50% Medium, ~20% Hard
             e_pct = 30.0
             m_pct = 50.0
             h_pct = 20.0
@@ -2659,17 +2647,10 @@ SOURCE EDUCATIONAL MATERIAL:
 
         for q in paper.questions:
             mcq_opts = q.mcq_options
-            corr_ans = q.correct_answer if include_answers else None
-            exp_ans = q.expected_answer if include_answers else None
-            num_vals = q.numerical_values if include_answers else None
-            sol_exp = q.solution_explanation if include_answers else None
-            unit_val = q.unit if include_answers else None
 
             is_num = bool(
                 q.question_type == "NUMERICAL"
                 or getattr(q, "is_numerical", False)
-                or (q.numerical_values and isinstance(q.numerical_values, dict) and (q.numerical_values.get("is_numerical") or len(q.numerical_values) > 0))
-                or q.unit
             )
 
             v_req = getattr(q, "visual_required", False)
@@ -2740,11 +2721,6 @@ SOURCE EDUCATIONAL MATERIAL:
                     reasoning_style=q_reasoning_style,
                     section_description=q_section_desc,
                     mcq_options=mcq_opts,
-                    correct_answer=corr_ans,
-                    expected_answer=exp_ans,
-                    numerical_values=num_vals,
-                    solution_explanation=sol_exp,
-                    unit=unit_val,
                     visual_required=False if _is_mock(v_req) or not v_req else bool(v_req),
                     visual_type=None if _is_mock(v_type) else v_type,
                     visual_title=None if _is_mock(v_title) else v_title,
@@ -2894,12 +2870,10 @@ SOURCE EDUCATIONAL MATERIAL:
             total_marks=total_marks_val,
             time_allowed_minutes=time_allowed,
             class_name=cls_name,
-            difficulty=diff_mode,
             easy_percentage=easy_val,
             medium_percentage=med_val,
             hard_percentage=hard_val,
             selected_chapters=weightage_responses or [],
-            include_answers=inc_ans_val,
             blueprint_json=bp_val,
             error_message=err_val,
             has_saved_pdf=has_saved_pdf,

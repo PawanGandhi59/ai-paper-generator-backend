@@ -68,9 +68,7 @@ def test_custom_mode_paper_generation_success():
     assert paper_data["generation_mode"] == "CUSTOM"
     assert paper_data["status"] == "COMPLETED"
     assert paper_data["total_marks"] == 50
-    assert paper_data["difficulty"] == "MIXED"
     assert len(paper_data["questions"]) == 17
-    assert paper_data["include_answers"] is True
 
     # Verify section breakdown and questions
     sections = [q["section_name"] for q in paper_data["questions"]]
@@ -79,10 +77,9 @@ def test_custom_mode_paper_generation_success():
     assert sections.count("Section C") == 4
     assert sections.count("Section D") == 3
 
-    # Check answers present when include_answers=True
+    # Check MCQ options present for students
     mcq_q = next(q for q in paper_data["questions"] if q["question_type"] == "MCQ")
     assert mcq_q["mcq_options"] is not None
-    assert mcq_q["correct_answer"] is not None
 
 
 def test_custom_mode_validation_rejections():
@@ -183,7 +180,6 @@ def test_answer_visibility_stripping():
 
     assert res.status_code == 201
     paper_data = res.json()
-    assert paper_data["include_answers"] is False
 
     # Verify answer keys stripped in API response while MCQ options are retained for students
     for q in paper_data["questions"]:
@@ -1323,7 +1319,6 @@ def test_internal_choice_include_answers_stripping():
 
     assert res.status_code == 201
     paper_data = res.json()
-    assert paper_data["include_answers"] is False
     assert len(paper_data["questions"]) == 2
 
     for q in paper_data["questions"]:
