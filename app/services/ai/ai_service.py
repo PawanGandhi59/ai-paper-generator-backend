@@ -11,6 +11,7 @@ class AIService(ABC):
         max_output_tokens: Optional[int] = None,
         response_schema: Optional[Any] = None,
         response_mime_type: Optional[str] = None,
+        temperature: Optional[float] = None,
     ) -> str:
         """Generate a response for a prompt."""
         pass

@@ -80,7 +80,7 @@ Return ONLY a JSON object with this exact structure:
   "total_marks": <actual total examination marks of this reference paper as integer>,
   "sections": [
     {{
-      "name": "<Section Name, e.g. Part A, Part B, Part C>",
+      "name": "<Section Name, e.g. Part A, Part B, Part C, SECTION - A, etc.>",
       "question_type": "<One of: MCQ, VERY_SHORT_ANSWER, SHORT_ANSWER, LONG_ANSWER, NUMERICAL>",
       "reasoning_style": "<Analyze the questions in this section and determine what cognitive demand they require. You have complete free will and permission to either choose a common style (e.g. SCENARIO_BASED, DIRECT_RECALL, CONCEPT_EXPLANATION, MULTI_STEP_NUMERICAL, DERIVATION, EXPERIMENTAL_ANALYSIS, ASSERTION_REASON, MIXED) OR invent an entirely new domain-specific style (e.g. CLINICAL_DIAGNOSTIC_VIGNETTE, ETHICAL_EVALUATION, LEGAL_PRECEDENT_ANALYSIS, DATA_INTERPRETATION, etc.) that best characterizes the section. The examples are purely illustrative to demonstrate UPPERCASE_SNAKE_CASE format; choose or invent whatever truly fits best>",
       "section_description": "<Pedagogical description of what this section tests and any breakdown of question formats (e.g. 'Contains theoretical questions with 1 case scenario', 'Direct definitions and recall', or 'Mathematical problem solving')>",
@@ -93,10 +93,16 @@ Return ONLY a JSON object with this exact structure:
   ],
   "sample_questions": [
     {{
-      "section_name": "<Section Name, e.g. SECTION - A>",
+      "section_name": "<Section Name matching the section in sections list, e.g. SECTION - A>",
       "question_type": "<MCQ | VERY_SHORT_ANSWER | SHORT_ANSWER | LONG_ANSWER | NUMERICAL>",
-      "question_text": "<Full exact question text>",
-      "marks": <marks>,
+      "question_text": "<Full verbatim question stem / problem statement ONLY. For MCQs, do NOT include the options inside this string. For Assertion-Reason questions, include the complete Assertion (A) and Reason (R) statements>",
+      "mcq_options": [
+        "<Full text of Option A, e.g. (a) Option content>",
+        "<Full text of Option B, e.g. (b) Option content>",
+        "<Full text of Option C, e.g. (c) Option content>",
+        "<Full text of Option D, e.g. (d) Option content>"
+      ],
+      "marks": <marks as integer>,
       "cognitive_demand": "<RECALL | COMPREHENSION | APPLICATION | ANALYSIS | NUMERICAL_SOLVING>",
       "reasoning_style": "<Specific cognitive reasoning style of this question—you have full autonomy to use a standard style or invent a new descriptive style in UPPERCASE_SNAKE_CASE that precisely fits what the question tests>",
       "choice_group": "<Question number like Q4 if internal choice exists, null otherwise>",
@@ -106,14 +112,33 @@ Return ONLY a JSON object with this exact structure:
 }}
 
 CRITICAL BLUEPRINT RULES:
-1. question_count is the count of distinct question NUMBERS in the section (e.g., Q1 to Q5 is 5 questions; Q6 to Q10 is 5 question numbers; Q11 to Q15 is 5 question numbers).
-2. marks_per_question is the mark assigned to ONE question (or ONE alternative), NOT the sum of choice options! For example, if Q11(a) is 7 marks OR Q11(b) is 7 marks, marks_per_question is 7 (NEVER 14!).
-3. total_section_marks MUST BE equal to question_count * marks_per_question (e.g., 5 questions * 7 marks = 35 marks). Alternatives (a OR b) do NOT multiply or inflate section marks.
-4. Total paper marks = sum of total_section_marks across all sections (e.g. Part A: 5x1=5, Part B: 5x4=20, Part C: 5x7=35 -> Total = 60).
-5. COMPLETE SECTION EXTRACTION: Read all pages carefully. Identify all sections from question numbering (e.g., Q1-Q5, Q6-Q10, Q11-Q15), even if explicit section header labels (such as Part C) are missing or faint in OCR text. In standard 60-mark examination papers with Part A (5x1=5) and Part B (5x4=20), Part C questions Q11 to Q15 are 7 marks each (5x7=35 marks; Total = 60).
-6. QUESTION TYPES: Classify question_type based on section style: 1 mark direct answers are VERY_SHORT_ANSWER, 2-4 mark questions are SHORT_ANSWER, 5+ mark questions are LONG_ANSWER. Part A (1m) is VERY_SHORT_ANSWER, Part B (4m) is SHORT_ANSWER, while Part C (7m) is LONG_ANSWER.
-7. EXHAUSTIVE QUESTION EXTRACTION (ALL QUESTIONS): Read the ENTIRE examination text from start to finish. In sample_questions, extract EVERY question appearing in the examination paper across all sections (e.g. Q1, Q2, Q3 ... QN, including both alternatives for internal choice questions like Q4(a) and Q4(b)). Do NOT omit, skip, or summarize questions as mere 1-2 question samples—extract ALL questions so the complete pedagogical corpus and every question's specific text, marks, cognitive demand, and reasoning style are fully captured.
-8. SECTION REASONING STYLE & PEDAGOGICAL FREEDOM:
+1. COMPLETE SECTION EXTRACTION & DISCOVERY (NEVER OMIT OR MERGE SECTIONS):
+   Read the ENTIRE document from first page to last page. Identify all sections present in the paper (e.g. Section A, Section B, Section C, Section D, Section E, Section F, etc.) and from question numbering (e.g., Q1-Q5, Q6-Q10, Q11-Q15), even if explicit section header labels are missing or faint in OCR text.
+   NEVER omit, skip, or merge sections together (for example, do NOT put Section E questions into Section D). Every distinct section in the paper MUST have its own separate entry in the "sections" array.
+2. question_count is the count of distinct question NUMBERS in the section (e.g., Q1 to Q5 is 5 questions; Q6 to Q10 is 5 question numbers; Q11 to Q15 is 5 question numbers).
+3. marks_per_question is the mark assigned to ONE question (or ONE alternative), NOT the sum of choice options! For example, if Q5(a) is 3 marks OR Q5(b) is 3 marks, marks_per_question is 3 (NEVER 6!).
+   Read the actual marks allocated to each question in the paper (e.g. [1], [2], [3], [4], [5], [6] in the right margin or question line). Do NOT assume or force all sections to have the same marks. Set marks_per_question accurately based on what the questions in that section actually carry.
+4. total_section_marks MUST BE equal to question_count * marks_per_question. Alternatives (a OR b) do NOT multiply or inflate section marks.
+5. Total paper marks = sum of total_section_marks across all sections as specified in the uploaded examination paper (e.g., whether the paper has 3, 4, 5, or 6 sections, and whether total marks is 50, 70, 80, or 100). Never force, inflate, or truncate sections to match an arbitrary total.
+6. QUESTION TYPES CLASSIFICATION:
+   - If questions offer multiple choices (e.g. A, B, C, D options or Assertion-Reason choices), classify question_type as "MCQ" regardless of mark value.
+   - For direct text questions without multiple choices: 1 mark is VERY_SHORT_ANSWER, 2-4 marks are SHORT_ANSWER, 5+ marks are LONG_ANSWER.
+   - For mathematical or calculation-heavy questions, classify as NUMERICAL.
+7. MCQ OPTIONS SEPARATION:
+   For every multiple-choice question, you MUST extract the choices into the "mcq_options" array as clean strings.
+   "question_text" MUST contain ONLY the question stem / problem prompt, strictly WITHOUT the choices.
+   For non-MCQ questions (VERY_SHORT_ANSWER, SHORT_ANSWER, LONG_ANSWER, NUMERICAL), set "mcq_options": null.
+8. ASSERTION-REASON MCQ OPTIONS INHERITANCE:
+   For Assertion-Reason questions where the 4 standard options are stated once in the common section directions or header (e.g. "(a) Both A and R are true and R is the correct explanation of A", "(b) Both A and R are true but R is not the correct explanation of A", "(c) A is true but R is false", "(d) A is false but R is true"):
+   You MUST attach those 4 full option strings into "mcq_options" for every Assertion-Reason question so that each question is complete, self-contained, and never left without options.
+9. STRICT ZERO-TRUNCATION & VERBATIM TRANSCRIPTION:
+   Transcribe the complete, exact text of every question word-for-word.
+   NEVER use ellipses ('...'), NEVER summarize, and NEVER cut off sentences. Every word of the question stem, assertion statement, and reason statement must be fully transcribed.
+10. EXHAUSTIVE QUESTION EXTRACTION (ALL QUESTIONS):
+   Read the ENTIRE examination text from start to finish. In sample_questions, extract EVERY question appearing in the examination paper across all sections (e.g. Q1, Q2, Q3 ... QN, including both alternatives for internal choice questions like Q4(a) and Q4(b)). Do NOT omit, skip, or summarize questions as mere 1-2 question samples—extract ALL questions so the complete pedagogical corpus and every question's specific text, options, marks, cognitive demand, and reasoning style are fully captured.
+11. EXACT SECTION NAME MATCHING:
+   Ensure that "section_name" in each question in sample_questions matches the exact string given in the corresponding section's "name" field under "sections".
+12. SECTION REASONING STYLE & PEDAGOGICAL FREEDOM:
    Evaluate ALL questions in each section collectively before assigning reasoning_style and section_description:
    - FULL AUTONOMY & PERMISSION TO INVENT: You have complete free will and explicit permission to either choose an existing style or invent an entirely new domain-appropriate style (in UPPERCASE_SNAKE_CASE) that best characterizes the section or question. You are NOT confined to any fixed menu, multiple-choice list, or pre-set examples. Any examples mentioned in instructions are purely illustrative to demonstrate formatting (e.g. CLINICAL_CASE_DIAGNOSIS, STATISTICAL_ANALYSIS, ETHICAL_DILEMMA, PROOF_BY_CONTRADICTION, HISTORICAL_SOURCE_CRITIQUE, etc.). Use whatever descriptor genuinely best reflects the real cognitive demands of the questions.
    - DO NOT JUDGE BY A SINGLE QUESTION: Always read all questions in the section collectively.
@@ -285,6 +310,7 @@ class BlueprintService:
                 raw_response = self.ai_service.generate_response(
                     prompt=prompt,
                     system_instruction=BLUEPRINT_ANALYSIS_SYSTEM_INSTRUCTION,
+                    temperature=0.0,
                 )
             except TypeError:
                 raw_response = self.ai_service.generate_response(prompt=prompt)
@@ -346,6 +372,11 @@ class BlueprintService:
                 if isinstance(sq, dict):
                     if "reasoning_style" in sq:
                         sq["reasoning_style"] = normalize_reasoning_style(sq["reasoning_style"])
+                    if "mcq_options" in sq:
+                        if isinstance(sq["mcq_options"], list) and len(sq["mcq_options"]) > 0:
+                            sq["mcq_options"] = [str(opt).strip() for opt in sq["mcq_options"] if opt]
+                        else:
+                            sq["mcq_options"] = None
                     sample_questions.append(sq)
 
             analysis_total = sum(s.total_section_marks for s in sections)
