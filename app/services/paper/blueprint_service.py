@@ -95,7 +95,8 @@ Return ONLY a JSON object with this exact structure:
     {{
       "section_name": "<Section Name matching the section in sections list, e.g. SECTION - A>",
       "question_type": "<MCQ | VERY_SHORT_ANSWER | SHORT_ANSWER | LONG_ANSWER | NUMERICAL>",
-      "question_text": "<Full verbatim question stem / problem statement ONLY. For MCQs, do NOT include the options inside this string. For Assertion-Reason questions, include the complete Assertion (A) and Reason (R) statements>",
+      "passage": "<Exact stimulus passage, case-study narrative, or context reading text if this question is passage-based, null otherwise>",
+      "question_text": "<Full verbatim question stem / problem statement ONLY. For MCQs, do NOT include the options inside this string. For Assertion-Reason questions, include the complete Assertion (A) and Reason (R) statements. Do NOT include the passage text inside this field>",
       "mcq_options": [
         "<Full text of Option A, e.g. (a) Option content>",
         "<Full text of Option B, e.g. (b) Option content>",
@@ -128,17 +129,27 @@ CRITICAL BLUEPRINT RULES:
    For every multiple-choice question, you MUST extract the choices into the "mcq_options" array as clean strings.
    "question_text" MUST contain ONLY the question stem / problem prompt, strictly WITHOUT the choices.
    For non-MCQ questions (VERY_SHORT_ANSWER, SHORT_ANSWER, LONG_ANSWER, NUMERICAL), set "mcq_options": null.
-8. ASSERTION-REASON MCQ OPTIONS INHERITANCE:
+8. PASSAGE & CASE-STUDY HANDLING:
+   - For passage-based, case-study, or comprehension questions (e.g. questions referring to a common passage, stimulus story, or scenario):
+     * Place the complete stimulus passage text into the "passage" field.
+     * Place ONLY the specific sub-question prompt in "question_text". Do NOT duplicate or embed the passage text inside "question_text".
+     * Do NOT rely on "section_description" to carry a question-specific passage.
+     * If multiple questions in a section share the same passage, attach that passage text to each of those questions.
+     * If questions in a section use different passages (e.g. Case Study 1 vs Case Study 2), each question MUST carry its own respective passage.
+     * For all standard questions that do NOT have a stimulus passage, set "passage": null.
+9. ASSERTION-REASON MCQ OPTIONS INHERITANCE:
    For Assertion-Reason questions where the 4 standard options are stated once in the common section directions or header (e.g. "(a) Both A and R are true and R is the correct explanation of A", "(b) Both A and R are true but R is not the correct explanation of A", "(c) A is true but R is false", "(d) A is false but R is true"):
    You MUST attach those 4 full option strings into "mcq_options" for every Assertion-Reason question so that each question is complete, self-contained, and never left without options.
-9. STRICT ZERO-TRUNCATION & VERBATIM TRANSCRIPTION:
+10. STRICT ZERO-TRUNCATION & VERBATIM TRANSCRIPTION:
    Transcribe the complete, exact text of every question word-for-word.
-   NEVER use ellipses ('...'), NEVER summarize, and NEVER cut off sentences. Every word of the question stem, assertion statement, and reason statement must be fully transcribed.
-10. EXHAUSTIVE QUESTION EXTRACTION (ALL QUESTIONS):
-   Read the ENTIRE examination text from start to finish. In sample_questions, extract EVERY question appearing in the examination paper across all sections (e.g. Q1, Q2, Q3 ... QN, including both alternatives for internal choice questions like Q4(a) and Q4(b)). Do NOT omit, skip, or summarize questions as mere 1-2 question samples—extract ALL questions so the complete pedagogical corpus and every question's specific text, options, marks, cognitive demand, and reasoning style are fully captured.
-11. EXACT SECTION NAME MATCHING:
+   NEVER use ellipses ('...'), NEVER summarize, and NEVER cut off sentences. Every word of the question stem, assertion statement, and reason statement must be fully transcribed. Even if OCR text is faint, complete the sentence grammatically based on subject context—never leave trailing ellipses ('...').
+11. EXHAUSTIVE QUESTION EXTRACTION (ALL QUESTIONS & ZERO DUPLICATES):
+   Read the ENTIRE examination text from start to finish. In sample_questions, extract EVERY question appearing in the examination paper across all sections (e.g. Q1, Q2, Q3 ... QN, including both alternatives for internal choice questions like Q4(a) and Q4(b)).
+   NEVER duplicate or repeat questions in sample_questions. Every extracted question must be a distinct, unique item from the exam.
+   Do NOT omit, skip, or summarize questions as mere 1-2 question samples—extract ALL questions so the complete pedagogical corpus and every question's specific text, options, marks, cognitive demand, and reasoning style are fully captured.
+12. EXACT SECTION NAME MATCHING:
    Ensure that "section_name" in each question in sample_questions matches the exact string given in the corresponding section's "name" field under "sections".
-12. SECTION REASONING STYLE & PEDAGOGICAL FREEDOM:
+13. SECTION REASONING STYLE & PEDAGOGICAL FREEDOM:
    Evaluate ALL questions in each section collectively before assigning reasoning_style and section_description:
    - FULL AUTONOMY & PERMISSION TO INVENT: You have complete free will and explicit permission to either choose an existing style or invent an entirely new domain-appropriate style (in UPPERCASE_SNAKE_CASE) that best characterizes the section or question. You are NOT confined to any fixed menu, multiple-choice list, or pre-set examples. Any examples mentioned in instructions are purely illustrative to demonstrate formatting (e.g. CLINICAL_CASE_DIAGNOSIS, STATISTICAL_ANALYSIS, ETHICAL_DILEMMA, PROOF_BY_CONTRADICTION, HISTORICAL_SOURCE_CRITIQUE, etc.). Use whatever descriptor genuinely best reflects the real cognitive demands of the questions.
    - DO NOT JUDGE BY A SINGLE QUESTION: Always read all questions in the section collectively.
@@ -372,6 +383,14 @@ class BlueprintService:
                 if isinstance(sq, dict):
                     if "reasoning_style" in sq:
                         sq["reasoning_style"] = normalize_reasoning_style(sq["reasoning_style"])
+                    if "passage" in sq:
+                        raw_passage = sq.get("passage")
+                        if raw_passage and str(raw_passage).strip() and str(raw_passage).strip().lower() != "null":
+                            sq["passage"] = str(raw_passage).strip()
+                        else:
+                            sq["passage"] = None
+                    else:
+                        sq["passage"] = None
                     if "mcq_options" in sq:
                         if isinstance(sq["mcq_options"], list) and len(sq["mcq_options"]) > 0:
                             sq["mcq_options"] = [str(opt).strip() for opt in sq["mcq_options"] if opt]
