@@ -21,11 +21,9 @@ class PaperRepository:
         book_id: UUID,
         generation_mode: str,
         total_marks: int,
-        difficulty: str,
         selected_chapter_ids: List[UUID],
         time_allowed_minutes: Optional[int] = None,
         class_name: Optional[str] = None,
-        include_answers: bool = True,
         title: Optional[str] = None,
         reference_paper_id: Optional[UUID] = None,
         blueprint_json: Optional[Dict[str, Any]] = None,
@@ -49,13 +47,11 @@ class PaperRepository:
             total_marks=total_marks,
             time_allowed_minutes=time_allowed_minutes,
             class_name=class_name,
-            difficulty=difficulty,
             easy_percentage=easy_percentage,
             medium_percentage=medium_percentage,
             hard_percentage=hard_percentage,
             selected_chapter_ids=[str(cid) for cid in selected_chapter_ids],
             chapter_weightages=chapter_weightages,
-            include_answers=include_answers,
             blueprint_json=blueprint_json,
         )
 
@@ -168,10 +164,7 @@ class PaperRepository:
                 except ValueError:
                     ch_id = None
 
-            diff_val = q_info.get("difficulty")
-            if not diff_val:
-                paper = self.db.get(GeneratedPaper, paper_id)
-                diff_val = paper.difficulty if (paper and paper.difficulty) else "MEDIUM"
+            diff_val = q_info.get("difficulty") or "MEDIUM"
 
             # Visual fields extraction
             vis_info = q_info.get("visual")

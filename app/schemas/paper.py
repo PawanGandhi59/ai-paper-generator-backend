@@ -81,14 +81,12 @@ class PaperGenerateRequest(BaseModel):
     time_allowed_minutes: Optional[int] = Field(None, ge=1, le=1440, description="Time allowed for paper in minutes (e.g. 180 for 3 hours)")
     class_name: Optional[str] = Field(None, max_length=100, description="Optional class/grade name (e.g. Class 10, Grade 12)")
 
-    difficulty: DifficultyLevel = DifficultyLevel.MIXED
     easy_percentage: Optional[int] = Field(None, ge=0, le=100, description="Optional percentage of Easy questions (0-100%)")
     medium_percentage: Optional[int] = Field(None, ge=0, le=100, description="Optional percentage of Medium questions (0-100%)")
     hard_percentage: Optional[int] = Field(None, ge=0, le=100, description="Optional percentage of Hard questions (0-100%)")
 
     model_config = ConfigDict(extra="ignore")
 
-    include_answers: bool = Field(True, description="Whether to include answer keys in API response")
     title: Optional[str] = Field(None, max_length=255)
 
     enable_numerical_percentage: bool = Field(False, description="Whether to distribute a percentage of numerical questions across sections")
@@ -218,13 +216,7 @@ class PaperQuestionResponse(BaseModel):
     reasoning_style: Optional[str] = None
     section_description: Optional[str] = None
 
-    # Answer fields (conditionally included based on include_answers)
     mcq_options: Optional[List[str]] = None
-    correct_answer: Optional[str] = None
-    expected_answer: Optional[str] = None
-    numerical_values: Optional[Dict[str, Any]] = None
-    solution_explanation: Optional[str] = None
-    unit: Optional[str] = None
 
     # Visual fields
     visual_required: bool = False
@@ -249,13 +241,11 @@ class PaperResponse(BaseModel):
     total_marks: int
     time_allowed_minutes: Optional[int] = None
     class_name: Optional[str] = None
-    difficulty: DifficultyLevel
     easy_percentage: Optional[int] = None
     medium_percentage: Optional[int] = None
     hard_percentage: Optional[int] = None
 
     selected_chapters: List[ChapterWeightageResponse] = Field(default_factory=list)
-    include_answers: bool
     blueprint_json: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
 
