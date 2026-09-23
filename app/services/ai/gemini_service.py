@@ -160,6 +160,7 @@ class GeminiService(AIService):
         max_output_tokens: int,
         response_schema: Optional[Any],
         response_mime_type: str = "application/json",
+        temperature: Optional[float] = None,
     ) -> str:
         """Handles mock client compatibility for legacy tests."""
         class _LegacyConfig:
@@ -174,7 +175,7 @@ class GeminiService(AIService):
             sys_inst=system_instruction,
             mime=response_mime_type,
             schema=response_schema,
-            temp=0.2,
+            temp=temperature if temperature is not None else 0.2,
             max_tokens=max_output_tokens,
         )
 
@@ -217,6 +218,7 @@ class GeminiService(AIService):
         max_output_tokens: Optional[int] = None,
         response_schema: Optional[Any] = None,
         response_mime_type: Optional[str] = None,
+        temperature: Optional[float] = None,
     ) -> str:
         if not self.llm and not (hasattr(self, "client") and self.client):
             raise RuntimeError("GeminiService client is not initialized.")
@@ -226,7 +228,7 @@ class GeminiService(AIService):
         mime_type = response_mime_type or "application/json"
 
         if hasattr(self, "client") and self.client is not None and hasattr(self.client, "models"):
-            return self._legacy_client_generate(prompt, sys_instruct, token_limit, response_schema, mime_type)
+            return self._legacy_client_generate(prompt, sys_instruct, token_limit, response_schema, mime_type, temperature)
 
         messages: List[BaseMessage] = []
         if sys_instruct:
@@ -244,6 +246,8 @@ class GeminiService(AIService):
             "max_output_tokens": token_limit,
             "response_mime_type": mime_type,
         }
+        if temperature is not None:
+            invocation_kwargs["temperature"] = temperature
         if schema_dict:
             invocation_kwargs["response_schema"] = schema_dict
 
