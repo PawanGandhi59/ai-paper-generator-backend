@@ -2618,10 +2618,22 @@ SOURCE EDUCATIONAL MATERIAL:
                     logger.error(f"Failed to parse Gemini output JSON: {json_err}")
                     raise GeminiInvalidResponseError(f"The AI returned an invalid response while generating the paper: {str(json_err)}")
 
+        def _unescape_unicode_sequences(val: Any) -> Any:
+            if isinstance(val, str):
+                # Decode double-escaped or literal \uXXXX and \UXXXXXXXX sequences into actual characters (e.g. \u221a -> √, \u03c0 -> π)
+                s = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), val)
+                s = re.sub(r'\\U([0-9a-fA-F]{8})', lambda m: chr(int(m.group(1), 16)), s)
+                return s
+            elif isinstance(val, dict):
+                return {k: _unescape_unicode_sequences(v) for k, v in val.items()}
+            elif isinstance(val, list):
+                return [_unescape_unicode_sequences(item) for item in val]
+            return val
+
         if isinstance(res, dict):
-            return res
+            return _unescape_unicode_sequences(res)
         if isinstance(res, list):
-            return {"questions": res}
+            return {"questions": _unescape_unicode_sequences(res)}
         raise GeminiInvalidResponseError("Gemini output root is not a JSON object or array.")
 
     def _build_paper_response(

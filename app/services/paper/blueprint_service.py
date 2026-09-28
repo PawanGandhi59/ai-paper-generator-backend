@@ -795,13 +795,25 @@ class BlueprintService:
             if match:
                 text_str = match.group(1).strip()
 
+        def _unescape_unicode_sequences(val: Any) -> Any:
+            if isinstance(val, str):
+                s = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), val)
+                s = re.sub(r'\\U([0-9a-fA-F]{8})', lambda m: chr(int(m.group(1), 16)), s)
+                return s
+            elif isinstance(val, dict):
+                return {k: _unescape_unicode_sequences(v) for k, v in val.items()}
+            elif isinstance(val, list):
+                return [_unescape_unicode_sequences(item) for item in val]
+            return val
+
+        res: Any = {}
         try:
-            return json.loads(text_str)
+            res = json.loads(text_str)
         except Exception:
             sanitized = re.sub(r',\s*([\}\]])', r'\1', text_str)
             sanitized = re.sub(r'\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})', r'\\\\', sanitized)
             try:
-                return json.loads(sanitized)
+                res = json.loads(sanitized)
             except Exception:
                 balanced = sanitized
                 open_braces = balanced.count("{") - balanced.count("}")
@@ -811,7 +823,7 @@ class BlueprintService:
                 if open_braces > 0:
                     balanced += "}" * open_braces
                 try:
-                    return json.loads(balanced)
+                    res = json.loads(balanced)
                 except Exception:
                     # Final attempt: extract substring between first { and last }
                     first_brace = text_str.find("{")
@@ -819,7 +831,9 @@ class BlueprintService:
                     if first_brace != -1 and last_brace > first_brace:
                         candidate = text_str[first_brace:last_brace + 1]
                         try:
-                            return json.loads(candidate)
+                            res = json.loads(candidate)
                         except Exception:
                             pass
-                    return {}
+                    res = {}
+
+        return _unescape_unicode_sequences(res) if isinstance(res, (dict, list)) else {}

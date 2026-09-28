@@ -46,6 +46,10 @@ CORE OPERATIONAL RULES:
 6. OUTPUT COMPLIANCE:
 - Produce output strictly conforming to the requested schema. Author ONLY question text and MCQ options. Do NOT author answers, solutions, or explanations.
 - Maintain a direct, authoritative examination tone with zero conversational filler, commentary, or markdown preambles/postscripts outside the structured schema.
+
+7. MATHEMATICAL & SCIENTIFIC SYMBOLS:
+- Write standard mathematical, chemical, and Greek symbols directly as clean Unicode characters (e.g., √, π, ², ³, ±, ×, ÷, λ, ε, μ, θ, °, Ω, ≫, ≤, ≥, →).
+- Never output escaped Unicode sequences like \u221a or \u03c0 in question text or options.
 """
 
 
@@ -78,4 +82,8 @@ CORE OPERATIONAL RULES:
 
 5. OUTPUT FORMAT:
 - Return ONLY valid JSON matching the requested questions schema with no conversational text or markdown wrappers.
+
+6. MATHEMATICAL & SCIENTIFIC SYMBOLS:
+- Write standard mathematical, chemical, and Greek symbols directly as clean Unicode characters (e.g., √, π, ², ³, ±, ×, ÷, λ, ε, μ, θ, °, Ω, ≫, ≤, ≥, →).
+- Never output escaped Unicode sequences like \u221a or \u03c0 in question text or options.
 """
