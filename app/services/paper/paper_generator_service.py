@@ -2770,7 +2770,11 @@ SOURCE EDUCATIONAL MATERIAL:
                     pass
 
         # Calculate PDF & Processing Status
-        has_saved_pdf = bool(paper.pdf_path and not _is_mock(paper.pdf_path) and os.path.exists(paper.pdf_path))
+        has_saved_pdf = bool(
+            paper.pdf_path
+            and not _is_mock(paper.pdf_path)
+            and (storage_service.exists(paper.pdf_path) or paper.document_id is not None)
+        )
         pdf_url = f"/api/v1/papers/{paper.id}/pdf" if has_saved_pdf else None
 
         raw_proc = getattr(paper, "processing_status", None)
@@ -2918,7 +2922,7 @@ SOURCE EDUCATIONAL MATERIAL:
         self.workspace_service.get_subject(paper.subject_id, current_user_id)
 
         # Single save rule: reject if PDF has already been saved
-        if paper.pdf_path and os.path.exists(paper.pdf_path):
+        if paper.pdf_path and not _is_mock(paper.pdf_path) and (storage_service.exists(paper.pdf_path) or paper.document_id is not None):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Paper has already been saved.",
