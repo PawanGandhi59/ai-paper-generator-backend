@@ -115,10 +115,9 @@ class PaperRepository:
             paper.pdf_path = pdf_path
             paper.document_id = document_id
             paper.processing_status = processing_status
-            if blueprint_json is not None:
-                paper.blueprint_json = blueprint_json
-                if "total_marks" in blueprint_json and isinstance(blueprint_json["total_marks"], int):
-                    paper.total_marks = blueprint_json["total_marks"]
+            paper.blueprint_json = blueprint_json
+            if blueprint_json and "total_marks" in blueprint_json and isinstance(blueprint_json["total_marks"], int):
+                paper.total_marks = blueprint_json["total_marks"]
             self.db.commit()
             self.db.refresh(paper)
         return paper

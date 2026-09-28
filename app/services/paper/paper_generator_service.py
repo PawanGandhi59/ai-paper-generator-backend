@@ -3043,31 +3043,18 @@ SOURCE EDUCATIONAL MATERIAL:
 
             self.doc_repo.mark_ready(doc_id)
 
-            # Analyze edited PDF text to generate updated blueprint reflecting user edits
-            pages_text = [p.get("text_content", "") for p in pages_data if p.get("text_content")]
-            updated_blueprint_dict = None
-            if pages_text:
-                try:
-                    updated_bp = self.blueprint_service.analyze_reference_paper(
-                        paper_pages_text=pages_text,
-                        requested_total_marks=None,
-                    )
-                    if updated_bp:
-                        updated_blueprint_dict = updated_bp.model_dump()
-                except Exception as bp_err:
-                    logger.warning(f"Could not extract updated blueprint from saved PDF for paper {paper_id}: {bp_err}")
-
             # Upload to persistent storage (S3 or local)
             remote_key = f"generated_papers/{paper_id}/final.pdf"
             storage_service.upload_file(stored_path, remote_key, content_type="application/pdf")
             stored_record_path = remote_key if storage_service.is_s3_enabled else stored_path
 
+            # Mark READY immediately. Blueprint extraction is deferred lazily to when/if
+            # this paper is first selected as a reference paper, keeping save fast & 100% resilient.
             self.paper_repo.update_saved_pdf(
                 paper_id=paper_id,
                 pdf_path=stored_record_path,
                 document_id=doc_id,
                 processing_status="READY",
-                blueprint_json=updated_blueprint_dict,
             )
         except Exception as exc:
             logger.error(f"Failed processing saved paper PDF for paper {paper_id}: {exc}")
