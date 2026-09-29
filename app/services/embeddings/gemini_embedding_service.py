@@ -194,3 +194,14 @@ class GeminiEmbeddingService(EmbeddingService):
         except Exception as exc:
             logger.error(f"Gemini embedding API error: {str(exc)}")
             raise RuntimeError(f"Gemini embedding API failure: {str(exc)}")
+
+
+_default_embedding_service: Optional[GeminiEmbeddingService] = None
+
+
+def get_gemini_embedding_service() -> GeminiEmbeddingService:
+    global _default_embedding_service
+    if _default_embedding_service is None:
+        _default_embedding_service = GeminiEmbeddingService()
+    return _default_embedding_service
+

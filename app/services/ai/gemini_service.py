@@ -484,4 +484,15 @@ class GeminiService(AIService):
         return len(combined_contents) // 4
 
 
+_default_gemini_service: Optional[GeminiService] = None
+
+
+def get_gemini_service() -> GeminiService:
+    global _default_gemini_service
+    if _default_gemini_service is None:
+        _default_gemini_service = GeminiService()
+    return _default_gemini_service
+
+
+
 

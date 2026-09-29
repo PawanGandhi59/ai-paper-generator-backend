@@ -75,6 +75,7 @@ class PaperRepository:
     def list_papers_by_subject(self, subject_id: UUID, user_id: UUID) -> List[GeneratedPaper]:
         stmt = (
             select(GeneratedPaper)
+            .options(joinedload(GeneratedPaper.questions))
             .where(
                 GeneratedPaper.subject_id == subject_id,
                 GeneratedPaper.user_id == user_id,
@@ -82,7 +83,7 @@ class PaperRepository:
             )
             .order_by(GeneratedPaper.created_at.desc())
         )
-        return list(self.db.execute(stmt).scalars().all())
+        return list(self.db.execute(stmt).unique().scalars().all())
 
     def update_status(
         self,

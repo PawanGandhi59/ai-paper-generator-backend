@@ -71,10 +71,53 @@ class PaperGeneratorService:
         self.workspace_service = WorkspaceService(db)
         self.doc_repo = DocumentRepository(db)
         self.ref_paper_repo = ReferencePaperRepository(db)
-        self.ai_service = ai_service or GeminiService()
-        self.retrieval_service = retrieval_service or RetrievalService(db)
-        self.embedding_service = embedding_service or GeminiEmbeddingService()
-        self.blueprint_service = blueprint_service or BlueprintService(self.ai_service)
+        self._ai_service = ai_service
+        self._retrieval_service = retrieval_service
+        self._embedding_service = embedding_service
+        self._blueprint_service = blueprint_service
+
+    @property
+    def ai_service(self) -> GeminiService:
+        if self._ai_service is None:
+            from app.services.ai.gemini_service import get_gemini_service
+            self._ai_service = get_gemini_service()
+        return self._ai_service
+
+    @ai_service.setter
+    def ai_service(self, val: Any) -> None:
+        self._ai_service = val
+
+    @property
+    def embedding_service(self) -> GeminiEmbeddingService:
+        if self._embedding_service is None:
+            from app.services.embeddings.gemini_embedding_service import get_gemini_embedding_service
+            self._embedding_service = get_gemini_embedding_service()
+        return self._embedding_service
+
+    @embedding_service.setter
+    def embedding_service(self, val: Any) -> None:
+        self._embedding_service = val
+
+    @property
+    def retrieval_service(self) -> RetrievalService:
+        if self._retrieval_service is None:
+            self._retrieval_service = RetrievalService(self.db, embedding_service=self.embedding_service)
+        return self._retrieval_service
+
+    @retrieval_service.setter
+    def retrieval_service(self, val: Any) -> None:
+        self._retrieval_service = val
+
+    @property
+    def blueprint_service(self) -> BlueprintService:
+        if self._blueprint_service is None:
+            self._blueprint_service = BlueprintService(self.ai_service)
+        return self._blueprint_service
+
+    @blueprint_service.setter
+    def blueprint_service(self, val: Any) -> None:
+        self._blueprint_service = val
+
 
     @staticmethod
     def calculate_proportional_chapter_allocations(
@@ -2773,7 +2816,6 @@ SOURCE EDUCATIONAL MATERIAL:
         has_saved_pdf = bool(
             paper.pdf_path
             and not _is_mock(paper.pdf_path)
-            and (storage_service.exists(paper.pdf_path) or paper.document_id is not None)
         )
         pdf_url = f"/api/v1/papers/{paper.id}/pdf" if has_saved_pdf else None
 
