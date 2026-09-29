@@ -209,19 +209,6 @@ def process_document(self, document_id_str: str) -> dict:
         # Save DocumentChunks to DB
         created_chunks = doc_repo.save_document_chunks(doc_id, chunks_data)
 
-        # 6. Dispatch background embedding generation task
-        doc_repo.mark_embedding_status(doc_id, "PROCESSING")
-        try:
-            generate_document_embeddings.delay(document_id_str)
-        except Exception as embed_queue_exc:
-            logger.warning(f"Failed to queue background embedding task via delay: {embed_queue_exc}")
-            try:
-                # Direct execution fallback
-                generate_document_embeddings(document_id_str)
-            except Exception as direct_exc:
-                logger.warning(f"Direct embedding execution also failed: {direct_exc}. Document remains READY, embeddings can be retried.")
-                doc_repo.mark_embedding_status(doc_id, "FAILED", error_message=f"Queue failure: {str(embed_queue_exc)[:200]}")
-
         # 7. Generate Structured Exam Knowledge Digest for chapters
         try:
             digest_service = ChapterDigestService()
