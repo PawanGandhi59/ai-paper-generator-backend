@@ -31,7 +31,7 @@ services:
       dockerfile: Dockerfile
     container_name: ai_paper_generator_backend
     restart: always
-    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2"
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1"
     ports:
       - "8000:8000"
     volumes:
@@ -56,7 +56,7 @@ services:
       dockerfile: Dockerfile
     container_name: ai_paper_generator_celery_worker
     restart: always
-    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=2
+    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=1
     volumes:
       - ./storage:/app/storage
     env_file:

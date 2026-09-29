@@ -2921,12 +2921,24 @@ SOURCE EDUCATIONAL MATERIAL:
         # Ownership authorization
         self.workspace_service.get_subject(paper.subject_id, current_user_id)
 
-        # Single save rule: reject if PDF has already been saved
-        if paper.pdf_path and not _is_mock(paper.pdf_path) and (storage_service.exists(paper.pdf_path) or paper.document_id is not None):
+        # Single save rule: reject only if PDF has already been successfully saved (READY)
+        if (
+            paper.pdf_path
+            and not _is_mock(paper.pdf_path)
+            and getattr(paper, "processing_status", None) == "READY"
+            and (storage_service.exists(paper.pdf_path) or paper.document_id is not None)
+        ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Paper has already been saved.",
             )
+
+        # If retrying a previous unready / failed attempt, cleanly remove the prior document
+        if paper.document_id and not _is_mock(paper.document_id):
+            try:
+                self.doc_repo.delete_document(paper.document_id)
+            except Exception as cleanup_exc:
+                logger.warning(f"Could not clean up prior unready document {paper.document_id}: {cleanup_exc}")
 
         # Validate extension & MIME
         original_filename = os.path.basename(file.filename or "paper.pdf")
@@ -2992,26 +3004,42 @@ SOURCE EDUCATIONAL MATERIAL:
                 detail=f"Failed to process saved PDF: {str(exc)}",
             )
 
+        # Upload to persistent storage (S3 or local) immediately so the PDF is available
+        remote_key = f"generated_papers/{paper_id}/final.pdf"
+        storage_service.upload_file(stored_path, remote_key, content_type="application/pdf")
+        stored_record_path = remote_key if storage_service.is_s3_enabled else stored_path
+
         # Create Document record linked to book
         doc = self.doc_repo.create_document(
             book_id=paper.book_id,
             original_filename="final.pdf",
-            stored_path=stored_path,
+            stored_path=stored_record_path,
             mime_type="application/pdf",
             file_size=total_written,
-            processing_status="UPLOADED",
+            processing_status="PROCESSING",
         )
 
         # Update paper record with pdf_path, document_id, processing_status
         paper = self.paper_repo.update_saved_pdf(
             paper_id=paper.id,
-            pdf_path=stored_path,
+            pdf_path=stored_record_path,
             document_id=doc.id,
             processing_status="PROCESSING",
         )
 
-        # Process PDF text extraction & chunks into DB WITHOUT embeddings
-        self._process_saved_paper_pdf_without_embeddings(paper_id=paper.id, doc_id=doc.id, stored_path=stored_path)
+        # Dispatch background Celery task for PDF extraction & chunking (with OCR preserved)
+        try:
+            from app.worker import process_saved_paper_pdf
+            process_saved_paper_pdf.delay(str(paper.id), str(doc.id), stored_path)
+        except Exception as task_exc:
+            logger.warning(f"Celery task dispatch failed: {task_exc}. Marking READY as fallback.")
+            self.paper_repo.update_saved_pdf(
+                paper_id=paper.id,
+                pdf_path=stored_record_path,
+                document_id=doc.id,
+                processing_status="READY",
+            )
+            self.doc_repo.mark_ready(doc.id)
 
         final_paper = self.paper_repo.get_paper(paper.id)
         return self._build_paper_response(final_paper, include_answers=final_paper.include_answers)

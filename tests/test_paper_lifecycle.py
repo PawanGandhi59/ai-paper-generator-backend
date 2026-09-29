@@ -195,12 +195,13 @@ def test_save_pdf_validation_magic_bytes_and_second_save_conflict(tmp_path):
     pg_svc.paper_repo.get_paper = MagicMock(side_effect=[paper, updated_paper])
 
     with patch("app.core.config.settings.LOCAL_STORAGE_PATH", str(tmp_path)), \
-         patch("app.worker.process_document.delay"):
+         patch("app.worker.process_saved_paper_pdf.delay"):
         res = pg_svc.save_pdf(paper_id=paper_id, current_user_id=user_id, file=mock_file_valid)
         assert res.has_saved_pdf is True
         assert res.processing_status == "PROCESSING"
 
     # 4. Second Save Conflict Test (HTTP 409)
+    updated_paper.processing_status = "READY"
     pg_svc.paper_repo.get_paper = MagicMock(return_value=updated_paper)
     with pytest.raises(HTTPException) as exc_info_conflict:
         pg_svc.save_pdf(paper_id=paper_id, current_user_id=user_id, file=mock_file_valid)
@@ -635,7 +636,7 @@ def test_original_ai_json_preserved_after_save():
     dummy_file.filename = "final.pdf"
     dummy_file.file.read = MagicMock(side_effect=[b"%PDF-1.7 data", b""])
 
-    with patch("os.makedirs"), patch("builtins.open", MagicMock()), patch("os.path.exists", side_effect=[False, True]), patch("app.worker.process_document.delay"):
+    with patch("os.makedirs"), patch("builtins.open", MagicMock()), patch("os.path.exists", side_effect=[False, True]), patch("app.worker.process_saved_paper_pdf.delay"):
         pg_svc.save_pdf(paper_id=paper_id, current_user_id=user_id, file=dummy_file)
 
     # Original questions remain preserved and unchanged

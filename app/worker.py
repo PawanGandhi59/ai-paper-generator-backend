@@ -451,3 +451,81 @@ def generate_document_embeddings(self, document_id_str: str) -> dict:
 
     finally:
         db.close()
+
+
+@celery_app.task(bind=True, name="process_saved_paper_pdf", max_retries=2)
+def process_saved_paper_pdf(self, paper_id_str: str, doc_id_str: str, stored_path: str) -> dict:
+    """
+    Celery task to asynchronously extract text, pages, and chunks from a saved paper PDF
+    without running inside the FastAPI web server process.
+    Preserves full OCR capability in the Celery worker container.
+    """
+    logger.info(f"Starting process_saved_paper_pdf for paper_id={paper_id_str}, doc_id={doc_id_str}")
+    db = SessionLocal()
+    try:
+        from app.repositories.paper_repository import PaperRepository
+        doc_repo = DocumentRepository(db)
+        paper_repo = PaperRepository(db)
+
+        paper_id = UUID(paper_id_str)
+        doc_id = UUID(doc_id_str)
+
+        local_file_path = storage_service.get_local_path(stored_path)
+        if not os.path.exists(local_file_path):
+            doc = doc_repo.get_document_by_id(doc_id)
+            if doc and doc.stored_path:
+                try:
+                    storage_service.download_file(doc.stored_path, local_file_path)
+                except Exception as dl_exc:
+                    logger.error(f"Failed downloading saved paper PDF from storage: {dl_exc}")
+
+        doc_dir = os.path.dirname(local_file_path)
+        pages_data = PDFProcessor.process_pdf(local_file_path, doc_dir, ocr_mode="fast")
+        doc_repo.save_document_pages(doc_id, pages_data)
+
+        doc = doc_repo.get_document_by_id(doc_id)
+        if doc and doc.book:
+            subject_id = doc.book.subject_id
+            workspace_id = doc.book.subject.workspace_id if doc.book.subject else None
+            pages = doc_repo.get_document_pages(doc_id)
+            chunks_data = ChunkingService.chunk_document_pages(
+                pages=pages,
+                document_id=doc_id,
+                book_id=doc.book_id,
+                subject_id=subject_id,
+                workspace_id=workspace_id,
+            )
+            doc_repo.save_document_chunks(doc_id, chunks_data)
+
+        doc_repo.mark_ready(doc_id)
+
+        remote_key = f"generated_papers/{paper_id}/final.pdf"
+        stored_record_path = remote_key if storage_service.is_s3_enabled else stored_path
+        paper_repo.update_saved_pdf(
+            paper_id=paper_id,
+            pdf_path=stored_record_path,
+            document_id=doc_id,
+            processing_status="READY",
+        )
+        logger.info(f"Successfully completed process_saved_paper_pdf for paper_id={paper_id_str}")
+        return {"status": "SUCCESS", "paper_id": paper_id_str, "document_id": doc_id_str}
+
+    except Exception as exc:
+        logger.error(f"Error in process_saved_paper_pdf for paper {paper_id_str}: {exc}")
+        try:
+            from app.repositories.paper_repository import PaperRepository
+            paper_repo = PaperRepository(db)
+            remote_key = f"generated_papers/{paper_id_str}/final.pdf"
+            stored_record_path = remote_key if storage_service.is_s3_enabled else stored_path
+            paper_repo.update_saved_pdf(
+                paper_id=UUID(paper_id_str),
+                pdf_path=stored_record_path,
+                document_id=UUID(doc_id_str),
+                processing_status="READY",
+            )
+        except Exception as inner_exc:
+            logger.error(f"Failed to update paper status on failure: {inner_exc}")
+        return {"status": "FAILED", "paper_id": paper_id_str, "error": str(exc)}
+    finally:
+        db.close()
+
