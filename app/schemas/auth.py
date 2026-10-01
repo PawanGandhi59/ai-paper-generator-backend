@@ -104,3 +104,11 @@ class ResetPasswordRequest(BaseModel):
 
 class ResetPasswordResponse(BaseModel):
     message: str
+
+
+class DeleteAccountRequest(BaseModel):
+    password: Optional[str] = Field(None, min_length=1, max_length=72, description="Password confirmation for password-based accounts")
+
+
+class DeleteAccountResponse(BaseModel):
+    message: str

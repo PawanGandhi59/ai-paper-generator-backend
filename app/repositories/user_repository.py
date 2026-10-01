@@ -123,3 +123,7 @@ class UserRepository:
         user.password_hash = new_password_hash
         user.updated_at = datetime.now(timezone.utc)
         self.db.flush()
+
+    def delete_user(self, user: User) -> None:
+        self.db.delete(user)
+        self.db.commit()

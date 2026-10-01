@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 
 import secrets
 from uuid import UUID
@@ -21,6 +21,8 @@ from app.core.security import (
 from app.models.user import User
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import (
+    DeleteAccountRequest,
+    DeleteAccountResponse,
     ForgotPasswordRequest,
     ForgotPasswordResponse,
     GoogleLogin,
@@ -464,3 +466,75 @@ class AuthService:
         self.db.commit()
 
         return ResetPasswordResponse(message="Password reset successfully.")
+
+    def delete_account(
+        self,
+        current_user: User,
+        data: Optional[DeleteAccountRequest] = None,
+    ) -> DeleteAccountResponse:
+        """
+        Permanently delete a user account and all descendant resources.
+        - Verifies user is active.
+        - Verifies password if provided (for password-based accounts).
+        - Deletes all user workspaces, cascading down through subjects, books, documents,
+          reference papers, and generated papers, including physical files on disk/S3.
+        - Deletes any generated visual files.
+        - Deletes user entity from DB, cascading all OAuth accounts, refresh tokens, OTPs.
+        """
+        if not current_user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User account is inactive.",
+            )
+
+        if data and data.password:
+            if current_user.password_hash and not verify_password(data.password, current_user.password_hash):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Incorrect password.",
+                )
+
+        import os
+        from sqlalchemy import select
+        from app.models.generated_visual import GeneratedVisual
+        from app.models.workspace import Workspace
+        from app.services.storage import storage_service
+        from app.services.workspace_service import WorkspaceService
+
+        # 1. Clean up user workspaces and their associated descendant files (docs, ref papers, generated papers)
+        workspace_service = WorkspaceService(self.db)
+        user_workspaces = self.db.execute(
+            select(Workspace).where(Workspace.owner_id == current_user.id)
+        ).scalars().all()
+
+        import logging
+        logger = logging.getLogger(__name__)
+
+        for ws in user_workspaces:
+            try:
+                workspace_service.delete_workspace(ws.id, current_user.id)
+            except Exception as exc:
+                logger.warning(f"Error cleaning up workspace {ws.id} for user {current_user.id}: {exc}")
+
+        # 2. Clean up any remaining visual files for this user
+        try:
+            visuals = self.db.execute(
+                select(GeneratedVisual).where(GeneratedVisual.user_id == current_user.id)
+            ).scalars().all()
+            for visual in visuals:
+                if visual.file_path:
+                    if os.path.exists(visual.file_path):
+                        try:
+                            os.remove(visual.file_path)
+                        except OSError:
+                            pass
+                    storage_service.delete_prefix(visual.file_path)
+        except Exception:
+            pass
+
+        # 3. Delete user record from database (cascading deletes OAuth accounts, refresh tokens, OTPs, etc.)
+        user = self.user_repo.get_by_id(current_user.id)
+        if user:
+            self.user_repo.delete_user(user)
+
+        return DeleteAccountResponse(message="Account successfully deleted.")

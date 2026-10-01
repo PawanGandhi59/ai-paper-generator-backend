@@ -6,6 +6,8 @@ from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.models.user import User
 from app.schemas.auth import (
+    DeleteAccountRequest,
+    DeleteAccountResponse,
     ForgotPasswordRequest,
     ForgotPasswordResponse,
     GoogleLogin,
@@ -128,3 +130,17 @@ def reset_password(data: ResetPasswordRequest, db: Session = Depends(get_db)) ->
     """
     auth_service = AuthService(db)
     return auth_service.reset_password(data)
+
+
+@router.delete("/delete-account", response_model=DeleteAccountResponse, status_code=status.HTTP_200_OK)
+def delete_account(
+    data: Optional[DeleteAccountRequest] = Body(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> DeleteAccountResponse:
+    """
+    Permanently delete the authenticated user's account and all associated resources.
+    Supports optional password confirmation for password-based accounts.
+    """
+    auth_service = AuthService(db)
+    return auth_service.delete_account(current_user, data)
