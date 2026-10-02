@@ -52,8 +52,11 @@ class SectionBlueprint(BaseModel):
     reasoning_style: Optional[str] = Field(default=None, description="Dominant cognitive reasoning style e.g. SCENARIO_BASED, DIRECT_RECALL, MIXED, etc.")
     section_description: Optional[str] = Field(default=None, description="Detailed pedagogical focus or guidance for the section")
     question_count: int = Field(..., ge=1, description="Number of distinct question numbers in this section")
+    attempt_question_count: Optional[int] = Field(default=None, ge=1, description="Number of questions students must attempt in this section. If null, all questions are mandatory.")
+    or_sections_count: int = Field(default=0, ge=0, description="Number of alternative OR sections provided for this section")
+    is_or_alternative: bool = Field(default=False, description="True if this section is an alternative/OR copy of another section")
     marks_per_question: int = Field(..., ge=1, description="Marks assigned to each question number")
-    total_section_marks: int = Field(..., ge=1, description="Total marks = question_count * marks_per_question")
+    total_section_marks: int = Field(..., ge=1, description="Contributing marks for this section")
     has_internal_choice: bool = Field(default=False, description="Whether questions in this section have internal choices (e.g. Q4(a) OR Q4(b))")
     alternatives_per_question: int = Field(default=1, ge=1, description="Number of alternatives per question number (1 if no internal choice, 2 for (a) OR (b))")
     choice_rule: Optional[str] = Field(default=None, description="Choice rule description, e.g. 'answer_one_of_two'")
@@ -84,11 +87,15 @@ Return ONLY a JSON object with this exact structure:
       "question_type": "<One of: MCQ, VERY_SHORT_ANSWER, SHORT_ANSWER, LONG_ANSWER, NUMERICAL>",
       "reasoning_style": "<Analyze the questions in this section and determine what cognitive demand they require. You have complete free will and permission to either choose a common style (e.g. SCENARIO_BASED, DIRECT_RECALL, CONCEPT_EXPLANATION, MULTI_STEP_NUMERICAL, DERIVATION, EXPERIMENTAL_ANALYSIS, ASSERTION_REASON, MIXED) OR invent an entirely new domain-specific style (e.g. CLINICAL_DIAGNOSTIC_VIGNETTE, ETHICAL_EVALUATION, LEGAL_PRECEDENT_ANALYSIS, DATA_INTERPRETATION, etc.) that best characterizes the section. The examples are purely illustrative to demonstrate UPPERCASE_SNAKE_CASE format; choose or invent whatever truly fits best>",
       "section_description": "<Pedagogical description of what this section tests and any breakdown of question formats (e.g. 'Contains theoretical questions with 1 case scenario', 'Direct definitions and recall', or 'Mathematical problem solving')>",
-      "question_count": <number of distinct question numbers in this section as integer>,
+      "question_count": <number of distinct question numbers appearing in this section as integer>,
+      "attempt_question_count": <number of questions the student must attempt as integer (e.g. 5 if directions state 'Answer any 5 questions out of 8'), or null if all questions in the section are mandatory>,
+      "or_sections_count": <number of alternative OR sections provided for this section, e.g. 1 if an alternative section is offered, 0 otherwise>,
+      "is_or_alternative": <true if this section is an alternative/OR copy of a preceding section (e.g. 'SECTION C (OR)'), false otherwise>,
       "marks_per_question": <marks assigned per single question number as integer>,
+      "total_section_marks": <contributing marks: (attempt_question_count * marks_per_question) if attempt_question_count else (question_count * marks_per_question)>,
       "has_internal_choice": <true if questions have internal OR choices (e.g. Q4(a) OR Q4(b)), false otherwise>,
       "alternatives_per_question": <number of alternatives per question number, e.g. 2 for (a) OR (b), 1 if no choice>,
-      "choice_rule": "<'answer_one_of_two' if has_internal_choice is true, null otherwise>"
+      "choice_rule": "<'answer_N_of_M' if section has question choice, 'answer_one_of_two' if internal choice, or null>"
     }}
   ],
   "sample_questions": [
@@ -119,8 +126,11 @@ CRITICAL BLUEPRINT RULES:
 2. question_count is the count of distinct question NUMBERS in the section (e.g., Q1 to Q5 is 5 questions; Q6 to Q10 is 5 question numbers; Q11 to Q15 is 5 question numbers).
 3. marks_per_question is the mark assigned to ONE question (or ONE alternative), NOT the sum of choice options! For example, if Q5(a) is 3 marks OR Q5(b) is 3 marks, marks_per_question is 3 (NEVER 6!).
    Read the actual marks allocated to each question in the paper (e.g. [1], [2], [3], [4], [5], [6] in the right margin or question line). Do NOT assume or force all sections to have the same marks. Set marks_per_question accurately based on what the questions in that section actually carry.
-4. total_section_marks MUST BE equal to question_count * marks_per_question. Alternatives (a OR b) do NOT multiply or inflate section marks.
-5. Total paper marks = sum of total_section_marks across all sections as specified in the uploaded examination paper (e.g., whether the paper has 3, 4, 5, or 6 sections, and whether total marks is 50, 70, 80, or 100). Never force, inflate, or truncate sections to match an arbitrary total.
+4. total_section_marks:
+   - If a section has an 'Answer N of M questions' rule (e.g. 'Answer any 5 out of 8 questions'), total_section_marks = attempt_question_count * marks_per_question.
+   - Otherwise, total_section_marks = question_count * marks_per_question.
+   - Alternatives (a OR b) do NOT multiply or inflate section marks.
+5. Total paper marks = sum of total_section_marks across all primary sections (where is_or_alternative is false) as specified in the uploaded examination paper. Alternative OR sections provide elective paths and do not inflate the total marks. Never force, inflate, or truncate sections to match an arbitrary total.
 6. QUESTION TYPES CLASSIFICATION:
    - If questions offer multiple choices (e.g. A, B, C, D options or Assertion-Reason choices), classify question_type as "MCQ" regardless of mark value.
    - For direct text questions without multiple choices: 1 mark is VERY_SHORT_ANSWER, 2-4 marks are SHORT_ANSWER, 5+ marks are LONG_ANSWER.
@@ -170,10 +180,10 @@ class BlueprintService:
     def validate_blueprint(self, blueprint: PaperBlueprint) -> None:
         """
         Validates structural invariants of a PaperBlueprint:
-        1. total_section_marks sum across all sections equals blueprint.total_marks.
+        1. total_section_marks sum across all primary sections equals blueprint.total_marks.
         2. For each section: question_count >= 1, marks_per_question >= 1, alternatives_per_question >= 1.
         3. For sections with internal choice (has_internal_choice is True): alternatives_per_question == 2.
-        4. For all sections: total_section_marks == question_count * marks_per_question.
+        4. For all sections: total_section_marks == (attempt_question_count or question_count) * marks_per_question.
         """
         if not blueprint.sections:
             raise HTTPException(
@@ -198,15 +208,22 @@ class BlueprintService:
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Invalid blueprint: internal choice sections must have alternatives_per_question equal to 2.",
                 )
+            if sec.attempt_question_count is not None and sec.attempt_question_count > sec.question_count:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid blueprint: section '{sec.name}' attempt_question_count ({sec.attempt_question_count}) exceeds question_count ({sec.question_count}).",
+                )
 
-            expected_section_marks = sec.question_count * sec.marks_per_question
+            effective_count = sec.attempt_question_count if sec.attempt_question_count is not None else sec.question_count
+            expected_section_marks = effective_count * sec.marks_per_question
             if sec.total_section_marks != expected_section_marks:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid blueprint: section '{sec.name}' total_section_marks ({sec.total_section_marks}) does not match question_count * marks_per_question ({expected_section_marks}).",
+                    detail=f"Invalid blueprint: section '{sec.name}' total_section_marks ({sec.total_section_marks}) does not match expected marks ({expected_section_marks}).",
                 )
 
-            computed_total += sec.total_section_marks
+            if not sec.is_or_alternative:
+                computed_total += sec.total_section_marks
 
         if computed_total != blueprint.total_marks:
             raise HTTPException(
@@ -261,15 +278,23 @@ class BlueprintService:
         sections: List[SectionBlueprint] = []
         for idx, cfg in enumerate(question_configs):
             sec_name = cfg.section_name or f"Section {chr(65 + idx)}"
-            sec_marks = cfg.question_count * cfg.marks_per_question
+            attempt_q_count = cfg.attempt_question_count
+            effective_count = cfg.effective_attempt_count
+            sec_marks = effective_count * cfg.marks_per_question
 
             alts_per_q = max(cfg.alternatives_per_question, 1)
             has_choice = alts_per_q > 1
-            c_rule = "answer_one_of_two" if has_choice else None
+            if attempt_q_count and attempt_q_count < cfg.question_count:
+                c_rule = f"answer_{attempt_q_count}_of_{cfg.question_count}"
+            elif has_choice:
+                c_rule = "answer_one_of_two"
+            else:
+                c_rule = None
 
             num_count = sec_num_counts[idx]
             num_pct = numerical_percentage if (enable_numerical_percentage and numerical_percentage and numerical_percentage > 0) else None
 
+            # Primary Section
             sections.append(
                 SectionBlueprint(
                     name=sec_name,
@@ -277,6 +302,9 @@ class BlueprintService:
                     reasoning_style=getattr(cfg, "reasoning_style", None),
                     section_description=getattr(cfg, "section_description", None),
                     question_count=cfg.question_count,
+                    attempt_question_count=attempt_q_count,
+                    or_sections_count=cfg.or_sections_count,
+                    is_or_alternative=False,
                     marks_per_question=cfg.marks_per_question,
                     total_section_marks=sec_marks,
                     has_internal_choice=has_choice,
@@ -286,6 +314,31 @@ class BlueprintService:
                     numerical_percentage=num_pct,
                 )
             )
+
+            # Generate OR Alternative Sections if configured
+            if cfg.or_sections_count > 0:
+                for k in range(1, cfg.or_sections_count + 1):
+                    suffix = "(OR)" if cfg.or_sections_count == 1 else f"(OR {k})"
+                    or_sec_name = f"{sec_name} {suffix}"
+                    sections.append(
+                        SectionBlueprint(
+                            name=or_sec_name,
+                            question_type=cfg.question_type,
+                            reasoning_style=getattr(cfg, "reasoning_style", None),
+                            section_description=getattr(cfg, "section_description", None),
+                            question_count=cfg.question_count,
+                            attempt_question_count=attempt_q_count,
+                            or_sections_count=0,
+                            is_or_alternative=True,
+                            marks_per_question=cfg.marks_per_question,
+                            total_section_marks=sec_marks,
+                            has_internal_choice=has_choice,
+                            alternatives_per_question=alts_per_q,
+                            choice_rule=c_rule,
+                            numerical_question_count=num_count,
+                            numerical_percentage=num_pct,
+                        )
+                    )
 
         blueprint = PaperBlueprint(
             total_marks=total_marks,
@@ -337,13 +390,27 @@ class BlueprintService:
                 q_count = max(1, int(sec.get("question_count", 5)))
                 marks_per_q = max(1, int(sec.get("marks_per_question", 2)))
 
+                raw_attempt = sec.get("attempt_question_count")
+                attempt_q_count = None
+                if raw_attempt is not None and str(raw_attempt).strip().isdigit():
+                    parsed_att = int(str(raw_attempt).strip())
+                    if 1 <= parsed_att <= q_count:
+                        attempt_q_count = parsed_att
+
+                is_or_alt = bool(sec.get("is_or_alternative", False))
+                or_cnt = max(0, int(sec.get("or_sections_count", 0)))
+
                 has_choice = bool(sec.get("has_internal_choice", sec.get("internal_choice", False)))
                 alts_per_q = 2 if has_choice else max(1, int(sec.get("alternatives_per_question", 1)))
-                c_rule = str(sec.get("choice_rule", "")) if has_choice else None
-                if has_choice and not c_rule:
-                    c_rule = "answer_one_of_two"
+                c_rule = str(sec.get("choice_rule", "")) if (has_choice or attempt_q_count) else None
+                if not c_rule:
+                    if attempt_q_count and attempt_q_count < q_count:
+                        c_rule = f"answer_{attempt_q_count}_of_{q_count}"
+                    elif has_choice:
+                        c_rule = "answer_one_of_two"
 
-                sec_marks = q_count * marks_per_q  # NEVER multiply by alts_per_q!
+                effective_cnt = attempt_q_count if attempt_q_count else q_count
+                sec_marks = effective_cnt * marks_per_q  # NEVER multiply by alts_per_q!
 
                 r_style = normalize_reasoning_style(sec.get("reasoning_style"))
                 s_desc = sec.get("section_description")
@@ -357,6 +424,9 @@ class BlueprintService:
                         reasoning_style=r_style,
                         section_description=s_desc,
                         question_count=q_count,
+                        attempt_question_count=attempt_q_count,
+                        or_sections_count=or_cnt,
+                        is_or_alternative=is_or_alt,
                         marks_per_question=marks_per_q,
                         total_section_marks=sec_marks,
                         has_internal_choice=has_choice,
@@ -398,7 +468,7 @@ class BlueprintService:
                             sq["mcq_options"] = None
                     sample_questions.append(sq)
 
-            analysis_total = sum(s.total_section_marks for s in sections)
+            analysis_total = sum(s.total_section_marks for s in sections if not s.is_or_alternative)
             ref_blueprint = PaperBlueprint(
                 total_marks=analysis_total,
                 sections=sections,
@@ -532,7 +602,7 @@ class BlueprintService:
                     )
                 ]
 
-            total_m = getattr(paper, "total_marks", sum(s.total_section_marks for s in sections))
+            total_m = getattr(paper, "total_marks", None) or sum(s.total_section_marks for s in sections if not s.is_or_alternative)
             blueprint = PaperBlueprint(
                 total_marks=total_m,
                 sections=sections,

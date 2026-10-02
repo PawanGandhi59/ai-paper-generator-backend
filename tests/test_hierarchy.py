@@ -137,3 +137,107 @@ def test_chapter_number_validation_and_duplicate_prevention():
     )
     assert patch_dup.status_code == 400
     assert "already exists in this book" in patch_dup.json()["detail"]
+
+
+def test_duplicate_name_validations_per_user_and_scope():
+    uid = uuid4().hex[:8]
+    user1 = client.post("/api/v1/auth/register", json={"name": "User 1", "email": f"u1_{uid}@example.com", "password": "password123"}).json()
+    user2 = client.post("/api/v1/auth/register", json={"name": "User 2", "email": f"u2_{uid}@example.com", "password": "password123"}).json()
+    h1 = {"Authorization": f"Bearer {user1['access_token']}"}
+    h2 = {"Authorization": f"Bearer {user2['access_token']}"}
+
+    # 1. WORKSPACE VALIDATION
+    # User 1 creates workspace "Science"
+    ws1 = client.post("/api/v1/workspaces", json={"name": "Science"}, headers=h1)
+    assert ws1.status_code == 201
+    ws1_id = ws1.json()["id"]
+
+    # User 1 creates duplicate workspace "Science" -> 400 Bad Request
+    dup_ws = client.post("/api/v1/workspaces", json={"name": "Science"}, headers=h1)
+    assert dup_ws.status_code == 400
+    assert "already exists" in dup_ws.json()["detail"]
+
+    # User 1 creates duplicate with different casing "science" -> 400 Bad Request
+    dup_ws_case = client.post("/api/v1/workspaces", json={"name": "science"}, headers=h1)
+    assert dup_ws_case.status_code == 400
+    assert "already exists" in dup_ws_case.json()["detail"]
+
+    # User 2 CAN create workspace "Science" (per-user isolation) -> 201 Created
+    ws2 = client.post("/api/v1/workspaces", json={"name": "Science"}, headers=h2)
+    assert ws2.status_code == 201
+
+    # User 1 creates another workspace "Commerce"
+    ws1_b = client.post("/api/v1/workspaces", json={"name": "Commerce"}, headers=h1)
+    assert ws1_b.status_code == 201
+
+    # User 1 renames "Commerce" to "Science" -> 400 Bad Request
+    dup_patch = client.patch(f"/api/v1/workspaces/{ws1_b.json()['id']}", json={"name": "Science"}, headers=h1)
+    assert dup_patch.status_code == 400
+    assert "already exists" in dup_patch.json()["detail"]
+
+    # User 1 updates "Commerce" to same name -> 200 OK
+    ok_patch = client.patch(f"/api/v1/workspaces/{ws1_b.json()['id']}", json={"name": "Commerce"}, headers=h1)
+    assert ok_patch.status_code == 200
+
+    # 2. SUBJECT VALIDATION
+    # Inside Workspace 1, User 1 creates subject "Physics"
+    subj1 = client.post(f"/api/v1/workspaces/{ws1_id}/subjects", json={"name": "Physics"}, headers=h1)
+    assert subj1.status_code == 201
+    subj1_id = subj1.json()["id"]
+
+    # Duplicate subject in same workspace -> 400 Bad Request
+    dup_subj = client.post(f"/api/v1/workspaces/{ws1_id}/subjects", json={"name": "Physics"}, headers=h1)
+    assert dup_subj.status_code == 400
+    assert "already exists in this workspace" in dup_subj.json()["detail"]
+
+    # Duplicate subject with different casing in same workspace -> 400 Bad Request
+    dup_subj_case = client.post(f"/api/v1/workspaces/{ws1_id}/subjects", json={"name": "physics"}, headers=h1)
+    assert dup_subj_case.status_code == 400
+    assert "already exists in this workspace" in dup_subj_case.json()["detail"]
+
+    # Different workspace CAN have subject "Physics" -> 201 Created
+    diff_ws_subj = client.post(f"/api/v1/workspaces/{ws1_b.json()['id']}/subjects", json={"name": "Physics"}, headers=h1)
+    assert diff_ws_subj.status_code == 201
+
+    # User 1 creates another subject "Chemistry" in ws1
+    subj2 = client.post(f"/api/v1/workspaces/{ws1_id}/subjects", json={"name": "Chemistry"}, headers=h1)
+    assert subj2.status_code == 201
+
+    # User 1 renames "Chemistry" to "Physics" in same workspace -> 400 Bad Request
+    dup_subj_patch = client.patch(f"/api/v1/subjects/{subj2.json()['id']}", json={"name": "Physics"}, headers=h1)
+    assert dup_subj_patch.status_code == 400
+    assert "already exists in this workspace" in dup_subj_patch.json()["detail"]
+
+    # 3. BOOK VALIDATION
+    # Inside Subject 1, User 1 creates book "Halliday Resnick"
+    bk1 = client.post(f"/api/v1/subjects/{subj1_id}/books", json={"name": "Halliday Resnick"}, headers=h1)
+    assert bk1.status_code == 201
+    bk1_id = bk1.json()["id"]
+
+    # Duplicate book in same subject -> 400 Bad Request
+    dup_bk = client.post(f"/api/v1/subjects/{subj1_id}/books", json={"name": "Halliday Resnick"}, headers=h1)
+    assert dup_bk.status_code == 400
+    assert "already exists in this subject" in dup_bk.json()["detail"]
+
+    # Duplicate book with different casing -> 400 Bad Request
+    dup_bk_case = client.post(f"/api/v1/subjects/{subj1_id}/books", json={"name": "halliday resnick"}, headers=h1)
+    assert dup_bk_case.status_code == 400
+    assert "already exists in this subject" in dup_bk_case.json()["detail"]
+
+    # Different subject CAN have book "Halliday Resnick" -> 201 Created
+    diff_subj_bk = client.post(f"/api/v1/subjects/{subj2.json()['id']}/books", json={"name": "Halliday Resnick"}, headers=h1)
+    assert diff_subj_bk.status_code == 201
+
+    # User 1 creates another book "HC Verma" in subj1
+    bk2 = client.post(f"/api/v1/subjects/{subj1_id}/books", json={"name": "HC Verma"}, headers=h1)
+    assert bk2.status_code == 201
+
+    # User 1 renames "HC Verma" to "Halliday Resnick" in same subject -> 400 Bad Request
+    dup_bk_patch = client.patch(f"/api/v1/books/{bk2.json()['id']}", json={"name": "Halliday Resnick"}, headers=h1)
+    assert dup_bk_patch.status_code == 400
+    assert "already exists in this subject" in dup_bk_patch.json()["detail"]
+
+    # User 1 renames "HC Verma" to "HC Verma Vol 1" -> 200 OK
+    ok_bk_patch = client.patch(f"/api/v1/books/{bk2.json()['id']}", json={"name": "HC Verma Vol 1"}, headers=h1)
+    assert ok_bk_patch.status_code == 200
+

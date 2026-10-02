@@ -41,6 +41,16 @@ class QuestionConfigItem(BaseModel):
     question_count: int = Field(..., ge=1, description="Number of questions for this type")
     marks_per_question: int = Field(..., ge=1, description="Marks assigned to each question")
     section_name: Optional[str] = Field(None, max_length=100)
+    attempt_question_count: Optional[int] = Field(
+        None,
+        ge=1,
+        description="Number of questions students must attempt in this section. If null, all questions are mandatory.",
+    )
+    or_sections_count: int = Field(
+        0,
+        ge=0,
+        description="Number of alternative OR sections to generate for this section (e.g. 1 generates Section A + Section A (OR)).",
+    )
     alternatives_per_question: int = Field(1, ge=1, description="Number of alternatives per question number (e.g. 1 for mandatory, 2 for (a) OR (b))")
     reasoning_style: Optional[str] = Field(None, description="Cognitive reasoning style e.g. SCENARIO_BASED, DIRECT_RECALL, etc.")
     section_description: Optional[str] = Field(None, description="Optional pedagogical guidance or description for the section")
@@ -48,6 +58,14 @@ class QuestionConfigItem(BaseModel):
     @property
     def has_internal_choice(self) -> bool:
         return self.alternatives_per_question > 1
+
+    @property
+    def effective_attempt_count(self) -> int:
+        return self.attempt_question_count if self.attempt_question_count is not None else self.question_count
+
+    @property
+    def contributing_marks(self) -> int:
+        return self.effective_attempt_count * self.marks_per_question
 
 
 
@@ -164,8 +182,15 @@ class PaperGenerateRequest(BaseModel):
             if self.reference_paper_id is not None:
                 raise ValueError("reference_paper_id must not be provided for CUSTOM generation mode.")
 
-            # Enforce sum(count * marks) == total_marks
-            computed_total = sum(c.question_count * c.marks_per_question for c in self.question_configs)
+            for c in self.question_configs:
+                if c.attempt_question_count is not None and c.attempt_question_count > c.question_count:
+                    sec_label = f" in section '{c.section_name}'" if c.section_name else ""
+                    raise ValueError(
+                        f"attempt_question_count ({c.attempt_question_count}) cannot exceed question_count ({c.question_count}){sec_label}."
+                    )
+
+            # Enforce sum of contributing marks == total_marks
+            computed_total = sum(c.contributing_marks for c in self.question_configs)
             if computed_total != self.total_marks:
                 raise ValueError(
                     f"Invalid question configuration: sum of configured marks ({computed_total}) "

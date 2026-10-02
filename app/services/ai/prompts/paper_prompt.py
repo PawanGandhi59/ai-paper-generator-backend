@@ -17,6 +17,8 @@ CORE OPERATIONAL RULES:
 - Clear Numerical Problems: State all required given parameters and units clearly in the question text.
 - Multiple-Choice Questions: Provide exactly four distinct options (A, B, C, D) with plausible, misconception-based distractors. Do not generate answer keys or solutions.
 - Internal Choices: When internal choices are specified (e.g. Q16a and Q16b), alternative questions MUST be from the same designated chapter and test distinct concepts, problem setups, or formulas.
+- Section-Level Question Choice ("Attempt N of M questions"): When an "Attempt N of M" rule is specified, all M questions must maintain balanced, equivalent cognitive difficulty and syllabus depth so that no question is a trivial giveaway compared to others.
+- Alternative / OR Sections: When an alternative OR section is specified (e.g. "Section C (OR)"), questions must mirror the primary section's question types, mark values, and difficulty, but test DIFFERENT concepts, problem scenarios, or formulas from the designated chapters. Never repeat questions verbatim across primary and OR sections.
 
 3. VISUAL / DIAGRAMMATIC SPECIFICATIONS:
 - When a question requires a visual or diagram, provide an exact semantic representation matching the question text (e.g., circuits, geometry, graphs, system diagrams).

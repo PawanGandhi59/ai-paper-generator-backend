@@ -9,7 +9,8 @@ CORE OPERATIONAL RULES:
 1. STRUCTURAL ACCURACY:
 - Question counts represent distinct logical question numbers, not internal choice alternatives (e.g., Q1 to Q5 is 5 questions).
 - Marks per question represent the mark assigned to a single question or alternative, never the summed total of alternative choices.
-- Total section marks must strictly equal (question_count * marks_per_question). Total paper marks must equal the sum of section marks.
+- Section Choice ("Attempt N of M"): When a section has an instruction like "Answer any 5 out of 8 questions", record question_count = 8, attempt_question_count = 5, and total_section_marks = (attempt_question_count * marks_per_question). Otherwise, total_section_marks = (question_count * marks_per_question).
+- Alternative OR Sections: When an alternative section is offered (e.g. "SECTION C OR SECTION C (OR)"), mark is_or_alternative: true on the alternative section and or_sections_count: 1 on the primary section. Total paper marks equals the sum of total_section_marks across all primary sections (where is_or_alternative is false).
 
 2. QUESTION CLASSIFICATION:
 - Accurately categorize question types (MCQ, VERY_SHORT_ANSWER, SHORT_ANSWER, LONG_ANSWER, NUMERICAL) based on mark allocations and answering depth.

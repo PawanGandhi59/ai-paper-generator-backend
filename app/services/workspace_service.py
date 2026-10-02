@@ -28,7 +28,14 @@ class WorkspaceService:
 
     # Workspace operations
     def create_workspace(self, owner_id: UUID, name: str) -> Workspace:
-        return self.repo.create_workspace(owner_id=owner_id, name=name)
+        clean_name = name.strip()
+        existing = self.repo.get_workspace_by_owner_and_name(owner_id, clean_name)
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Workspace '{clean_name}' already exists.",
+            )
+        return self.repo.create_workspace(owner_id=owner_id, name=clean_name)
 
     def get_workspace(self, workspace_id: UUID, current_user_id: UUID) -> Workspace:
         workspace = self.repo.get_workspace_by_id(workspace_id)
@@ -44,6 +51,14 @@ class WorkspaceService:
 
     def update_workspace(self, workspace_id: UUID, current_user_id: UUID, name: Optional[str] = None) -> Workspace:
         workspace = self.get_workspace(workspace_id, current_user_id)
+        if name is not None:
+            clean_name = name.strip()
+            existing = self.repo.get_workspace_by_owner_and_name(current_user_id, clean_name)
+            if existing and existing.id != workspace.id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Workspace '{clean_name}' already exists.",
+                )
         return self.repo.update_workspace(workspace, name=name)
 
     def delete_workspace(self, workspace_id: UUID, current_user_id: UUID) -> None:
@@ -87,13 +102,14 @@ class WorkspaceService:
     # Subject operations
     def create_subject(self, workspace_id: UUID, current_user_id: UUID, name: str) -> Subject:
         workspace = self.get_workspace(workspace_id, current_user_id)
-        existing = self.repo.get_subject_by_workspace_and_name(workspace.id, name)
+        clean_name = name.strip()
+        existing = self.repo.get_subject_by_workspace_and_name(workspace.id, clean_name)
         if existing:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Subject '{name.strip()}' already exists in this workspace.",
+                detail=f"Subject '{clean_name}' already exists in this workspace.",
             )
-        return self.repo.create_subject(workspace_id=workspace.id, name=name)
+        return self.repo.create_subject(workspace_id=workspace.id, name=clean_name)
 
     def list_subjects(self, workspace_id: UUID, current_user_id: UUID) -> List[Subject]:
         workspace = self.get_workspace(workspace_id, current_user_id)
@@ -112,12 +128,13 @@ class WorkspaceService:
 
     def update_subject(self, subject_id: UUID, current_user_id: UUID, name: Optional[str] = None) -> Subject:
         subject = self.get_subject(subject_id, current_user_id)
-        if name is not None and name.strip() != subject.name:
-            existing = self.repo.get_subject_by_workspace_and_name(subject.workspace_id, name)
-            if existing:
+        if name is not None:
+            clean_name = name.strip()
+            existing = self.repo.get_subject_by_workspace_and_name(subject.workspace_id, clean_name)
+            if existing and existing.id != subject.id:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Subject '{name.strip()}' already exists in this workspace.",
+                    detail=f"Subject '{clean_name}' already exists in this workspace.",
                 )
         return self.repo.update_subject(subject, name=name)
 
@@ -166,7 +183,14 @@ class WorkspaceService:
     # Book operations
     def create_book(self, subject_id: UUID, current_user_id: UUID, name: str) -> Book:
         subject = self.get_subject(subject_id, current_user_id)
-        return self.repo.create_book(subject_id=subject.id, name=name)
+        clean_name = name.strip()
+        existing = self.repo.get_book_by_subject_and_name(subject.id, clean_name)
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Book '{clean_name}' already exists in this subject.",
+            )
+        return self.repo.create_book(subject_id=subject.id, name=clean_name)
 
     def list_books(self, subject_id: UUID, current_user_id: UUID) -> List[Book]:
         subject = self.get_subject(subject_id, current_user_id)
@@ -253,6 +277,14 @@ class WorkspaceService:
 
     def update_book(self, book_id: UUID, current_user_id: UUID, name: Optional[str] = None) -> Book:
         book = self.get_book(book_id, current_user_id)
+        if name is not None:
+            clean_name = name.strip()
+            existing = self.repo.get_book_by_subject_and_name(book.subject_id, clean_name)
+            if existing and existing.id != book.id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Book '{clean_name}' already exists in this subject.",
+                )
         return self.repo.update_book(book, name=name)
 
     def delete_book(self, book_id: UUID, current_user_id: UUID) -> None:

@@ -225,10 +225,14 @@ class PaperGeneratorService:
                     "is_numerical": False,
                     "reasoning_style": getattr(sec, "reasoning_style", None),
                     "section_description": getattr(sec, "section_description", None),
+                    "is_or_alternative": getattr(sec, "is_or_alternative", False),
                 })
             current_q_order += sec.question_count
 
-        # Denomination-Aware Chapter Allocation
+        primary_groups = [g for g in logical_groups if not g.get("is_or_alternative")]
+        alt_groups = [g for g in logical_groups if g.get("is_or_alternative")]
+
+        # Denomination-Aware Chapter Allocation on Primary Groups
         if chapter_weightages_data and len(chapter_weightages_data) > 0:
             for idx, item in enumerate(chapter_weightages_data):
                 if "chapter_id" not in item or not item["chapter_id"]:
@@ -242,7 +246,7 @@ class PaperGeneratorService:
 
             # Sort groups by marks descending so high-mark questions (e.g. 5m) go first,
             # and low-mark questions (e.g. 1m MCQs) fine-tune the remaining mark deficits.
-            sorted_groups = sorted(logical_groups, key=lambda g: (-g["marks"], g["question_order"]))
+            sorted_groups = sorted(primary_groups, key=lambda g: (-g["marks"], g["question_order"]))
 
             for g in sorted_groups:
                 best_ch_id = max(
@@ -255,31 +259,51 @@ class PaperGeneratorService:
                 g["chapter_name"] = ch_info.get("chapter_name")
                 ch_remaining[best_ch_id] -= g["marks"]
         else:
-            for g in logical_groups:
+            for g in primary_groups:
                 g["chapter_id"] = None
                 g["chapter_number"] = 1
                 g["chapter_name"] = "General"
 
-        # Per-Section Difficulty Distribution across logical groups
+        # Per-Section Difficulty Distribution across Primary logical groups
         for sec in blueprint.sections:
-            sec_groups = [g for g in logical_groups if g["section_name"] == sec.name]
-            sec_diffs = self._calculate_difficulty_distribution(
-                count=len(sec_groups),
-                easy_pct=easy_pct,
-                med_pct=med_pct,
-                hard_pct=hard_pct,
-                marks_per_q=sec.marks_per_question,
-            )
-            sec_sorted = sorted(sec_groups, key=lambda g: g["question_order"])
-            for idx, g in enumerate(sec_sorted):
-                g["difficulty"] = sec_diffs[idx] if idx < len(sec_diffs) else "MEDIUM"
+            if not getattr(sec, "is_or_alternative", False):
+                sec_groups = [g for g in primary_groups if g["section_name"] == sec.name]
+                sec_diffs = self._calculate_difficulty_distribution(
+                    count=len(sec_groups),
+                    easy_pct=easy_pct,
+                    med_pct=med_pct,
+                    hard_pct=hard_pct,
+                    marks_per_q=sec.marks_per_question,
+                )
+                sec_sorted = sorted(sec_groups, key=lambda g: g["question_order"])
+                for idx, g in enumerate(sec_sorted):
+                    g["difficulty"] = sec_diffs[idx] if idx < len(sec_diffs) else "MEDIUM"
 
-        # Numerical Requirement Allocation per Section
+        # Numerical Requirement Allocation per Primary Section
         for sec in blueprint.sections:
-            if sec.numerical_question_count > 0:
-                sec_groups = [g for g in logical_groups if g["section_name"] == sec.name]
+            if not getattr(sec, "is_or_alternative", False) and sec.numerical_question_count > 0:
+                sec_groups = [g for g in primary_groups if g["section_name"] == sec.name]
                 for g in sec_groups[:sec.numerical_question_count]:
                     g["is_numerical"] = True
+
+        # Mirror Chapter, Difficulty, and Numerical status for Alternative (OR) sections
+        for alt_g in alt_groups:
+            parent_sec_name = alt_g["section_name"].split(" (OR")[0].strip()
+            parent_matches = [g for g in primary_groups if g["section_name"] == parent_sec_name]
+            g_idx = alt_g["group_idx"]
+            if parent_matches and g_idx < len(parent_matches):
+                ref_g = parent_matches[g_idx]
+                alt_g["chapter_id"] = ref_g.get("chapter_id")
+                alt_g["chapter_number"] = ref_g.get("chapter_number")
+                alt_g["chapter_name"] = ref_g.get("chapter_name")
+                alt_g["difficulty"] = ref_g.get("difficulty", "MEDIUM")
+                alt_g["is_numerical"] = ref_g.get("is_numerical", False)
+            else:
+                alt_g["chapter_id"] = None
+                alt_g["chapter_number"] = 1
+                alt_g["chapter_name"] = "General"
+                alt_g["difficulty"] = "MEDIUM"
+                alt_g["is_numerical"] = False
 
         # Construct Section-Organized Matrix Structure
         planned_sections = []
@@ -1218,21 +1242,27 @@ class PaperGeneratorService:
             for bs in batch_planned:
                 sec = bs["sec"]
                 grp_cnt = len(bs["groups"])
+                att_cnt = getattr(sec, "attempt_question_count", None)
+                eff_cnt = att_cnt if (att_cnt and grp_cnt == sec.question_count) else grp_cnt
                 sec_copy = SectionBlueprint(
                     name=bs["section_name"],
                     question_type=sec.question_type,
                     question_count=grp_cnt,
+                    attempt_question_count=att_cnt if grp_cnt == sec.question_count else None,
+                    or_sections_count=getattr(sec, "or_sections_count", 0),
+                    is_or_alternative=getattr(sec, "is_or_alternative", False),
                     marks_per_question=sec.marks_per_question,
-                    total_section_marks=grp_cnt * sec.marks_per_question,
+                    total_section_marks=eff_cnt * sec.marks_per_question,
                     has_internal_choice=sec.has_internal_choice,
                     alternatives_per_question=sec.alternatives_per_question,
+                    choice_rule=sec.choice_rule,
                     numerical_question_count=sum(1 for g in bs["groups"] if g.get("is_numerical")),
                     reasoning_style=getattr(sec, "reasoning_style", None),
                     section_description=getattr(sec, "section_description", None),
                 )
                 batch_sections.append(sec_copy)
 
-            batch_total_marks = sum(s.total_section_marks for s in batch_sections)
+            batch_total_marks = sum(s.total_section_marks for s in batch_sections if not s.is_or_alternative)
             batch_bp = PaperBlueprint(
                 total_marks=batch_total_marks,
                 sections=batch_sections,
@@ -1297,11 +1327,7 @@ class PaperGeneratorService:
                 sec_resp = next(
                     (
                         s for s in raw_sections
-                        if isinstance(s, dict) and (
-                            _norm_sec_str(s.get("section_name", "")) == sec_norm or
-                            _norm_sec_str(s.get("section_name", "")) in sec_norm or
-                            sec_norm in _norm_sec_str(s.get("section_name", ""))
-                        )
+                        if isinstance(s, dict) and _norm_sec_str(s.get("section_name", "")) == sec_norm
                     ),
                     None
                 )
@@ -1594,12 +1620,11 @@ Return ONLY valid JSON matching this schema:
                         cand_sec_name = str(cand.get("section_name", "")).strip()
                         target_sec_data = None
                         if cand_sec_name:
+                            cand_norm = _norm_sec_str(cand_sec_name)
                             target_sec_data = next(
                                 (
                                     s for s in planned_sections
-                                    if _norm_sec_str(s["section_name"]) == _norm_sec_str(cand_sec_name)
-                                    or _norm_sec_str(cand_sec_name) in _norm_sec_str(s["section_name"])
-                                    or _norm_sec_str(s["section_name"]) in _norm_sec_str(cand_sec_name)
+                                    if _norm_sec_str(s["section_name"]) == cand_norm
                                 ),
                                 None
                             )
@@ -1887,14 +1912,30 @@ Return ONLY valid JSON matching this schema:
                     f"\"D. Assertion (A) is false, but Reason (R) is true.\"]\n"
                 )
 
+            choice_directive = ""
+            if sec.attempt_question_count and sec.attempt_question_count < sec.question_count:
+                choice_directive = (
+                    f"- SECTION-LEVEL QUESTION CHOICE: Students will be instructed to attempt any "
+                    f"{sec.attempt_question_count} of the {sec.question_count} questions in this section. "
+                    f"Author all {sec.question_count} distinct questions with equivalent cognitive depth and difficulty.\n"
+                )
+            or_directive = ""
+            if getattr(sec, "is_or_alternative", False):
+                or_directive = (
+                    f"- ALTERNATIVE (OR) SECTION DIRECTIVE: This section '{sec.name}' is an elective alternative counterpart. "
+                    f"Questions must test the designated chapters and difficulty levels but explore DIFFERENT concepts, problem statements, or formulas. "
+                    f"DO NOT duplicate questions from the primary section.\n"
+                )
+
             sections_info.append(f"""
 ---
 SECTION NAME: '{sec.name}'
 - Question Type: {sec.question_type.value}
-{style_str}{desc_str}{pedagogical_rule}{ar_directive}- Logical Question Count: {sec.question_count}
+{style_str}{desc_str}{pedagogical_rule}{ar_directive}{choice_directive}{or_directive}- Logical Question Count: {sec.question_count}
+- Questions To Attempt: {sec.attempt_question_count or sec.question_count}
 - Alternatives Per Question: {sec.alternatives_per_question}
 - Total Question Items To Generate: {sec.question_count * alts_per_q}
-- Marks Per Question Item: {sec.marks_per_question} (Total Section Marks: {sec.total_section_marks})
+- Marks Per Question Item: {sec.marks_per_question} (Contributing Section Marks: {sec.total_section_marks})
 - Target Difficulty Distribution: {json.dumps(sec_difficulties)}
 - Internal Choice Requirement: {choice_str}
 - Numerical Requirement: {num_str}{slot_breakdown_str}
@@ -2253,19 +2294,23 @@ SOURCE EDUCATIONAL MATERIAL:
                     )
 
         # 2. Total marks accounting & Choice Group Integrity
-        computed_marks = 0
-        seen_choice_groups = set()
         choice_group_map: Dict[str, List[Dict[str, Any]]] = {}
-
         for q in generated_questions:
             cg = q.get("choice_group")
             if cg:
                 choice_group_map.setdefault(cg, []).append(q)
-                if cg not in seen_choice_groups:
-                    seen_choice_groups.add(cg)
-                    computed_marks += q.get("marks", 0)
-            else:
-                computed_marks += q.get("marks", 0)
+
+        computed_marks = 0
+        for sec in blueprint.sections:
+            sec_items = [q for q in generated_questions if q.get("section_name") == sec.name]
+            for item in sec_items:
+                if item.get("marks") != sec.marks_per_question:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Final paper validation failed: Section '{sec.name}' question marks ({item.get('marks')}) do not match expected ({sec.marks_per_question}).",
+                    )
+            if not getattr(sec, "is_or_alternative", False):
+                computed_marks += sec.total_section_marks
 
         if computed_marks != blueprint.total_marks:
             raise HTTPException(

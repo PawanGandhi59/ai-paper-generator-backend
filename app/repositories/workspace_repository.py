@@ -29,6 +29,13 @@ class WorkspaceRepository:
         stmt = select(Workspace).where(Workspace.owner_id == owner_id).order_by(Workspace.created_at.desc())
         return list(self.db.execute(stmt).scalars().all())
 
+    def get_workspace_by_owner_and_name(self, owner_id: UUID, name: str) -> Optional[Workspace]:
+        stmt = select(Workspace).where(
+            Workspace.owner_id == owner_id,
+            func.lower(Workspace.name) == func.lower(name.strip()),
+        )
+        return self.db.execute(stmt).scalar_one_or_none()
+
     def update_workspace(self, workspace: Workspace, name: Optional[str] = None) -> Workspace:
         if name is not None:
             workspace.name = name.strip()
@@ -63,7 +70,7 @@ class WorkspaceRepository:
     def get_subject_by_workspace_and_name(self, workspace_id: UUID, name: str) -> Optional[Subject]:
         stmt = select(Subject).where(
             Subject.workspace_id == workspace_id,
-            Subject.name == name.strip(),
+            func.lower(Subject.name) == func.lower(name.strip()),
             Subject.deleted_at.is_(None),
         )
         return self.db.execute(stmt).scalar_one_or_none()
@@ -141,6 +148,14 @@ class WorkspaceRepository:
     def get_books_by_subject(self, subject_id: UUID) -> List[Book]:
         stmt = select(Book).where(Book.subject_id == subject_id, Book.deleted_at.is_(None)).order_by(Book.created_at.asc())
         return list(self.db.execute(stmt).scalars().all())
+
+    def get_book_by_subject_and_name(self, subject_id: UUID, name: str) -> Optional[Book]:
+        stmt = select(Book).where(
+            Book.subject_id == subject_id,
+            func.lower(Book.name) == func.lower(name.strip()),
+            Book.deleted_at.is_(None),
+        )
+        return self.db.execute(stmt).scalar_one_or_none()
 
     def get_all_books_by_user(
         self,
