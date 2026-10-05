@@ -27,11 +27,12 @@ def check_db_health(db: Session = Depends(get_db)) -> dict[str, str]:
             "database": "connected",
         }
     except Exception as exc:
+        import logging
+        logging.getLogger(__name__).error(f"Database health check failed: {exc}")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
                 "status": "error",
                 "database": "disconnected",
-                "error": str(exc),
             },
         ) from exc

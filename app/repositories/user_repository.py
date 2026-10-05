@@ -20,14 +20,43 @@ class UserRepository:
         stmt = select(User).where(User.email == email.strip().lower())
         return self.db.execute(stmt).scalar_one_or_none()
 
-    def create_user(self, name: str, email: str, password_hash: Optional[str] = None, email_verified: bool = False) -> User:
+    def create_user(
+        self,
+        name: str,
+        email: str,
+        password_hash: Optional[str] = None,
+        email_verified: bool = False,
+        terms_version: Optional[str] = None,
+        terms_accepted_at: Optional[datetime] = None,
+        privacy_notice_acknowledged_at: Optional[datetime] = None,
+        marketing_opt_in: bool = False,
+    ) -> User:
         user = User(
             name=name.strip(),
             email=email.strip().lower(),
             password_hash=password_hash,
             email_verified=email_verified,
+            terms_version=terms_version,
+            terms_accepted_at=terms_accepted_at,
+            privacy_notice_acknowledged_at=privacy_notice_acknowledged_at,
+            marketing_opt_in=marketing_opt_in,
         )
         self.db.add(user)
+        self.db.commit()
+        self.db.refresh(user)
+        return user
+
+    def update_user_profile(
+        self,
+        user: User,
+        name: Optional[str] = None,
+        marketing_opt_in: Optional[bool] = None,
+    ) -> User:
+        if name is not None:
+            user.name = name.strip()
+        if marketing_opt_in is not None:
+            user.marketing_opt_in = marketing_opt_in
+        user.updated_at = datetime.now(timezone.utc)
         self.db.commit()
         self.db.refresh(user)
         return user

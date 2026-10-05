@@ -88,7 +88,13 @@ class StorageService:
 
     def get_local_path(self, key: str) -> str:
         norm_key = self.normalize_key(key)
-        return os.path.join(self.local_root, norm_key.replace("/", os.sep))
+        # Prevent directory traversal attacks escaping local storage root
+        norm_sep = norm_key.replace("/", os.sep)
+        resolved_path = os.path.realpath(os.path.join(self.local_root, norm_sep))
+        real_root = os.path.realpath(self.local_root)
+        if not (resolved_path == real_root or resolved_path.startswith(real_root + os.sep)):
+            raise ValueError(f"Directory traversal detected for path: '{key}'")
+        return resolved_path
 
     def upload_file(self, local_path: str, remote_path: str, content_type: Optional[str] = None) -> str:
         norm_key = self.normalize_key(remote_path)

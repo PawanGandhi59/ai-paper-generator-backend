@@ -33,16 +33,16 @@ def test_forgot_password_account_validation():
 
     assert res1.status_code == status.HTTP_200_OK
     data1 = res1.json()
-    assert data1["message"] == "Password reset OTP has been sent to your email address."
+    assert "password reset OTP has been sent" in data1["message"]
     assert mock_email.called
 
-    # 3. Forgot password for non-existent user -> HTTP 404 NOT FOUND
+    # 3. Forgot password for non-existent user -> HTTP 200 OK generic response (GDPR-008 Anti-enumeration)
     non_existent_email = f"unknown_{uid}@example.com"
     with patch.object(EmailService, "send_password_reset_otp", return_value=True) as mock_email_unknown:
         res2 = client.post("/api/v1/auth/forgot-password", json={"email": non_existent_email})
 
-    assert res2.status_code == status.HTTP_404_NOT_FOUND
-    assert res2.json()["detail"] == "No account found with this email address."
+    assert res2.status_code == status.HTTP_200_OK
+    assert "password reset OTP has been sent" in res2.json()["message"]
     assert not mock_email_unknown.called
 
 

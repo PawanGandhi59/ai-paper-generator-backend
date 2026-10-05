@@ -33,6 +33,7 @@ from app.schemas.auth import (
     UserLogin,
     UserRegister,
     UserResponse,
+    UserUpdate,
     VerifyResetOTPRequest,
     VerifyResetOTPResponse,
 )
@@ -80,11 +81,20 @@ class AuthService:
             )
 
         hashed_password = get_password_hash(data.password)
+        now = utc_now()
+        terms_version = "1.0" if data.terms_accepted else None
+        terms_accepted_at = now if data.terms_accepted else None
+        privacy_notice_acknowledged_at = now if data.terms_accepted else None
+
         user = self.user_repo.create_user(
             name=data.name,
             email=data.email,
             password_hash=hashed_password,
             email_verified=False,
+            terms_version=terms_version,
+            terms_accepted_at=terms_accepted_at,
+            privacy_notice_acknowledged_at=privacy_notice_acknowledged_at,
+            marketing_opt_in=bool(data.marketing_opt_in),
         )
 
         return self._create_token_pair(user)
@@ -292,14 +302,10 @@ class AuthService:
 
     def forgot_password(self, data: ForgotPasswordRequest) -> ForgotPasswordResponse:
         normalized_email = data.email.strip().lower()
+        success_message = "If that email address is registered, a password reset OTP has been sent."
         user = self.user_repo.get_by_email(normalized_email)
         if not user or not user.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="No account found with this email address.",
-            )
-
-        success_message = "Password reset OTP has been sent to your email address."
+            return ForgotPasswordResponse(message=success_message)
 
         # Resend cooldown check
         latest_otp = self.user_repo.get_latest_otp_by_user_id(user.id)
@@ -538,3 +544,91 @@ class AuthService:
             self.user_repo.delete_user(user)
 
         return DeleteAccountResponse(message="Account successfully deleted.")
+
+    def update_profile(self, user: User, data: UserUpdate) -> UserResponse:
+        """
+        Right to Rectification (UK GDPR Art. 16): Update user profile details.
+        """
+        updated_user = self.user_repo.update_user_profile(
+            user=user,
+            name=data.name,
+            marketing_opt_in=data.marketing_opt_in,
+        )
+        return UserResponse.model_validate(updated_user)
+
+    def export_user_data(self, user: User) -> Dict[str, Any]:
+        """
+        Right to Data Portability (UK GDPR Art. 20): Export structured, machine-readable user data package.
+        """
+        from app.models.workspace import Workspace
+        from app.models.generated_paper import GeneratedPaper
+        from sqlalchemy import select
+
+        workspaces_data = []
+        user_workspaces = self.db.execute(
+            select(Workspace).where(Workspace.owner_id == user.id)
+        ).scalars().all()
+
+        for ws in user_workspaces:
+            subjects_data = []
+            for sub in (ws.subjects or []):
+                books_data = []
+                for b in (sub.books or []):
+                    chapters_data = [
+                        {
+                            "id": str(c.id),
+                            "chapter_number": c.chapter_number,
+                            "name": c.name,
+                            "start_page": c.start_page,
+                            "end_page": c.end_page,
+                        }
+                        for c in (b.chapters or []) if c.deleted_at is None
+                    ]
+                    books_data.append({
+                        "id": str(b.id),
+                        "name": b.name,
+                        "chapters": chapters_data,
+                    })
+                subjects_data.append({
+                    "id": str(sub.id),
+                    "name": sub.name,
+                    "books": books_data,
+                })
+            workspaces_data.append({
+                "id": str(ws.id),
+                "name": ws.name,
+                "created_at": ws.created_at.isoformat() if ws.created_at else None,
+                "subjects": subjects_data,
+            })
+
+        papers_data = []
+        user_papers = self.db.execute(
+            select(GeneratedPaper).where(GeneratedPaper.user_id == user.id, GeneratedPaper.deleted_at.is_(None))
+        ).scalars().all()
+
+        for p in user_papers:
+            papers_data.append({
+                "id": str(p.id),
+                "title": p.title,
+                "total_marks": p.total_marks,
+                "difficulty": p.difficulty,
+                "created_at": p.created_at.isoformat() if p.created_at else None,
+                "question_count": len(p.questions or []),
+            })
+
+        return {
+            "export_version": "1.0",
+            "exported_at": utc_now().isoformat(),
+            "user_profile": {
+                "id": str(user.id),
+                "name": user.name,
+                "email": user.email,
+                "terms_version": user.terms_version,
+                "terms_accepted_at": user.terms_accepted_at.isoformat() if user.terms_accepted_at else None,
+                "privacy_notice_acknowledged_at": user.privacy_notice_acknowledged_at.isoformat() if user.privacy_notice_acknowledged_at else None,
+                "marketing_opt_in": user.marketing_opt_in,
+                "created_at": user.created_at.isoformat() if user.created_at else None,
+            },
+            "workspaces": workspaces_data,
+            "generated_papers": papers_data,
+        }

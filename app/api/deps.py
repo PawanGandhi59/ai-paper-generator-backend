@@ -52,41 +52,12 @@ def get_current_user(
 
 def get_current_user_from_header_or_query(
     db: Session = Depends(get_db),
-    header_token: Optional[str] = Depends(oauth2_scheme_optional),
-    token: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
 ) -> User:
     """
-    FastAPI dependency accepting JWT token from Authorization header OR ?token= query parameter.
-    Enables direct browser viewing of PDF files.
+    Deprecated for UK GDPR Article 32 compliance (Finding GDPR-006).
+    Passing JWT access tokens via URL query parameters (?token=) is disabled to prevent
+    credential leakage in browser history, proxy logs, and referer headers.
+    Directly enforces standard Bearer token authentication via Authorization header.
     """
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate authentication credentials.",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-
-    effective_token = header_token or token
-    if not effective_token:
-        raise credentials_exception
-
-    try:
-        payload = decode_access_token(effective_token)
-        user_id_str: str | None = payload.get("sub")
-        if not user_id_str:
-            raise credentials_exception
-        user_id = UUID(user_id_str)
-    except (jwt.PyJWTError, ValueError):
-        raise credentials_exception
-
-    user_repo = UserRepository(db)
-    user = user_repo.get_by_id(user_id)
-    if not user:
-        raise credentials_exception
-
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Inactive user account.",
-        )
-
-    return user
+    return current_user

@@ -44,19 +44,126 @@ app = FastAPI(
     default_response_class=UnicodeJSONResponse,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+cors_origins_raw = getattr(settings, "CORS_ORIGINS", "*")
+cors_origins = [o.strip() for o in cors_origins_raw.split(",") if o.strip()]
+if not cors_origins or cors_origins == ["*"]:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+from uuid import UUID
+from fastapi import Depends, status
+from sqlalchemy.orm import Session
+from app.api.deps import get_current_user
+from app.core.database import get_db
+from app.models.user import User
+
+
+def verify_storage_file_access(db: Session, current_user: User, file_path: str) -> None:
+    """
+    UK GDPR Art. 5(1)(f) & Art. 32 Access Control Enforcement:
+    Validates that the authenticated user owns or has access to the workspace
+    associated with the requested stored asset.
+    """
+    norm = file_path.replace("\\", "/").strip("/")
+    parts = [p for p in norm.split("/") if p and p != "storage"]
+    if not parts:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid file path.")
+
+    category = parts[0].lower()
+    if len(parts) >= 2:
+        resource_id_str = parts[1]
+        try:
+            resource_uuid = UUID(resource_id_str)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid resource identifier in path.")
+
+        if category == "documents":
+            from app.models.document import Document
+            from app.models.book import Book
+            from app.models.subject import Subject
+            from app.models.workspace import Workspace
+            from sqlalchemy import select
+
+            stmt = (
+                select(Workspace.owner_id)
+                .select_from(Document)
+                .join(Book, Document.book_id == Book.id)
+                .join(Subject, Book.subject_id == Subject.id)
+                .join(Workspace, Subject.workspace_id == Workspace.id)
+                .where(Document.id == resource_uuid, Document.deleted_at.is_(None))
+            )
+            owner_id = db.execute(stmt).scalar_one_or_none()
+            if not owner_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+            if owner_id != current_user.id:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied to this document.")
+
+        elif category == "reference_papers":
+            from app.models.reference_paper import ReferencePaper
+            from app.models.workspace import Workspace
+            from sqlalchemy import select
+
+            stmt = (
+                select(Workspace.owner_id)
+                .select_from(ReferencePaper)
+                .join(Workspace, ReferencePaper.workspace_id == Workspace.id)
+                .where(ReferencePaper.id == resource_uuid, ReferencePaper.deleted_at.is_(None))
+            )
+            owner_id = db.execute(stmt).scalar_one_or_none()
+            if not owner_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reference paper not found.")
+            if owner_id != current_user.id:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied to this reference paper.")
+
+        elif category == "generated_papers":
+            from app.models.generated_paper import GeneratedPaper
+            from sqlalchemy import select
+
+            stmt = select(GeneratedPaper.user_id).where(
+                GeneratedPaper.id == resource_uuid,
+                GeneratedPaper.deleted_at.is_(None)
+            )
+            owner_id = db.execute(stmt).scalar_one_or_none()
+            if not owner_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Generated paper not found.")
+            if owner_id != current_user.id:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied to this generated paper.")
+
 
 # Storage file serving route (supports both AWS S3 and Local storage transparently with inline preview)
 @app.api_route("/storage/{file_path:path}", methods=["GET", "HEAD"])
-def serve_storage_file(file_path: str, request: Request):
-    if not storage_service.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found in storage.")
+def serve_storage_file(
+    file_path: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    # Enforce directory traversal security
+    path_segments = file_path.replace("\\", "/").split("/")
+    if ".." in path_segments:
+        raise HTTPException(status_code=400, detail="Invalid file path.")
+
+    # Enforce UK GDPR Art. 5(1)(f) & Art. 32 tenant authorization
+    verify_storage_file_access(db, current_user, file_path)
+
+    try:
+        if not storage_service.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found in storage.")
+    except (ValueError, FileNotFoundError):
+        raise HTTPException(status_code=400, detail="Invalid file path.")
 
     byte_range = request.headers.get("range")
     stream, length, media_type, content_range, status_code = storage_service.get_range_stream(file_path, byte_range)

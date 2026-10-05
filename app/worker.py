@@ -40,6 +40,12 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
+    beat_schedule={
+        "daily-gdpr-retention-purge": {
+            "task": "purge_soft_deleted_records",
+            "schedule": 86400.0,  # Run once every 24 hours
+        },
+    },
 )
 
 PERMANENT_ERRORS = (ValueError, FileNotFoundError, FileDataError, PackageNotFoundError)
@@ -528,4 +534,83 @@ def process_saved_paper_pdf(self, paper_id_str: str, doc_id_str: str, stored_pat
         return {"status": "FAILED", "paper_id": paper_id_str, "error": str(exc)}
     finally:
         db.close()
+
+
+@celery_app.task(name="purge_soft_deleted_records")
+def purge_soft_deleted_records(retention_days: int = None):
+    """
+    UK GDPR Art. 5(1)(e) Storage Limitation & Retention Purge Task.
+    Permanently hard-deletes soft-deleted records older than retention_days (default from settings).
+    """
+    from datetime import timedelta
+    from app.core.time import utc_now
+    from app.models.generated_paper import GeneratedPaper
+    from app.models.document import Document, DocumentPage, DocumentChunk
+    from app.models.chapter import Chapter
+    from app.models.book import Book
+    from app.models.subject import Subject
+    from app.models.topic import Topic
+    from app.models.reference_paper import ReferencePaper, ReferencePaperQuestion
+    from app.models.user import PasswordResetOTP, RefreshToken
+    from sqlalchemy import delete
+
+    if retention_days is None:
+        retention_days = settings.RETENTION_PURGE_DAYS
+
+    cutoff_date = utc_now() - timedelta(days=retention_days)
+    db: Session = SessionLocal()
+    purged_counts = {}
+
+    try:
+        # Purge generated papers
+        res_paper = db.execute(delete(GeneratedPaper).where(GeneratedPaper.deleted_at.is_not(None), GeneratedPaper.deleted_at < cutoff_date))
+        purged_counts["generated_papers"] = res_paper.rowcount
+
+        # Purge chunks, pages, documents
+        res_chunk = db.execute(delete(DocumentChunk).where(DocumentChunk.deleted_at.is_not(None), DocumentChunk.deleted_at < cutoff_date))
+        purged_counts["document_chunks"] = res_chunk.rowcount
+
+        res_page = db.execute(delete(DocumentPage).where(DocumentPage.deleted_at.is_not(None), DocumentPage.deleted_at < cutoff_date))
+        purged_counts["document_pages"] = res_page.rowcount
+
+        res_doc = db.execute(delete(Document).where(Document.deleted_at.is_not(None), Document.deleted_at < cutoff_date))
+        purged_counts["documents"] = res_doc.rowcount
+
+        # Purge chapters, books, topics, subjects
+        res_chap = db.execute(delete(Chapter).where(Chapter.deleted_at.is_not(None), Chapter.deleted_at < cutoff_date))
+        purged_counts["chapters"] = res_chap.rowcount
+
+        res_book = db.execute(delete(Book).where(Book.deleted_at.is_not(None), Book.deleted_at < cutoff_date))
+        purged_counts["books"] = res_book.rowcount
+
+        res_topic = db.execute(delete(Topic).where(Topic.deleted_at.is_not(None), Topic.deleted_at < cutoff_date))
+        purged_counts["topics"] = res_topic.rowcount
+
+        res_subj = db.execute(delete(Subject).where(Subject.deleted_at.is_not(None), Subject.deleted_at < cutoff_date))
+        purged_counts["subjects"] = res_subj.rowcount
+
+        # Purge reference papers
+        res_rpq = db.execute(delete(ReferencePaperQuestion).where(ReferencePaperQuestion.deleted_at.is_not(None), ReferencePaperQuestion.deleted_at < cutoff_date))
+        purged_counts["reference_paper_questions"] = res_rpq.rowcount
+
+        res_rp = db.execute(delete(ReferencePaper).where(ReferencePaper.deleted_at.is_not(None), ReferencePaper.deleted_at < cutoff_date))
+        purged_counts["reference_papers"] = res_rp.rowcount
+
+        # Purge expired / revoked security tokens older than cutoff
+        res_otp = db.execute(delete(PasswordResetOTP).where(PasswordResetOTP.expires_at < cutoff_date))
+        purged_counts["expired_otps"] = res_otp.rowcount
+
+        res_tok = db.execute(delete(RefreshToken).where(RefreshToken.expires_at < cutoff_date))
+        purged_counts["expired_refresh_tokens"] = res_tok.rowcount
+
+        db.commit()
+        logger.info(f"Completed UK GDPR retention purge (cutoff {cutoff_date.isoformat()}): {purged_counts}")
+        return {"status": "SUCCESS", "purged": purged_counts}
+    except Exception as exc:
+        db.rollback()
+        logger.error(f"Error executing UK GDPR retention purge: {exc}")
+        return {"status": "FAILED", "error": str(exc)}
+    finally:
+        db.close()
+
 

@@ -243,3 +243,57 @@ def test_concurrent_refresh_token_rotation():
 
     http_err = res1 if res1[0] == "http_error" else res2
     assert http_err[1] == 401
+
+
+def test_gdpr_rectification_and_data_export_flow():
+    """
+    UK GDPR Test Suite:
+    - Art. 7 & 13: Consent logging on registration.
+    - Art. 16: Right to Rectification (PATCH /api/v1/auth/me).
+    - Art. 20: Right to Data Portability (GET /api/v1/auth/export-data).
+    """
+    uid = uuid4().hex[:8]
+    email = f"gdpr_{uid}@example.com"
+    password = "SecurePassword123!"
+
+    # 1. Register with consent parameters
+    reg_resp = client.post(
+        "/api/v1/auth/register",
+        json={
+            "name": "GDPR User",
+            "email": email,
+            "password": password,
+            "terms_accepted": True,
+            "marketing_opt_in": False,
+        },
+    )
+    assert reg_resp.status_code == 201
+    reg_data = reg_resp.json()
+    token = reg_data["access_token"]
+    assert reg_data["user"]["terms_version"] == "1.0"
+    assert reg_data["user"]["terms_accepted_at"] is not None
+    assert reg_data["user"]["marketing_opt_in"] is False
+
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 2. Right to Rectification (PATCH /me)
+    patch_resp = client.patch(
+        "/api/v1/auth/me",
+        headers=headers,
+        json={"name": "Rectified Name", "marketing_opt_in": True},
+    )
+    assert patch_resp.status_code == 200
+    user_updated = patch_resp.json()
+    assert user_updated["name"] == "Rectified Name"
+    assert user_updated["marketing_opt_in"] is True
+
+    # 3. Right to Data Portability (GET /export-data)
+    export_resp = client.get("/api/v1/auth/export-data", headers=headers)
+    assert export_resp.status_code == 200
+    export_data = export_resp.json()
+    assert export_data["export_version"] == "1.0"
+    assert export_data["user_profile"]["email"] == email
+    assert export_data["user_profile"]["name"] == "Rectified Name"
+    assert "workspaces" in export_data
+    assert "generated_papers" in export_data
+

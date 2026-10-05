@@ -19,6 +19,8 @@ class UserRegister(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     email: EmailStr
     password: str = Field(..., min_length=6, max_length=72)
+    terms_accepted: bool = Field(default=True, description="Acknowledgment of Terms of Service and Privacy Notice")
+    marketing_opt_in: bool = Field(default=False, description="Consent to receive marketing communications")
 
     @field_validator("name")
     @classmethod
@@ -29,6 +31,18 @@ class UserRegister(BaseModel):
     @classmethod
     def validate_email(cls, v: str) -> str:
         return v.strip()
+
+
+class UserUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    marketing_opt_in: Optional[bool] = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            return _validate_person_name(v)
+        return v
 
 
 class UserLogin(BaseModel):
@@ -55,6 +69,10 @@ class UserResponse(BaseModel):
     email: EmailStr
     is_active: bool
     email_verified: bool
+    terms_version: Optional[str] = None
+    terms_accepted_at: Optional[datetime] = None
+    privacy_notice_acknowledged_at: Optional[datetime] = None
+    marketing_opt_in: bool = False
     created_at: datetime
     updated_at: datetime
 

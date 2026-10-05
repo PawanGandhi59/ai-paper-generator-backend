@@ -79,8 +79,17 @@ class EmailService:
         </html>
         """
 
+        def _mask_email(email_addr: str) -> str:
+            if not email_addr or "@" not in email_addr:
+                return "***"
+            parts = email_addr.split("@", 1)
+            prefix = parts[0][0] + "***" if len(parts[0]) > 1 else "***"
+            return f"{prefix}@{parts[1]}"
+
+        masked_email = _mask_email(recipient_email)
+
         if not self.smtp_host:
-            logger.info(f"SMTP_HOST not configured. Email to {recipient_email} simulated successfully.")
+            logger.info(f"SMTP_HOST not configured. Email to {masked_email} simulated successfully.")
             return True
 
         try:
@@ -99,8 +108,8 @@ class EmailService:
                     server.login(self.smtp_username, self.smtp_password)
                 server.send_message(msg)
 
-            logger.info(f"Password reset OTP email sent successfully to {recipient_email}.")
+            logger.info(f"Password reset OTP email sent successfully to {masked_email}.")
             return True
         except Exception as exc:
-            logger.error(f"Failed to send password reset OTP email to {recipient_email}: {exc}")
+            logger.error(f"Failed to send password reset OTP email to {masked_email}: {exc}")
             raise RuntimeError(f"Failed to deliver email: {exc}")

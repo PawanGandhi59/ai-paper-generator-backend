@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     """
     APP_NAME: str = "AI Paper Generator"
     APP_ENV: str = "development"
-    DEBUG: bool = True
+    DEBUG: bool = False
 
     DATABASE_URL: str = "postgresql+psycopg://postgres:postgres@db:5432/ai_paper_generator"
 
@@ -69,6 +69,13 @@ class Settings(BaseSettings):
     RAG_RATE_LIMIT_WINDOW_SECONDS: int = 60
 
     RAG_RELEVANCE_THRESHOLD: float = 0.45
+
+    CORS_ORIGINS: str = "*"
+    LANGCHAIN_TRACING_V2: bool = False
+    RETENTION_PURGE_DAYS: int = 30
+    AUTH_RATE_LIMIT_LOGIN_MAX: int = 5
+    AUTH_RATE_LIMIT_WINDOW_SECONDS: int = 60
+    AUTH_RATE_LIMIT_FORGOT_MAX: int = 3
 
     model_config = SettingsConfigDict(
         env_file=".env",

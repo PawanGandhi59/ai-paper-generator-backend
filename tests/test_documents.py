@@ -368,12 +368,22 @@ def test_document_preview_and_download_endpoints():
         ).json()
     doc_id = upload_resp["id"]
 
-    # 1. Direct static access (vigilens-backend pattern)
-    static_res = client.get(f"/storage/documents/{doc_id}/original.pdf")
+    # 1. Authenticated owner access to storage route -> 200 OK
+    static_res = client.get(f"/storage/documents/{doc_id}/original.pdf", headers=headers_a)
     assert static_res.status_code == 200
     assert static_res.content == pdf_bytes
 
-    # 2. Missing file on disk -> 404
+    # GDPR-001: Unauthenticated request -> 401 Unauthorized
+    unauth_res = client.get(f"/storage/documents/{doc_id}/original.pdf")
+    assert unauth_res.status_code == 401
+
+    # GDPR-001: Unauthorized attacker request -> 403 Forbidden
+    attacker_res = client.get(f"/storage/documents/{doc_id}/original.pdf", headers=headers_b)
+    assert attacker_res.status_code == 403
+
+    # 2. Missing file -> 404
+    from app.services.storage import storage_service
+    storage_service.delete_file(f"documents/{doc_id}/original.pdf")
     db = SessionLocal()
     try:
         doc_obj = db.get(Document, PyUUID(doc_id))
@@ -383,5 +393,5 @@ def test_document_preview_and_download_endpoints():
     finally:
         db.close()
 
-    missing_static = client.get(f"/storage/documents/{doc_id}/original.pdf")
+    missing_static = client.get(f"/storage/documents/{doc_id}/original.pdf", headers=headers_a)
     assert missing_static.status_code == 404
