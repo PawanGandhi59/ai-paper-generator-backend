@@ -61,3 +61,20 @@ def get_current_user_from_header_or_query(
     Directly enforces standard Bearer token authentication via Authorization header.
     """
     return current_user
+
+
+def get_current_unrestricted_user(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """
+    UK GDPR Article 18: Enforce processing restriction.
+    Halts automated processing activities (such as AI exam generation, document OCR)
+    when user has invoked Right to Restriction of Processing.
+    """
+    if getattr(current_user, "is_restricted", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account processing is currently restricted under UK GDPR Article 18. Update privacy preferences in settings or contact support to lift restriction.",
+        )
+    return current_user
+

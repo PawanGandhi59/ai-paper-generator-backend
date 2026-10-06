@@ -28,8 +28,7 @@ class UserRepository:
         email_verified: bool = False,
         terms_version: Optional[str] = None,
         terms_accepted_at: Optional[datetime] = None,
-        privacy_notice_acknowledged_at: Optional[datetime] = None,
-        marketing_opt_in: bool = False,
+        is_restricted: bool = False,
     ) -> User:
         user = User(
             name=name.strip(),
@@ -38,8 +37,7 @@ class UserRepository:
             email_verified=email_verified,
             terms_version=terms_version,
             terms_accepted_at=terms_accepted_at,
-            privacy_notice_acknowledged_at=privacy_notice_acknowledged_at,
-            marketing_opt_in=marketing_opt_in,
+            is_restricted=is_restricted,
         )
         self.db.add(user)
         self.db.commit()
@@ -50,12 +48,12 @@ class UserRepository:
         self,
         user: User,
         name: Optional[str] = None,
-        marketing_opt_in: Optional[bool] = None,
+        is_restricted: Optional[bool] = None,
     ) -> User:
         if name is not None:
             user.name = name.strip()
-        if marketing_opt_in is not None:
-            user.marketing_opt_in = marketing_opt_in
+        if is_restricted is not None:
+            user.is_restricted = is_restricted
         user.updated_at = datetime.now(timezone.utc)
         self.db.commit()
         self.db.refresh(user)

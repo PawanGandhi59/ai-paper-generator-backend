@@ -38,6 +38,7 @@ from app.schemas.auth import (
     VerifyResetOTPResponse,
 )
 from app.services.email_service import EmailService
+from app.core.audit_logger import log_security_event
 
 
 def utc_now() -> datetime:
@@ -84,7 +85,6 @@ class AuthService:
         now = utc_now()
         terms_version = "1.0" if data.terms_accepted else None
         terms_accepted_at = now if data.terms_accepted else None
-        privacy_notice_acknowledged_at = now if data.terms_accepted else None
 
         user = self.user_repo.create_user(
             name=data.name,
@@ -93,8 +93,14 @@ class AuthService:
             email_verified=False,
             terms_version=terms_version,
             terms_accepted_at=terms_accepted_at,
-            privacy_notice_acknowledged_at=privacy_notice_acknowledged_at,
-            marketing_opt_in=bool(data.marketing_opt_in),
+            is_restricted=False,
+        )
+
+        log_security_event(
+            event_type="AUTH_REGISTER",
+            status="SUCCESS",
+            user_id=str(user.id),
+            details={"email": data.email},
         )
 
         return self._create_token_pair(user)
@@ -102,22 +108,45 @@ class AuthService:
     def login(self, data: UserLogin) -> TokenResponse:
         user = self.user_repo.get_by_email(data.email)
         if not user or not user.password_hash:
+            log_security_event(
+                event_type="AUTH_LOGIN",
+                status="FAILURE",
+                details={"reason": "User not found or no password", "email": data.email},
+            )
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password.",
             )
 
         if not verify_password(data.password, user.password_hash):
+            log_security_event(
+                event_type="AUTH_LOGIN",
+                status="FAILURE",
+                user_id=str(user.id),
+                details={"reason": "Invalid password", "email": data.email},
+            )
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password.",
             )
 
         if not user.is_active:
+            log_security_event(
+                event_type="AUTH_LOGIN",
+                status="BLOCKED",
+                user_id=str(user.id),
+                details={"reason": "Inactive user account"},
+            )
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="User account is inactive.",
             )
+
+        log_security_event(
+            event_type="AUTH_LOGIN",
+            status="SUCCESS",
+            user_id=str(user.id),
+        )
 
         return self._create_token_pair(user)
 
@@ -543,17 +572,35 @@ class AuthService:
         if user:
             self.user_repo.delete_user(user)
 
+        log_security_event(
+            event_type="AUTH_ACCOUNT_DELETED",
+            status="SUCCESS",
+            user_id=str(current_user.id),
+            details={"email": current_user.email},
+        )
+
         return DeleteAccountResponse(message="Account successfully deleted.")
 
     def update_profile(self, user: User, data: UserUpdate) -> UserResponse:
         """
-        Right to Rectification (UK GDPR Art. 16): Update user profile details.
+        Right to Rectification (UK GDPR Art. 16) & Account Freeze (Art. 18): Update user profile details.
         """
         updated_user = self.user_repo.update_user_profile(
             user=user,
             name=data.name,
-            marketing_opt_in=data.marketing_opt_in,
+            is_restricted=data.is_restricted,
         )
+
+        log_security_event(
+            event_type="AUTH_PROFILE_UPDATED",
+            status="SUCCESS",
+            user_id=str(user.id),
+            details={
+                "name_updated": data.name is not None,
+                "is_restricted": updated_user.is_restricted,
+            },
+        )
+
         return UserResponse.model_validate(updated_user)
 
     def export_user_data(self, user: User) -> Dict[str, Any]:
@@ -616,6 +663,13 @@ class AuthService:
                 "question_count": len(p.questions or []),
             })
 
+        log_security_event(
+            event_type="AUTH_DATA_EXPORTED",
+            status="SUCCESS",
+            user_id=str(user.id),
+            details={"workspaces_count": len(workspaces_data), "papers_count": len(papers_data)},
+        )
+
         return {
             "export_version": "1.0",
             "exported_at": utc_now().isoformat(),
@@ -625,8 +679,7 @@ class AuthService:
                 "email": user.email,
                 "terms_version": user.terms_version,
                 "terms_accepted_at": user.terms_accepted_at.isoformat() if user.terms_accepted_at else None,
-                "privacy_notice_acknowledged_at": user.privacy_notice_acknowledged_at.isoformat() if user.privacy_notice_acknowledged_at else None,
-                "marketing_opt_in": user.marketing_opt_in,
+                "is_restricted": user.is_restricted,
                 "created_at": user.created_at.isoformat() if user.created_at else None,
             },
             "workspaces": workspaces_data,

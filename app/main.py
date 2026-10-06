@@ -144,7 +144,7 @@ def verify_storage_file_access(db: Session, current_user: User, file_path: str) 
 
 
 # Storage file serving route (supports both AWS S3 and Local storage transparently with inline preview)
-@app.api_route("/storage/{file_path:path}", methods=["GET", "HEAD"])
+@app.api_route("/storage/{file_path:path}", methods=["GET", "HEAD"], tags=["Storage & Files"])
 def serve_storage_file(
     file_path: str,
     request: Request,

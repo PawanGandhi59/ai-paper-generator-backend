@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db
+from app.api.deps import get_current_unrestricted_user, get_current_user, get_db
 from app.core.config import settings
 from app.core.rate_limiter import RateLimiter
 from app.models.generated_visual import GeneratedVisual
@@ -20,7 +20,7 @@ router = APIRouter()
 @router.post("/query", response_model=AIQueryResponse, status_code=status.HTTP_200_OK)
 def rag_query(
     payload: AIQueryRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_unrestricted_user),
     db: Session = Depends(get_db),
 ):
     """

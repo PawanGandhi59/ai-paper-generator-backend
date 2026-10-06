@@ -256,7 +256,7 @@ def test_gdpr_rectification_and_data_export_flow():
     email = f"gdpr_{uid}@example.com"
     password = "SecurePassword123!"
 
-    # 1. Register with consent parameters
+    # 1. Register with terms parameters
     reg_resp = client.post(
         "/api/v1/auth/register",
         json={
@@ -264,7 +264,6 @@ def test_gdpr_rectification_and_data_export_flow():
             "email": email,
             "password": password,
             "terms_accepted": True,
-            "marketing_opt_in": False,
         },
     )
     assert reg_resp.status_code == 201
@@ -272,20 +271,20 @@ def test_gdpr_rectification_and_data_export_flow():
     token = reg_data["access_token"]
     assert reg_data["user"]["terms_version"] == "1.0"
     assert reg_data["user"]["terms_accepted_at"] is not None
-    assert reg_data["user"]["marketing_opt_in"] is False
+    assert reg_data["user"]["is_restricted"] is False
 
     headers = {"Authorization": f"Bearer {token}"}
 
-    # 2. Right to Rectification (PATCH /me)
+    # 2. Right to Rectification (PATCH /me) & Article 18 Restriction
     patch_resp = client.patch(
         "/api/v1/auth/me",
         headers=headers,
-        json={"name": "Rectified Name", "marketing_opt_in": True},
+        json={"name": "Rectified Name", "is_restricted": True},
     )
     assert patch_resp.status_code == 200
     user_updated = patch_resp.json()
     assert user_updated["name"] == "Rectified Name"
-    assert user_updated["marketing_opt_in"] is True
+    assert user_updated["is_restricted"] is True
 
     # 3. Right to Data Portability (GET /export-data)
     export_resp = client.get("/api/v1/auth/export-data", headers=headers)
