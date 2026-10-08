@@ -26,18 +26,22 @@ from app.schemas.visuals import (
     validate_math_expression_safety,
     validate_visual_spec_semantics,
 )
+from app.services.visuals.builders.biology_builder import BiologyBuilder
 from app.services.visuals.builders.circuit_builder import CircuitBuilder
 from app.services.visuals.builders.geometry_builder import GeometryBuilder
 from app.services.visuals.builders.graph_builder import GraphBuilder
+from app.services.visuals.builders.science_experiment_builder import ScienceExperimentBuilder
 from app.services.visuals.svg_generator_service import GeneratedSVGResult, SVGGeneratorService
 from app.services.visuals.svg_renderer import SVGRenderer
 
 __all__ = [
     "SVGGeneratorService",
     "GeneratedSVGResult",
+    "BiologyBuilder",
     "CircuitBuilder",
     "GeometryBuilder",
     "GraphBuilder",
+    "ScienceExperimentBuilder",
     "SVGRenderer",
     "VisualRequiredSpec",
     "VisualType",

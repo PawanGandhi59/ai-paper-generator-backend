@@ -41,8 +41,13 @@ class CircuitBuilder:
         connections = circuit_data.connections or []
         junctions = circuit_data.junctions or []
 
-        # Auto-synthesize default positions if missing
-        cls._ensure_component_positions(components, junctions)
+        # Check if parallel resistor network topology is indicated
+        is_parallel = cls._is_parallel_topology(title, caption, components, connections)
+        if is_parallel:
+            cls._layout_parallel_network(components, connections, junctions)
+        else:
+            # Auto-synthesize default positions if missing
+            cls._ensure_component_positions(components, junctions)
 
         comp_map: Dict[str, CircuitComponent] = {c.id: c for c in components}
         junc_map: Dict[str, CircuitJunction] = {j.id: j for j in junctions}
@@ -157,32 +162,60 @@ class CircuitBuilder:
         ctype = comp.type
         lbl_escaped = html.escape(comp.label or comp.id)
 
+        is_vert = getattr(comp, "orientation", None) == "vertical"
+
         if ctype in ["resistor"]:
-            # Zig-zag resistor
-            parts.append(
-                f'  <rect x="{cx - 25.0:.1f}" y="{cy - 12.0:.1f}" width="50.0" height="24.0" fill="#FFFFFF" stroke="#3182CE" stroke-width="2.5" rx="3"/>'
-            )
-            parts.append(
-                f'  <path d="M {cx - 20.0:.1f} {cy:.1f} L {cx - 12.0:.1f} {cy - 6.0:.1f} L {cx - 4.0:.1f} {cy + 6.0:.1f} L {cx + 4.0:.1f} {cy - 6.0:.1f} L {cx + 12.0:.1f} {cy + 6.0:.1f} L {cx + 20.0:.1f} {cy:.1f}" stroke="#3182CE" stroke-width="2" fill="none"/>'
-            )
-            parts.append(
-                f'  <text x="{cx:.1f}" y="{cy - 18.0:.1f}" font-size="12" font-weight="bold" fill="#2B6CB0" text-anchor="middle">{lbl_escaped}</text>'
-            )
+            if is_vert:
+                # Vertical zig-zag resistor
+                parts.append(
+                    f'  <rect x="{cx - 12.0:.1f}" y="{cy - 25.0:.1f}" width="24.0" height="50.0" fill="#FFFFFF" stroke="#3182CE" stroke-width="2.5" rx="3"/>'
+                )
+                parts.append(
+                    f'  <path d="M {cx:.1f} {cy - 20.0:.1f} L {cx - 6.0:.1f} {cy - 12.0:.1f} L {cx + 6.0:.1f} {cy - 4.0:.1f} L {cx - 6.0:.1f} {cy + 4.0:.1f} L {cx + 6.0:.1f} {cy + 12.0:.1f} L {cx:.1f} {cy + 20.0:.1f}" stroke="#3182CE" stroke-width="2" fill="none"/>'
+                )
+                parts.append(
+                    f'  <text x="{cx + 18.0:.1f}" y="{cy + 4.0:.1f}" font-size="12" font-weight="bold" fill="#2B6CB0" text-anchor="start">{lbl_escaped}</text>'
+                )
+            else:
+                # Horizontal zig-zag resistor
+                parts.append(
+                    f'  <rect x="{cx - 25.0:.1f}" y="{cy - 12.0:.1f}" width="50.0" height="24.0" fill="#FFFFFF" stroke="#3182CE" stroke-width="2.5" rx="3"/>'
+                )
+                parts.append(
+                    f'  <path d="M {cx - 20.0:.1f} {cy:.1f} L {cx - 12.0:.1f} {cy - 6.0:.1f} L {cx - 4.0:.1f} {cy + 6.0:.1f} L {cx + 4.0:.1f} {cy - 6.0:.1f} L {cx + 12.0:.1f} {cy + 6.0:.1f} L {cx + 20.0:.1f} {cy:.1f}" stroke="#3182CE" stroke-width="2" fill="none"/>'
+                )
+                parts.append(
+                    f'  <text x="{cx:.1f}" y="{cy - 18.0:.1f}" font-size="12" font-weight="bold" fill="#2B6CB0" text-anchor="middle">{lbl_escaped}</text>'
+                )
 
         elif ctype in ["battery", "cell"]:
-            # Long thin line (+), short thick line (-)
-            parts.append(
-                f'  <rect x="{cx - 30.0:.1f}" y="{cy - 18.0:.1f}" width="60.0" height="36.0" fill="#FFFFFF" fill-opacity="0.9"/>'
-            )
-            parts.append(f'  <line x1="{cx - 12.0:.1f}" y1="{cy - 16.0:.1f}" x2="{cx - 12.0:.1f}" y2="{cy + 16.0:.1f}" stroke="#2D3748" stroke-width="3"/>')
-            parts.append(f'  <line x1="{cx - 4.0:.1f}" y1="{cy - 10.0:.1f}" x2="{cx - 4.0:.1f}" y2="{cy + 10.0:.1f}" stroke="#2D3748" stroke-width="5"/>')
-            if ctype == "battery":
-                parts.append(f'  <line x1="{cx + 4.0:.1f}" y1="{cy - 16.0:.1f}" x2="{cx + 4.0:.1f}" y2="{cy + 16.0:.1f}" stroke="#2D3748" stroke-width="3"/>')
-                parts.append(f'  <line x1="{cx + 12.0:.1f}" y1="{cy - 10.0:.1f}" x2="{cx + 12.0:.1f}" y2="{cy + 10.0:.1f}" stroke="#2D3748" stroke-width="5"/>')
-            parts.append(f'  <text x="{cx - 20.0:.1f}" y="{cy - 18.0:.1f}" font-size="13" font-weight="bold" fill="#E53E3E">+</text>')
-            parts.append(
-                f'  <text x="{cx:.1f}" y="{cy + 30.0:.1f}" font-size="12" font-weight="bold" fill="#2D3748" text-anchor="middle">{lbl_escaped}</text>'
-            )
+            if is_vert:
+                # Vertical battery: horizontal plates (top positive, bottom negative)
+                parts.append(
+                    f'  <rect x="{cx - 18.0:.1f}" y="{cy - 25.0:.1f}" width="36.0" height="50.0" fill="#FFFFFF" fill-opacity="0.9"/>'
+                )
+                parts.append(f'  <line x1="{cx - 16.0:.1f}" y1="{cy - 12.0:.1f}" x2="{cx + 16.0:.1f}" y2="{cy - 12.0:.1f}" stroke="#2D3748" stroke-width="3"/>')
+                parts.append(f'  <line x1="{cx - 8.0:.1f}" y1="{cy - 4.0:.1f}" x2="{cx + 8.0:.1f}" y2="{cy - 4.0:.1f}" stroke="#2D3748" stroke-width="5"/>')
+                if ctype == "battery":
+                    parts.append(f'  <line x1="{cx - 16.0:.1f}" y1="{cy + 4.0:.1f}" x2="{cx + 16.0:.1f}" y2="{cy + 4.0:.1f}" stroke="#2D3748" stroke-width="3"/>')
+                    parts.append(f'  <line x1="{cx - 8.0:.1f}" y1="{cy + 12.0:.1f}" x2="{cx + 8.0:.1f}" y2="{cy + 12.0:.1f}" stroke="#2D3748" stroke-width="5"/>')
+                parts.append(f'  <text x="{cx + 20.0:.1f}" y="{cy - 10.0:.1f}" font-size="13" font-weight="bold" fill="#E53E3E">+</text>')
+                parts.append(f'  <text x="{cx - 24.0:.1f}" y="{cy + 4.0:.1f}" font-size="12" font-weight="bold" fill="#2D3748" text-anchor="end">{lbl_escaped}</text>')
+            else:
+                # Horizontal battery
+                parts.append(
+                    f'  <rect x="{cx - 30.0:.1f}" y="{cy - 18.0:.1f}" width="60.0" height="36.0" fill="#FFFFFF" fill-opacity="0.9"/>'
+                )
+                parts.append(f'  <line x1="{cx - 12.0:.1f}" y1="{cy - 16.0:.1f}" x2="{cx - 12.0:.1f}" y2="{cy + 16.0:.1f}" stroke="#2D3748" stroke-width="3"/>')
+                parts.append(f'  <line x1="{cx - 4.0:.1f}" y1="{cy - 10.0:.1f}" x2="{cx - 4.0:.1f}" y2="{cy + 10.0:.1f}" stroke="#2D3748" stroke-width="5"/>')
+                if ctype == "battery":
+                    parts.append(f'  <line x1="{cx + 4.0:.1f}" y1="{cy - 16.0:.1f}" x2="{cx + 4.0:.1f}" y2="{cy + 16.0:.1f}" stroke="#2D3748" stroke-width="3"/>')
+                    parts.append(f'  <line x1="{cx + 12.0:.1f}" y1="{cy - 10.0:.1f}" x2="{cx + 12.0:.1f}" y2="{cy + 10.0:.1f}" stroke="#2D3748" stroke-width="5"/>')
+                parts.append(f'  <text x="{cx - 20.0:.1f}" y="{cy - 18.0:.1f}" font-size="13" font-weight="bold" fill="#E53E3E">+</text>')
+                parts.append(
+                    f'  <text x="{cx:.1f}" y="{cy + 30.0:.1f}" font-size="12" font-weight="bold" fill="#2D3748" text-anchor="middle">{lbl_escaped}</text>'
+                )
+
 
         elif ctype in ["ac_source"]:
             # AC Source: Circle with sine wave inside
@@ -327,3 +360,100 @@ class CircuitBuilder:
                 pos = positions[i % len(positions)]
                 comp.x = pos[0]
                 comp.y = pos[1]
+
+    @classmethod
+    def _is_parallel_topology(
+        cls,
+        title: Optional[str],
+        caption: Optional[str],
+        components: List[CircuitComponent],
+        connections: List[CircuitConnection],
+    ) -> bool:
+        t_str = f"{title or ''} {caption or ''}".lower()
+        resistors = [c for c in components if c.type in ["resistor", "lamp"]]
+        if len(resistors) < 2:
+            return False
+        if "parallel" in t_str:
+            return True
+        vertical_res = [c for c in resistors if getattr(c, "orientation", None) == "vertical"]
+        if len(vertical_res) >= 2:
+            return True
+        srcs = [c for c in components if c.type in ["battery", "dc_source", "cell", "ac_source"]]
+        if len(srcs) == 1 and all(r.x is None for r in resistors):
+            src_id = srcs[0].id
+            to_res = [conn.to_comp for conn in connections if conn.from_comp == src_id]
+            if len(to_res) >= 2:
+                return True
+        return False
+
+    @classmethod
+    def _layout_parallel_network(
+        cls,
+        components: List[CircuitComponent],
+        connections: List[CircuitConnection],
+        junctions: List[CircuitJunction],
+    ) -> None:
+        """
+        Synthesizes an authentic parallel ladder circuit layout:
+        - Voltage source placed on the left oriented vertically
+        - Resistors arranged side-by-side as vertical parallel rungs
+        - Continuous horizontal top bus rail and bottom bus rail with explicit junction dots
+        """
+        srcs = [c for c in components if c.type in ["battery", "dc_source", "cell", "ac_source"]]
+        resistors = [c for c in components if c.type in ["resistor", "lamp"]]
+        other_comps = [c for c in components if c not in srcs and c not in resistors]
+
+        src = srcs[0] if srcs else None
+        if src:
+            src.x = 80.0
+            src.y = 190.0
+            src.orientation = "vertical"
+
+        spacing = 110.0
+        start_r_x = 190.0
+
+        for idx, r in enumerate(resistors):
+            r.x = start_r_x + idx * spacing
+            r.y = 190.0
+            r.orientation = "vertical"
+
+        for idx, c in enumerate(other_comps):
+            c.x = start_r_x + (len(resistors) + idx) * spacing
+            c.y = 190.0
+            c.orientation = "vertical"
+
+        all_vertical_comps = resistors + other_comps
+        connections.clear()
+        junctions.clear()
+
+        y_top = 110.0
+        y_bot = 270.0
+        src_x = src.x if src else 80.0
+
+        j_src_top = CircuitJunction(id="J_src_top", x=src_x, y=y_top)
+        j_src_bot = CircuitJunction(id="J_src_bot", x=src_x, y=y_bot)
+        junctions.extend([j_src_top, j_src_bot])
+
+        if src:
+            connections.append(CircuitConnection(from_comp="J_src_bot", to_comp=src.id, routing="direct"))
+            connections.append(CircuitConnection(from_comp=src.id, to_comp="J_src_top", routing="direct"))
+
+        prev_top_j = "J_src_top"
+        prev_bot_j = "J_src_bot"
+
+        for idx, comp in enumerate(all_vertical_comps):
+            cx = comp.x or (start_r_x + idx * spacing)
+            jt_id = f"J_top_{idx}"
+            jb_id = f"J_bot_{idx}"
+            jt = CircuitJunction(id=jt_id, x=cx, y=y_top)
+            jb = CircuitJunction(id=jb_id, x=cx, y=y_bot)
+            junctions.extend([jt, jb])
+
+            connections.append(CircuitConnection(from_comp=prev_top_j, to_comp=jt_id, routing="direct"))
+            connections.append(CircuitConnection(from_comp=prev_bot_j, to_comp=jb_id, routing="direct"))
+            prev_top_j = jt_id
+            prev_bot_j = jb_id
+
+            connections.append(CircuitConnection(from_comp=jt_id, to_comp=comp.id, routing="direct"))
+            connections.append(CircuitConnection(from_comp=comp.id, to_comp=jb_id, routing="direct"))
+

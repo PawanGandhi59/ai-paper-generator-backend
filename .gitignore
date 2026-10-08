@@ -41,6 +41,7 @@ venv.bak/
 .idea/
 *.swp
 *.swo
+pyrightconfig.json
 
 # Testing & Coverage
 .pytest_cache/
@@ -60,4 +61,13 @@ API_ENDPOINTS_GUIDE.md
 FRONTEND_INTEGRATION_GUIDE.md
 docs/
 UK-GDPR-*.md
+
+# Documents and generated diagrams
+*.docx
+*.pdf
+diagrams/
+build_technical_document.py
+build_user_manual.py
+generate_diagrams.py
+build_*.py
 

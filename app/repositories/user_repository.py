@@ -26,7 +26,6 @@ class UserRepository:
         email: str,
         password_hash: Optional[str] = None,
         email_verified: bool = False,
-        terms_version: Optional[str] = None,
         terms_accepted_at: Optional[datetime] = None,
         is_restricted: bool = False,
     ) -> User:
@@ -35,7 +34,6 @@ class UserRepository:
             email=email.strip().lower(),
             password_hash=password_hash,
             email_verified=email_verified,
-            terms_version=terms_version,
             terms_accepted_at=terms_accepted_at,
             is_restricted=is_restricted,
         )
@@ -54,6 +52,17 @@ class UserRepository:
             user.name = name.strip()
         if is_restricted is not None:
             user.is_restricted = is_restricted
+        user.updated_at = datetime.now(timezone.utc)
+        self.db.commit()
+        self.db.refresh(user)
+        return user
+
+    def update_terms_acceptance(
+        self,
+        user: User,
+        terms_accepted_at: datetime,
+    ) -> User:
+        user.terms_accepted_at = terms_accepted_at
         user.updated_at = datetime.now(timezone.utc)
         self.db.commit()
         self.db.refresh(user)

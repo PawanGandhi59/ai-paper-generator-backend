@@ -269,7 +269,6 @@ def test_gdpr_rectification_and_data_export_flow():
     assert reg_resp.status_code == 201
     reg_data = reg_resp.json()
     token = reg_data["access_token"]
-    assert reg_data["user"]["terms_version"] == "1.0"
     assert reg_data["user"]["terms_accepted_at"] is not None
     assert reg_data["user"]["is_restricted"] is False
 
@@ -295,4 +294,10 @@ def test_gdpr_rectification_and_data_export_flow():
     assert export_data["user_profile"]["name"] == "Rectified Name"
     assert "workspaces" in export_data
     assert "generated_papers" in export_data
+
+    # 4. Consent Renewal / Terms Update (PATCH /accept-terms)
+    terms_patch_resp = client.patch("/api/v1/auth/accept-terms", headers=headers)
+    assert terms_patch_resp.status_code == 200
+    terms_updated = terms_patch_resp.json()
+    assert terms_updated["terms_accepted_at"] is not None
 

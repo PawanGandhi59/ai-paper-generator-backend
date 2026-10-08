@@ -10,6 +10,8 @@ GeminiVisualType = Literal[
     "geometry",      # Geometric shapes, triangles, angles, polygons
     "circuit",       # Schematic circuits (resistors, capacitors, sources, switches)
     "graph",         # 2D function plots f(x), coordinate axes, curves
+    "biology",       # Biological anatomical diagrams, organ/cell structures, Punnett squares
+    "experiment",    # Scientific laboratory apparatus (glass slab refraction, magnetic field, electrolysis)
 ]
 
 # Internal Visual Type (includes internal backend raw_svg)
@@ -19,6 +21,8 @@ VisualType = Literal[
     "circuit",
     "geometry",
     "graph",
+    "biology",
+    "experiment",
     "raw_svg",
 ]
 
@@ -249,7 +253,27 @@ def validate_math_expression_safety(expr_str: str) -> None:
 
 
 # ==============================================================================
-# 7. Semantic Visual Specification Validator
+# 7. Biology Specification Schemas
+# ==============================================================================
+class BiologyLabelOverride(BaseModel):
+    target: str = Field(..., description="Target anatomical part or label key (e.g. 'glomerulus', 'bowman_capsule', 'guard_cell')")
+    label: str = Field(..., description="Display label (e.g. 'A', 'B', 'Part 1', or custom text)")
+
+
+class BiologyDataSpec(BaseModel):
+    template: Optional[str] = Field("nephron", description="Template identifier: e.g. nephron, human_heart, stomata_open, stomata_closed, leaf_cross_section, neuron, reflex_arc, flower_anatomy, plant_cell, digestive_system, punnett_square")
+    labels: Optional[List[BiologyLabelOverride]] = Field(default_factory=list, description="Optional label overrides for masking or customizing callout labels")
+    biology_labels: Optional[List[BiologyLabelOverride]] = Field(default_factory=list, description="Alias for labels")
+    # Punnett square specific fields:
+    parent1: Optional[str] = Field(None, description="Parent 1 genotype / phenotype (e.g. 'Tt (Tall)')")
+    parent2: Optional[str] = Field(None, description="Parent 2 genotype / phenotype (e.g. 'Tt (Tall)')")
+    gametes1: Optional[List[str]] = Field(default_factory=list, description="Parent 1 gametes (e.g. ['T', 't'])")
+    gametes2: Optional[List[str]] = Field(default_factory=list, description="Parent 2 gametes (e.g. ['T', 't'])")
+    cross_grid: Optional[List[List[str]]] = Field(default_factory=list, description="2D grid of offspring genotypes (e.g. [['TT', 'Tt'], ['Tt', 'tt']])")
+
+
+# ==============================================================================
+# 8. Semantic Visual Specification Validator
 # ==============================================================================
 def validate_visual_spec_semantics(visual_type: str, spec_data: Dict[str, Any]) -> None:
     """
@@ -355,19 +379,30 @@ def validate_visual_spec_semantics(visual_type: str, spec_data: Dict[str, Any]) 
         for fn in graph.functions:
             validate_math_expression_safety(fn.expression)
 
+    elif visual_type == "biology":
+        # Biology data validation (template and/or genetics cross)
+        bio = BiologyDataSpec(**spec_data)
+        if bio.cross_grid and bio.gametes1:
+            for row in bio.cross_grid:
+                if len(row) != len(bio.gametes1):
+                    raise ValueError(f"Punnett square cross_grid row width ({len(row)}) must match gametes1 count ({len(bio.gametes1)}).")
+
+    elif visual_type in ["experiment", "science"]:
+        # Experiment data validation
+        pass
+
     else:
         raise ValueError(f"Unsupported visual type '{visual_type}'. Allowed types: {list(GeminiVisualType.__args__)}.")
 
 
 # ==============================================================================
-# ==============================================================================
-# 8. Gemini-Facing Visual Specification Schema & Requirement Schema
+# 9. Gemini-Facing Visual Specification Schema & Requirement Schema
 # ==============================================================================
 class GeminiVisualSpecSchema(BaseModel):
     """
     Unified structured visual specification schema exposed directly to Gemini
     during native response_schema generation. Allows Gemini to populate exact
-    component, geometry, graph, diagram, and chart payloads.
+    component, geometry, graph, diagram, chart, and biology payloads.
     """
     # Circuit fields
     components: Optional[List[CircuitComponent]] = Field(None, description="List of circuit components (resistors, capacitors, batteries, meters, switches)")
@@ -398,6 +433,15 @@ class GeminiVisualSpecSchema(BaseModel):
     categories: Optional[List[str]] = Field(None, description="Category names")
     series: Optional[List[ChartSeriesData]] = Field(None, description="Data series")
 
+    # Biology & Science Experiment fields
+    template: Optional[str] = Field(None, description="Template ID for biology (nephron, human_heart, stomata_open, stomata_closed, leaf_cross_section, neuron, reflex_arc, flower_anatomy, plant_cell, digestive_system, punnett_square, human_eye, myopia_correction, ecological_pyramid, phototropism, female_reproductive_system) or science experiments (glass_slab_refraction, glass_prism, magnetic_field_wire, water_electrolysis)")
+    biology_labels: Optional[List[BiologyLabelOverride]] = Field(None, description="Optional label overrides for masking/letters (e.g. [{'target': 'glomerulus', 'label': 'A'}])")
+    parent1: Optional[str] = Field(None, description="Parent 1 genotype / phenotype for Punnett square (e.g. 'Tt (Tall)')")
+    parent2: Optional[str] = Field(None, description="Parent 2 genotype / phenotype for Punnett square (e.g. 'Tt (Tall)')")
+    gametes1: Optional[List[str]] = Field(None, description="Parent 1 gametes for Punnett square (e.g. ['T', 't'])")
+    gametes2: Optional[List[str]] = Field(None, description="Parent 2 gametes for Punnett square (e.g. ['T', 't'])")
+    cross_grid: Optional[List[List[str]]] = Field(None, description="Offspring grid for Punnett square")
+
 
 class GeminiVisualRequirementSchema(BaseModel):
     """
@@ -405,7 +449,7 @@ class GeminiVisualRequirementSchema(BaseModel):
     Attached as an optional field on each question item in complete paper generation.
     """
     required: bool = Field(False, description="Whether a visual illustration is genuinely required to solve the question")
-    type: Optional[GeminiVisualType] = Field(None, description="Visual classification type: diagram, chart, geometry, circuit, graph")
+    type: Optional[GeminiVisualType] = Field(None, description="Visual classification type: diagram, chart, geometry, circuit, graph, biology")
     title: Optional[str] = Field(None, max_length=255, description="Title or header for the visual artifact")
     caption: Optional[str] = Field(None, description="Educational description or caption")
     spec: Optional[GeminiVisualSpecSchema] = Field(None, description="Structured semantic visual payload")

@@ -83,15 +83,13 @@ class AuthService:
 
         hashed_password = get_password_hash(data.password)
         now = utc_now()
-        terms_version = "1.0" if data.terms_accepted else None
-        terms_accepted_at = now if data.terms_accepted else None
+        terms_accepted_at = now
 
         user = self.user_repo.create_user(
             name=data.name,
             email=data.email,
             password_hash=hashed_password,
             email_verified=False,
-            terms_version=terms_version,
             terms_accepted_at=terms_accepted_at,
             is_restricted=False,
         )
@@ -242,11 +240,13 @@ class AuthService:
             # Check existing user by email
             user = self.user_repo.get_by_email(email)
             if not user:
+                now = utc_now()
                 user = self.user_repo.create_user(
                     name=name,
                     email=email,
                     password_hash=None,
                     email_verified=True,
+                    terms_accepted_at=now,
                 )
             self.user_repo.create_oauth_account(
                 user_id=user.id,
@@ -677,7 +677,6 @@ class AuthService:
                 "id": str(user.id),
                 "name": user.name,
                 "email": user.email,
-                "terms_version": user.terms_version,
                 "terms_accepted_at": user.terms_accepted_at.isoformat() if user.terms_accepted_at else None,
                 "is_restricted": user.is_restricted,
                 "created_at": user.created_at.isoformat() if user.created_at else None,
@@ -685,3 +684,19 @@ class AuthService:
             "workspaces": workspaces_data,
             "generated_papers": papers_data,
         }
+
+    def accept_terms(self, user: User) -> UserResponse:
+        now = utc_now()
+        updated_user = self.user_repo.update_terms_acceptance(
+            user=user,
+            terms_accepted_at=now,
+        )
+        log_security_event(
+            event_type="AUTH_TERMS_UPDATE",
+            status="SUCCESS",
+            user_id=str(user.id),
+            details={
+                "terms_accepted_at": now.isoformat(),
+            },
+        )
+        return UserResponse.model_validate(updated_user)

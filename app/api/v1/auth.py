@@ -7,6 +7,7 @@ from app.core.database import get_db
 from app.core.rate_limiter import RateLimiter
 from app.models.user import User
 from app.schemas.auth import (
+    AcceptTermsRequest,
     DeleteAccountRequest,
     DeleteAccountResponse,
     ForgotPasswordRequest,
@@ -185,3 +186,17 @@ def delete_account(
     """
     auth_service = AuthService(db)
     return auth_service.delete_account(current_user, data)
+
+
+@router.patch("/accept-terms", response_model=UserResponse, status_code=status.HTTP_200_OK)
+def accept_terms(
+    data: Optional[AcceptTermsRequest] = Body(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> UserResponse:
+    """
+    Accept updated terms of service or privacy policy.
+    Records the request arrival timestamp in terms_accepted_at.
+    """
+    auth_service = AuthService(db)
+    return auth_service.accept_terms(current_user)

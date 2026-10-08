@@ -179,3 +179,35 @@ def test_svg_generator_service_circuit_integration():
     assert "</svg>" in result.svg_raw
     assert "6 V" in result.svg_raw
     assert "3 Ω" in result.svg_raw
+
+
+def test_circuit_builder_parallel_resistor_auto_layout():
+    """
+    Verify that 3 resistors and a battery without explicit coordinates
+    are auto-laid out as a parallel ladder with vertical rungs and bus rails.
+    """
+    builder = CircuitBuilder()
+    spec = {
+        "title": "Parallel Resistor Network",
+        "spec_data": {
+            "components": [
+                {"id": "V1", "type": "battery", "label": "12 V"},
+                {"id": "R1", "type": "resistor", "label": "6 Ω", "orientation": "vertical"},
+                {"id": "R2", "type": "resistor", "label": "6 Ω", "orientation": "vertical"},
+                {"id": "R3", "type": "resistor", "label": "6 Ω", "orientation": "vertical"},
+            ],
+            "connections": [
+                {"from": "V1", "to": "R1"},
+                {"from": "V1", "to": "R2"},
+                {"from": "V1", "to": "R3"},
+            ],
+        },
+    }
+    svg = builder.render(spec)
+    assert "<svg" in svg
+    assert "Parallel Resistor Network" in svg
+    assert "12 V" in svg
+    assert "6 Ω" in svg
+    # Check that junction dots are rendered on the parallel bus rails
+    assert "<circle" in svg
+

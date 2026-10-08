@@ -9,9 +9,11 @@ from app.schemas.visuals import (
     VisualRequiredSpec,
     VisualType,
 )
+from app.services.visuals.builders.biology_builder import BiologyBuilder
 from app.services.visuals.builders.circuit_builder import CircuitBuilder
 from app.services.visuals.builders.geometry_builder import GeometryBuilder
 from app.services.visuals.builders.graph_builder import GraphBuilder
+from app.services.visuals.builders.science_experiment_builder import ScienceExperimentBuilder
 from app.services.visuals.svg_renderer import SVGRenderer, VisualSpec
 
 logger = logging.getLogger(__name__)
@@ -120,7 +122,7 @@ class SVGGeneratorService:
                 # Resolve spec, spec_data, or data
                 v_data = spec.get("spec") or spec.get("spec_data") or spec.get("data") or {}
 
-            if not v_type or v_type not in ["diagram", "chart", "geometry", "circuit", "graph"]:
+            if not v_type or v_type not in ["diagram", "chart", "geometry", "circuit", "graph", "biology", "experiment", "science", "physics", "chemistry"]:
                 err_msg = f"Unsupported or unspecified visual type '{v_type}'."
                 logger.warning(f"SVGGeneratorService: {err_msg}")
                 return GeneratedSVGResult(
@@ -142,12 +144,57 @@ class SVGGeneratorService:
                 data=v_data,
             )
 
+            t_low = (v_title or "").lower()
+            tpl_low = str(v_data.get("template") or v_data.get("format") or "").lower()
+
+            # Intelligent biology template detection (e.g. eye defects, pyramids, flower anatomy, phototropism, female reproduction)
+            is_bio_template = (
+                tpl_low in [
+                    "nephron", "human_heart", "heart", "stomata_open", "stomata_closed",
+                    "stomata", "leaf_cross_section", "leaf", "neuron", "reflex_arc",
+                    "flower_anatomy", "flower", "plant_cell", "digestive_system",
+                    "punnett_square", "human_eye", "myopia", "myopia_correction",
+                    "hypermetropia", "ecological_pyramid", "energy_pyramid", "pyramid",
+                    "phototropism", "phototropism_experiment", "phototropism_box", "plant_tropism",
+                    "female_reproductive_system", "human_reproductive_anatomy", "female_reproduction",
+                    "human_reproductive_system", "human_reproduction", "uterus", "ovary",
+                ]
+                or any(k in t_low for k in [
+                    "reflex arc", "flower anatomy", "parts of a flower", "nephron",
+                    "human eye", "myopic", "myopia", "hypermetropia",
+                    "ecological pyramid", "energy pyramid", "trophic level",
+                    "phototrop", "tropism", "auxin",
+                    "female reproductive", "human reproductive", "reproductive anatomy",
+                ])
+            )
+
+            # Intelligent science experiment detection (e.g. glass slab, glass prism, magnetic field wire, electrolysis)
+            is_experiment_template = (
+                v_type in ["experiment", "science", "physics", "chemistry"]
+                or tpl_low in [
+                    "glass_slab", "glass_slab_refraction", "refraction_slab", "lateral_displacement",
+                    "glass_prism", "prism", "prism_refraction", "prism_dispersion", "dispersion", "triangular_prism",
+                    "magnetic_field_wire", "magnetic_field", "straight_wire", "oersted",
+                    "water_electrolysis", "electrolysis", "electrolysis_of_water",
+                ]
+                or any(k in t_low for k in [
+                    "glass slab", "rectangular glass", "refraction of light", "lateral displacement",
+                    "glass prism", "triangular prism", "prism refraction", "dispersion", "angle of deviation",
+                    "magnetic field around a straight", "magnetic field lines", "straight conductor",
+                    "electrolysis of water", "water electrolysis",
+                ])
+            )
+
             if v_type == "graph":
                 svg_markup = GraphBuilder.render(renderer_spec)
             elif v_type == "circuit":
                 svg_markup = CircuitBuilder.render(renderer_spec)
             elif v_type == "geometry":
                 svg_markup = GeometryBuilder.render(renderer_spec)
+            elif v_type == "biology" or is_bio_template:
+                svg_markup = BiologyBuilder.render(renderer_spec)
+            elif is_experiment_template:
+                svg_markup = ScienceExperimentBuilder.render(renderer_spec)
             else:
                 svg_markup = SVGRenderer.render(renderer_spec)
 

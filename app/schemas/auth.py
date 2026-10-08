@@ -19,7 +19,7 @@ class UserRegister(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     email: EmailStr
     password: str = Field(..., min_length=6, max_length=72)
-    terms_accepted: bool = Field(default=True, description="Acknowledgment of Terms of Service and Privacy Notice")
+    terms_accepted: Optional[bool] = Field(default=True, description="Acknowledgment of Terms of Service and Privacy Notice")
 
     @field_validator("name")
     @classmethod
@@ -69,7 +69,6 @@ class UserResponse(BaseModel):
     is_active: bool
     is_restricted: bool = False
     email_verified: bool
-    terms_version: Optional[str] = None
     terms_accepted_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
@@ -128,3 +127,8 @@ class DeleteAccountRequest(BaseModel):
 
 class DeleteAccountResponse(BaseModel):
     message: str
+
+
+class AcceptTermsRequest(BaseModel):
+    terms_accepted: Optional[bool] = Field(default=True, description="Acknowledgment of updated terms and privacy policy")
+

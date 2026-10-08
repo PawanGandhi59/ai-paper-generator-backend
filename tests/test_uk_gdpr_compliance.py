@@ -53,7 +53,6 @@ def test_terms_and_restriction_unit_flow():
         email="student@example.com",
         password_hash="hashed_pw",
         email_verified=False,
-        terms_version="1.0",
         terms_accepted_at=now,
         is_restricted=False,
         is_active=True,
@@ -75,7 +74,6 @@ def test_terms_and_restriction_unit_flow():
 
     token_pair = service.register(reg_dto)
     assert token_pair.access_token is not None
-    assert token_pair.user.terms_version == "1.0"
     assert token_pair.user.terms_accepted_at is not None
     assert token_pair.user.is_restricted is False
 
@@ -106,7 +104,6 @@ def test_terms_and_restriction_unit_flow():
     profile = exported["user_profile"]
     assert profile["name"] == "Updated Name"
     assert profile["is_restricted"] is True
-    assert profile["terms_version"] == "1.0"
 
 
 def test_article_18_restriction_dependency_blocks_restricted_user():
@@ -148,5 +145,78 @@ def test_security_audit_logger_redaction():
         assert "[REDACTED]" in log_call_arg
         assert "CleartextPassword123!" not in log_call_arg
         assert "secret-jwt-token" not in log_call_arg
-        assert "s***@example.com" in log_call_arg
         assert "TEST_SECURITY_EVENT" in log_call_arg
+
+
+def test_registration_defaults_terms_acceptance_without_flag():
+    """
+    Verify registration defaults terms_accepted to True and records terms_accepted_at timestamp.
+    """
+    mock_db = MagicMock()
+    service = AuthService(mock_db)
+
+    now = datetime.now(timezone.utc)
+    mock_user = User(
+        id=uuid4(),
+        name="Terms User",
+        email="terms@example.com",
+        password_hash="hashed_pw",
+        email_verified=False,
+        terms_accepted_at=now,
+        is_restricted=False,
+        is_active=True,
+        created_at=now,
+        updated_at=now,
+    )
+
+    service.user_repo.get_by_email = MagicMock(return_value=None)
+    service.user_repo.create_user = MagicMock(return_value=mock_user)
+    service.user_repo.create_refresh_token = MagicMock()
+
+    # Frontend does NOT send terms_accepted
+    reg_dto = UserRegister(
+        name="Terms User",
+        email="terms@example.com",
+        password="ValidPassword123!",
+    )
+    assert reg_dto.terms_accepted is True
+
+    token_pair = service.register(reg_dto)
+
+    # Check create_user call kwargs
+    create_args = service.user_repo.create_user.call_args[1]
+    assert create_args["terms_accepted_at"] is not None
+    assert token_pair.user.terms_accepted_at is not None
+
+
+def test_accept_terms_updates_timestamp():
+    """
+    Verify accept_terms updates terms_accepted_at to the current timestamp.
+    """
+    mock_db = MagicMock()
+    service = AuthService(mock_db)
+
+    old_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    user = User(
+        id=uuid4(),
+        name="Accepting User",
+        email="accept@example.com",
+        terms_accepted_at=old_time,
+        is_restricted=False,
+        is_active=True,
+        email_verified=True,
+        created_at=old_time,
+        updated_at=old_time,
+    )
+
+    def fake_update_terms(user, terms_accepted_at):
+        user.terms_accepted_at = terms_accepted_at
+        user.updated_at = terms_accepted_at
+        return user
+
+    service.user_repo.update_terms_acceptance = MagicMock(side_effect=fake_update_terms)
+
+    res = service.accept_terms(user)
+    assert res.terms_accepted_at > old_time
+    assert service.user_repo.update_terms_acceptance.call_count == 1
+

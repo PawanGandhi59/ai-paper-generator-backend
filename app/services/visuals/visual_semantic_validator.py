@@ -84,6 +84,10 @@ class VisualSemanticValidator:
             cls._validate_chart(q_lower, combined_text, spec_dict, result)
         elif vtype == "diagram":
             cls._validate_diagram(q_lower, combined_text, spec_dict, result)
+        elif vtype == "biology":
+            cls._validate_biology(q_lower, combined_text, spec_dict, result)
+        elif vtype in ["experiment", "science"]:
+            cls._validate_experiment(q_lower, combined_text, spec_dict, result)
 
         if result.errors:
             result.is_valid = False
@@ -296,3 +300,43 @@ class VisualSemanticValidator:
                 res.errors.append(
                     f"Question specifies a {exp_stages}-stage process, but diagram contains only {len(nodes)} nodes."
                 )
+
+    # ==========================================================================
+    # 6. Biology Semantic Validation
+    # ==========================================================================
+    @classmethod
+    def _validate_biology(
+        cls,
+        q_text: str,
+        combined_text: str,
+        spec: Dict[str, Any],
+        res: SemanticValidationResult,
+    ) -> None:
+        template = str(spec.get("template") or "").lower()
+        if "punnett" in q_text and template and template not in ["punnett_square", "punnett", "cross"]:
+            res.warnings.append("Question mentions Punnett square, but biology template is not set to punnett_square.")
+        if "heart" in q_text and template and "heart" not in template:
+            res.warnings.append("Question context appears to be about human heart, but template differs.")
+        if "nephron" in q_text and template and "nephron" not in template:
+            res.warnings.append("Question context appears to be about nephron, but template differs.")
+        if "phototrop" in q_text and template and "phototrop" not in template and "tropism" not in template:
+            res.warnings.append("Question context appears to be about phototropism, but template differs.")
+        if ("female" in q_text or "uterus" in q_text) and "reproduct" in q_text and template and "flower" in template:
+            res.warnings.append("Question context appears to be about human female reproduction, but flower anatomy was specified.")
+
+    # ==========================================================================
+    # 7. Experiment Semantic Validation
+    # ==========================================================================
+    @classmethod
+    def _validate_experiment(
+        cls,
+        q_text: str,
+        combined_text: str,
+        spec: Dict[str, Any],
+        res: SemanticValidationResult,
+    ) -> None:
+        template = str(spec.get("template") or "").lower()
+        if "prism" in q_text and template and "slab" in template and "prism" not in template:
+            res.warnings.append("Question mentions glass prism, but rectangular glass slab template was specified.")
+        if "slab" in q_text and template and "prism" in template and "slab" not in template:
+            res.warnings.append("Question mentions glass slab, but prism template was specified.")
