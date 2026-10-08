@@ -128,7 +128,3 @@ class DeleteAccountRequest(BaseModel):
 class DeleteAccountResponse(BaseModel):
     message: str
 
-
-class AcceptTermsRequest(BaseModel):
-    terms_accepted: Optional[bool] = Field(default=True, description="Acknowledgment of updated terms and privacy policy")
-

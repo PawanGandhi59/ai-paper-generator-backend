@@ -7,7 +7,6 @@ from app.core.database import get_db
 from app.core.rate_limiter import RateLimiter
 from app.models.user import User
 from app.schemas.auth import (
-    AcceptTermsRequest,
     DeleteAccountRequest,
     DeleteAccountResponse,
     ForgotPasswordRequest,
@@ -190,7 +189,6 @@ def delete_account(
 
 @router.patch("/accept-terms", response_model=UserResponse, status_code=status.HTTP_200_OK)
 def accept_terms(
-    data: Optional[AcceptTermsRequest] = Body(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> UserResponse:
