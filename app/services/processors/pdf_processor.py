@@ -37,9 +37,7 @@ class PDFProcessor:
             raise FileNotFoundError(f"PDF file not found at path: {file_path}")
 
         try:
-            with open(file_path, "rb") as f:
-                pdf_bytes = f.read()
-            pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            pdf_doc = fitz.open(file_path)
         except Exception as open_exc:
             raise ValueError(f"Corrupt or invalid PDF file: {open_exc}")
 
