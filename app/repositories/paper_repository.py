@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+import re
 import uuid
 from uuid import UUID
 
@@ -205,7 +206,15 @@ class PaperRepository:
                 alternative_label=q_info.get("alternative_label"),
                 reasoning_style=q_info.get("reasoning_style"),
                 section_description=q_info.get("section_description"),
-                mcq_options=q_info.get("mcq_options"),
+                mcq_options=[
+                    re.sub(
+                        r"^\s*(?:option\s+)?(?:\([A-Da-d]\)|\[[A-Da-d]\]|[A-Da-d]\s*[-.:\)\–])\s*",
+                        "",
+                        str(opt),
+                        flags=re.IGNORECASE,
+                    ).strip() or str(opt).strip()
+                    for opt in q_info["mcq_options"]
+                ] if isinstance(q_info.get("mcq_options"), list) else q_info.get("mcq_options"),
                 correct_answer=q_info.get("correct_answer"),
                 expected_answer=q_info.get("expected_answer"),
                 numerical_values=q_info.get("numerical_values"),

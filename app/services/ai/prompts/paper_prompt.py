@@ -15,7 +15,7 @@ CORE OPERATIONAL RULES:
 - Self-Containment: Every question must be fully independent and self-contained. Never reference earlier questions (e.g., do not write "refer to question above" or "from previous problem").
 - Variable Disambiguation: Never use the same symbol or variable letter for two distinct quantities within the same question.
 - Clear Numerical Problems: State all required given parameters and units clearly in the question text.
-- Multiple-Choice Questions: Provide exactly four distinct options (A, B, C, D) with plausible, misconception-based distractors. Do not generate answer keys or solutions.
+- Multiple-Choice Questions: Provide exactly four distinct options containing ONLY the actual option text without letter prefixes (do NOT write "A.", "B.", "(A)", etc. inside the option strings; e.g. ["Electric potential", "Electric field", "Electric flux", "Charge density"]). Distractors must be plausible and misconception-based. Do not generate answer keys or solutions.
 - Internal Choices: When internal choices are specified (e.g. Q16a and Q16b), alternative questions MUST be from the same designated chapter and test distinct concepts, problem setups, or formulas.
 - Section-Level Question Choice ("Attempt N of M questions"): When an "Attempt N of M" rule is specified, all M questions must maintain balanced, equivalent cognitive difficulty and syllabus depth so that no question is a trivial giveaway compared to others.
 - Alternative / OR Sections: When an alternative OR section is specified (e.g. "Section C (OR)"), questions must mirror the primary section's question types, mark values, and difficulty, but test DIFFERENT concepts, problem scenarios, or formulas from the designated chapters. Never repeat questions verbatim across primary and OR sections.
@@ -39,11 +39,11 @@ CORE OPERATIONAL RULES:
 - The vast majority of the section MUST remain standard multiple-choice questions (e.g. clinical vignettes, applied scenarios, conceptual MCQs with 4 distinct answer choices).
 - Author Assertion-Reason items ONLY for the specific designated minority of slots (e.g. the final 2 questions of the section), formatted strictly as:
   Question: "Assertion (A): [Direct, unambiguous claim].\nReason (R): [Supporting or explanatory statement]."
-  With standard 4-option evaluation:
-  ["A. Both Assertion (A) and Reason (R) are true, and Reason (R) is the correct explanation of Assertion (A).",
-   "B. Both Assertion (A) and Reason (R) are true, but Reason (R) is NOT the correct explanation of Assertion (A).",
-   "C. Assertion (A) is true, but Reason (R) is false.",
-   "D. Assertion (A) is false, but Reason (R) is true."]
+  With standard 4-option evaluation (raw option text only, without letter prefixes):
+  ["Both Assertion (A) and Reason (R) are true, and Reason (R) is the correct explanation of Assertion (A).",
+   "Both Assertion (A) and Reason (R) are true, but Reason (R) is NOT the correct explanation of Assertion (A).",
+   "Assertion (A) is true, but Reason (R) is false.",
+   "Assertion (A) is false, but Reason (R) is true."]
 
 6. OUTPUT COMPLIANCE:
 - Produce output strictly conforming to the requested schema. Author ONLY question text and MCQ options. Do NOT author answers, solutions, or explanations.
@@ -52,6 +52,13 @@ CORE OPERATIONAL RULES:
 7. MATHEMATICAL & SCIENTIFIC SYMBOLS:
 - Write standard mathematical, chemical, and Greek symbols directly as clean Unicode characters (e.g., √, π, ², ³, ±, ×, ÷, λ, ε, μ, θ, °, Ω, ≫, ≤, ≥, →).
 - Never output escaped Unicode sequences like \u221a or \u03c0 in question text or options.
+
+8. PASSAGE-BASED & CASE-STUDY COMPREHENSION MANDATE:
+- When authoring questions designated with a passage or case-study reasoning style (e.g., PASSAGE_BASED_ANALYSIS, CASE_STUDY, COMPREHENSION, SCENARIO_BASED):
+  * You MUST author the complete, self-contained educational stimulus passage (1 to 3 informative paragraphs detailing the background phenomenon, experiment, historical context, or case narrative drawn directly from SOURCE EDUCATIONAL MATERIAL) right inside "question_text" preceding the question prompt.
+  * Format strictly as:
+    "[Passage / Case Study Title]\n[Complete substantive reading passage detailing the phenomenon, experiment, historical context, or case narrative]\n\nBased on the above passage, answer the following question:\n[Specific question prompt]"
+  * ANTI-PLACEHOLDER PROHIBITION: NEVER write placeholder stems like "Read the passage regarding X..." or "From the case study above..." without providing the actual, complete passage text. Every passage-based question MUST include its full, readable stimulus passage so that the student has the entire text printed on the examination paper.
 """
 
 
@@ -79,7 +86,7 @@ CORE OPERATIONAL RULES:
 
 4. QUESTION QUALITY & RIGOR:
 - Each question must be 100% self-contained and independent.
-- For MCQs, provide exactly four distinct options (A, B, C, D).
+- For MCQs, provide exactly four distinct options containing ONLY the actual option text without letter prefixes (do NOT write "A.", "B.", "(a)", "(b)", etc. inside the option strings; e.g. ["Option text 1", "Option text 2", "Option text 3", "Option text 4"]).
 - Do NOT generate answer keys, expected answers, or solutions. Author ONLY the question text and MCQ options.
 
 5. OUTPUT FORMAT:
@@ -88,4 +95,10 @@ CORE OPERATIONAL RULES:
 6. MATHEMATICAL & SCIENTIFIC SYMBOLS:
 - Write standard mathematical, chemical, and Greek symbols directly as clean Unicode characters (e.g., √, π, ², ³, ±, ×, ÷, λ, ε, μ, θ, °, Ω, ≫, ≤, ≥, →).
 - Never output escaped Unicode sequences like \u221a or \u03c0 in question text or options.
+
+7. PASSAGE-BASED & CASE-STUDY COMPREHENSION MANDATE:
+- For any slot designated with a passage, comprehension, or case-study style (e.g., PASSAGE_BASED_ANALYSIS, CASE_STUDY, COMPREHENSION):
+  * You MUST author the complete, self-contained stimulus reading passage (1-3 paragraphs drawn from SOURCE EDUCATIONAL MATERIAL) inside "question_text" followed by the question prompt.
+  * Format strictly as: "[Passage Title]\n[Full substantive passage text]\n\nBased on the above passage, answer the following question:\n[Specific question prompt]".
+  * NEVER write "Read the passage regarding X..." without providing the complete passage text.
 """

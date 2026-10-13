@@ -300,7 +300,7 @@ class GeminiGeneratedQuestionSchema(BaseModel):
     question_text: str = Field(..., description="Full text of the question item")
     question_type: Optional[str] = Field(None, description="Question type e.g. MCQ, SHORT_ANSWER, LONG_ANSWER, NUMERICAL")
     marks: Optional[int] = Field(None, description="Marks assigned to this question")
-    mcq_options: Optional[List[str]] = Field(None, description="MANDATORY for MCQs: exactly 4 option strings ('A. ...', 'B. ...', 'C. ...', 'D. ...'). Set null ONLY for non-MCQ question types.")
+    mcq_options: Optional[List[str]] = Field(None, description="MANDATORY for MCQs: exactly 4 option strings containing ONLY the option text, WITHOUT letter prefixes like 'A.', 'B.', etc. Set null ONLY for non-MCQ question types.")
     is_numerical: bool = Field(False, description="Whether question involves quantitative calculation")
     chapter_number: Optional[int] = Field(None, description="1-based integer chapter number for chapter attribution")
     choice_group: Optional[str] = Field(None, description="Internal choice group identifier e.g. 'Q4'")

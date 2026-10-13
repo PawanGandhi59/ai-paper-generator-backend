@@ -1460,7 +1460,17 @@ class PaperGeneratorService:
                     desc_str = f"- Section Pedagogical Description: {sec_desc}\n" if sec_desc else ""
                     pedagogical_rule = ""
                     if r_style:
-                        if any(kw in r_style for kw in ("SCENARIO", "CASE", "VIGNETTE", "APPLIED", "SITUATION")):
+                        if any(kw in r_style for kw in ("PASSAGE", "COMPREHENSION")):
+                            pedagogical_rule = (
+                                f"- STRICT PASSAGE & CASE-STUDY COMPREHENSION MANDATE (Reasoning Style: {r_style}):\n"
+                                f"  * Every replacement question for this section is passage-based. You MUST author the complete, "
+                                f"self-contained educational stimulus passage (1 to 3 informative paragraphs drawn directly from SOURCE EDUCATIONAL MATERIAL) "
+                                f"inside 'question_text' followed by the sub-question prompt.\n"
+                                f"  * Format strictly as:\n"
+                                f"    \"[Passage / Case Context Title]\\n[Complete substantive reading passage detailing the experiment, concept, or case narrative]\\n\\nBased on the above passage, answer the following question:\\n[Actual question prompt]\"\n"
+                                f"  * ANTI-PLACEHOLDER PROHIBITION: NEVER write placeholder stems like 'Read the passage regarding X...' without providing the full, actual passage text! Each question item MUST include 'reasoning_style': '{r_style}'.\n"
+                            )
+                        elif any(kw in r_style for kw in ("SCENARIO", "CASE", "VIGNETTE", "APPLIED", "SITUATION")):
                             pedagogical_rule = (
                                 f"- STRICT PEDAGOGICAL REQUIREMENT: Every replacement question for this section MUST be grounded in a realistic, "
                                 f"contextual case scenario, vignette, or applied situation (reasoning style: {r_style}). "
@@ -1591,7 +1601,7 @@ Return ONLY valid JSON matching this schema:
       "is_numerical": <true | false>,
       "reasoning_style": "<Reasoning style matching section requirement, e.g. SCENARIO_BASED, DIRECT_RECALL, or custom style>",
       "section_description": "<Brief pedagogical description matching section focus or null>",
-      "mcq_options": ["A. ...", "B. ...", "C. ...", "D. ..."] or null,
+      "mcq_options": ["<Option 1 text>", "<Option 2 text>", "<Option 3 text>", "<Option 4 text>"] or null,
       "visual": null
     }}
   ]
@@ -1858,7 +1868,7 @@ Return ONLY valid JSON matching this schema:
                     diff_val = g.get("difficulty", "MEDIUM")
                     marks_val = g.get("marks", sec.marks_per_question)
                     if g.get("choice_group"):
-                        mcq_req = " Each alternative MUST include 'mcq_options' with exactly 4 options (['A. ...', 'B. ...', 'C. ...', 'D. ...'])." if sec_q_type == "MCQ" else ""
+                        mcq_req = " Each alternative MUST include 'mcq_options' with exactly 4 options containing ONLY the raw option text (WITHOUT 'A.', 'B.', 'C.', 'D.' prefixes)." if sec_q_type == "MCQ" else ""
                         slot_breakdown_lines.append(
                             f"  * {g['choice_group']} (Internal Choice, Type: {sec_q_type}): Chapter {ch_num_val} (\"{ch_name_val}\") | Difficulty: {diff_val} | Marks: {marks_val}. "
                             f"Both Alternative 'a' and Alternative 'b' MUST be authored from Chapter {ch_num_val} and test distinct concepts/formulas.{mcq_req}"
@@ -1883,7 +1893,17 @@ Return ONLY valid JSON matching this schema:
             pedagogical_rule = ""
             if getattr(sec, "reasoning_style", None):
                 r_style = sec.reasoning_style
-                if any(kw in r_style for kw in ("SCENARIO", "CASE", "VIGNETTE", "APPLIED", "SITUATION")):
+                if any(kw in r_style for kw in ("PASSAGE", "COMPREHENSION")):
+                    pedagogical_rule = (
+                        f"- STRICT PASSAGE & CASE-STUDY COMPREHENSION MANDATE (Reasoning Style: {r_style}):\n"
+                        f"  * Every question in this section is passage-based. You MUST author the complete, "
+                        f"self-contained educational stimulus passage (1 to 3 informative paragraphs drawn directly from SOURCE EDUCATIONAL MATERIAL) "
+                        f"inside 'question_text' followed by the sub-question prompt.\n"
+                        f"  * Format strictly as:\n"
+                        f"    \"[Passage / Case Context Title]\\n[Complete substantive reading passage detailing the experiment, concept, or case narrative]\\n\\nBased on the above passage, answer the following question:\\n[Actual question prompt]\"\n"
+                        f"  * ANTI-PLACEHOLDER PROHIBITION: NEVER write placeholder stems like 'Read the passage regarding X...' without providing the full, actual passage text! Each question item MUST include 'reasoning_style': '{r_style}'.\n"
+                    )
+                elif any(kw in r_style for kw in ("SCENARIO", "CASE", "VIGNETTE", "APPLIED", "SITUATION")):
                     pedagogical_rule = (
                         f"- STRICT PEDAGOGICAL REQUIREMENT: Every question in this section MUST be grounded in a realistic, "
                         f"contextual case scenario, vignette, or applied situation (reasoning style: {r_style}). "
@@ -1905,11 +1925,11 @@ Return ONLY valid JSON matching this schema:
                     f"  * Questions {start_q_num} through {std_mcq_end} MUST be STANDARD MULTIPLE-CHOICE QUESTIONS (clinical vignettes, conceptual questions, or applied problem setups with four distinct answer options). DO NOT use Assertion-Reason format for these questions.\n"
                     f"  * ONLY the final {ar_count} question(s) (Questions {ar_start_q} through {ar_end_q}) MUST be Assertion-Reasoning items. Format their 'question_text' strictly as:\n"
                     f"    \"Assertion (A): [Direct, unambiguous claim].\\nReason (R): [Supporting or explanatory statement].\"\n"
-                    f"    and their 'mcq_options' strictly as exactly 4 standard options:\n"
-                    f"    [\"A. Both Assertion (A) and Reason (R) are true, and Reason (R) is the correct explanation of Assertion (A).\", "
-                    f"\"B. Both Assertion (A) and Reason (R) are true, but Reason (R) is NOT the correct explanation of Assertion (A).\", "
-                    f"\"C. Assertion (A) is true, but Reason (R) is false.\", "
-                    f"\"D. Assertion (A) is false, but Reason (R) is true.\"]\n"
+                    f"    and their 'mcq_options' strictly as exactly 4 standard options (raw text only, WITHOUT 'A.', 'B.', 'C.', 'D.' prefixes):\n"
+                    f"    [\"Both Assertion (A) and Reason (R) are true, and Reason (R) is the correct explanation of Assertion (A).\", "
+                    f"\"Both Assertion (A) and Reason (R) are true, but Reason (R) is NOT the correct explanation of Assertion (A).\", "
+                    f"\"Assertion (A) is true, but Reason (R) is false.\", "
+                    f"\"Assertion (A) is false, but Reason (R) is true.\"]\n"
                 )
 
             choice_directive = ""
@@ -1982,7 +2002,7 @@ You are generating an examination paper in REFERENCE MODE.
      * If a selected chapter has NO matching reference questions in the sample list, do NOT force reuse for that chapter—fill its slots with fresh questions instead.
    - Word-by-Word Fidelity & Options Formatting:
      * For each matched slot, copy the question text EXACTLY WORD-FOR-WORD from the reference sample question without alteration, rephrasing, or adding extraneous scenarios.
-     * If the reference question is a multiple-choice question (MCQ), ensure the question stem is placed in "question_text" and its four options are cleanly provided in "mcq_options" as ["A. ...", "B. ...", "C. ...", "D. ..."] (even if the reference sample had options embedded inline in its text).
+     * If the reference question is a multiple-choice question (MCQ), ensure the question stem is placed in "question_text" and its four options are cleanly provided in "mcq_options" containing ONLY the actual option text without letter prefixes (e.g. ["Electric potential", "Electric field", "Electric flux", "Charge density"]).
      * Mark ONLY these questions that are directly copied from the reference paper sample list as "source_type": "REFERENCE_REUSED". NEVER label fresh questions authored from textbook materials as "REFERENCE_REUSED".
      * EXEMPTION: Questions with "source_type": "REFERENCE_REUSED" are completely EXEMPT from section reasoning-style or vignette rewriting mandates; retain their original phrasing as given in the reference paper.
 
@@ -2087,7 +2107,7 @@ CONTENT AUTHORITY, SOURCE FIDELITY & ANTI-EMBELLISHMENT RULES:
 {ref_instruction_str}
 OUTPUT FORMAT REQUIREMENT:
 Return ONLY a valid JSON object containing a "sections" array. Author ONLY question text and MCQ options. Do NOT author answer keys, expected answers, or solutions. Do NOT wrap in markdown text outside the JSON.
-CRITICAL MCQ REQUIREMENT: For EVERY question in an MCQ section (including both alternatives 'a' and 'b' of internal choice questions), "mcq_options" is MANDATORY and MUST contain exactly 4 distinct options (["A. ...", "B. ...", "C. ...", "D. ..."]). NEVER output null or an empty array for "mcq_options" on any MCQ question item!
+CRITICAL MCQ REQUIREMENT: For EVERY question in an MCQ section (including both alternatives 'a' and 'b' of internal choice questions), "mcq_options" is MANDATORY and MUST contain exactly 4 distinct options containing ONLY the actual option text, WITHOUT leading option letters like "A.", "B.", "(a)", "(b)", etc. NEVER output null or an empty array for "mcq_options" on any MCQ question item!
 {{
   "sections": [
     {{
@@ -2104,7 +2124,7 @@ CRITICAL MCQ REQUIREMENT: For EVERY question in an MCQ section (including both a
           "is_numerical": <true | false>,
           "reasoning_style": "<Reasoning style matching section requirement, e.g. SCENARIO_BASED, DIRECT_RECALL, or custom style>",
           "section_description": "<Brief pedagogical description matching section focus or null>",
-          "mcq_options": ["A. ...", "B. ...", "C. ...", "D. ..."] (MANDATORY for MCQ, null ONLY for non-MCQ types),
+          "mcq_options": ["<Option 1 text>", "<Option 2 text>", "<Option 3 text>", "<Option 4 text>"] (MANDATORY for MCQ with raw option text only, null ONLY for non-MCQ types),
           "visual": {{
             "required": true,
             "type": "circuit",
@@ -2161,6 +2181,18 @@ SOURCE EDUCATIONAL MATERIAL:
                 logger.warning(f"Rejecting dependent question (matches '{pat}'): '{q_text[:50]}'")
                 return False
 
+        # 1.5. Phantom passage validation: Reject questions referencing a passage without providing the actual passage text
+        phantom_passage_patterns = [
+            r"^\s*read\s+the\s+passage\s+regarding\b",
+            r"^\s*refer\s+to\s+the\s+passage\s+regarding\b",
+            r"^\s*based\s+on\s+the\s+passage\s+regarding\b",
+            r"^\s*read\s+the\s+following\s+passage\s*[:\.]?\s*(?:explain|what|how|why|describe|calculate|identify|state)\b",
+        ]
+        for pat in phantom_passage_patterns:
+            if re.search(pat, q_text, re.IGNORECASE) and len(q_text) < 280:
+                logger.warning(f"Rejecting question with phantom passage placeholder (length {len(q_text)} < 280): '{q_text[:70]}'")
+                return False
+
         # 2. Variable disambiguation: Reject conflicting variable symbol assignments
         var_assignments = re.findall(r"\b([a-zA-Z])\s*=\s*([\d\.\-]+)\s*([a-zA-ZΩ°µμ%C|N|m|V|J|A|Hz/\-]+)", q_text)
         symbol_map = {}
@@ -2182,6 +2214,10 @@ SOURCE EDUCATIONAL MATERIAL:
             if any(not str(opt).strip() for opt in opts):
                 logger.warning(f"Rejecting MCQ with empty option string in options: {opts}")
                 return False
+
+            # Strip leading letter prefixes ('A. ', '(B) ', etc.) so mcq_options contains only raw option text
+            opts = [self._strip_mcq_option_prefix(opt) for opt in opts]
+            q["mcq_options"] = opts
 
             # Check option uniqueness without lowercasing variables in formulas
             def _clean_content_exact(s: str) -> str:
@@ -2228,7 +2264,22 @@ SOURCE EDUCATIONAL MATERIAL:
 
         cand_style = normalize_reasoning_style(q.get("reasoning_style"))
         expected_style = getattr(sec, "reasoning_style", None)
-        if cand_style:
+
+        is_scenario_dominant = (
+            expected_style
+            and any(kw in expected_style for kw in ("SCENARIO", "CASE", "VIGNETTE", "APPLIED"))
+        )
+
+        if is_scenario_dominant:
+            # Domain-agnostic check: question must provide situational framing rather than bare factual recall
+            words = q_text.split()
+            is_too_brief = len(words) < 12 and len(q_text) < 60
+            is_bare_recall = bool(re.match(r"^\s*(what is|define|explain|state|list|mention|name the|give the definition)\b", q_text, re.IGNORECASE))
+            if is_too_brief and is_bare_recall:
+                logger.warning(f"Rejecting question in {expected_style} section '{sec.name}' due to lack of situational scenario context: '{q_text[:60]}'")
+                return False
+            q["reasoning_style"] = cand_style or expected_style
+        elif cand_style:
             q["reasoning_style"] = cand_style
         elif expected_style:
             q["reasoning_style"] = expected_style
@@ -2410,6 +2461,8 @@ SOURCE EDUCATIONAL MATERIAL:
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"Final paper validation failed: MCQ item '{q_text[:40]}' has empty option text.",
                     )
+                opts = [self._strip_mcq_option_prefix(opt) for opt in opts]
+                q["mcq_options"] = opts
                 def _clean_content_exact(s: str) -> str:
                     s_clean = re.sub(r"^\s*(?:option\s+)?(?:\([A-Da-d]\)|[A-Da-d][\.\:\)])\s*", "", str(s)).strip()
                     return s_clean.replace("$", "").replace("\\", "").strip()
@@ -2614,10 +2667,10 @@ SOURCE EDUCATIONAL MATERIAL:
                 "difficulty": difficulty,
                 "source_type": "AI_GENERATED",
                 "mcq_options": [
-                    "A. It defines the primary execution mechanism.",
-                    "B. It represents secondary memory management.",
-                    "C. It specifies network protocol headers.",
-                    "D. It controls hardware clock cycles.",
+                    "It defines the primary execution mechanism.",
+                    "It represents secondary memory management.",
+                    "It specifies network protocol headers.",
+                    "It controls hardware clock cycles.",
                 ],
                 "correct_answer": None,
                 "solution_explanation": None,
@@ -2664,6 +2717,20 @@ SOURCE EDUCATIONAL MATERIAL:
     def _normalize_text(self, text: str) -> str:
         clean = re.sub(r"[^\w\s]", "", text.lower())
         return " ".join(clean.split())
+
+    @staticmethod
+    def _strip_mcq_option_prefix(opt: Any) -> str:
+        """Strip leading letter prefixes like 'A.', '(A)', 'a)', 'A -' from MCQ option text."""
+        if not opt:
+            return ""
+        s = str(opt).strip()
+        cleaned = re.sub(
+            r"^\s*(?:option\s+)?(?:\([A-Da-d]\)|\[[A-Da-d]\]|[A-Da-d]\s*[-.:\)\–])\s*",
+            "",
+            s,
+            flags=re.IGNORECASE,
+        ).strip()
+        return cleaned if cleaned else s
 
     def _parse_json_safely(self, text: str) -> Dict[str, Any]:
         text_str = text.strip()
@@ -2749,6 +2816,8 @@ SOURCE EDUCATIONAL MATERIAL:
 
         for q in paper.questions:
             mcq_opts = q.mcq_options
+            if isinstance(mcq_opts, list):
+                mcq_opts = [self._strip_mcq_option_prefix(opt) for opt in mcq_opts]
 
             is_num = bool(
                 q.question_type == "NUMERICAL"
