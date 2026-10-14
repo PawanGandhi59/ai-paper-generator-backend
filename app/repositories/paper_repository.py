@@ -92,6 +92,7 @@ class PaperRepository:
         status: str,
         error_message: Optional[str] = None,
         blueprint_json: Optional[Dict[str, Any]] = None,
+        answer_key_json: Optional[Dict[str, Any]] = None,
     ) -> Optional[GeneratedPaper]:
         paper = self.db.get(GeneratedPaper, paper_id)
         if paper and paper.deleted_at is None:
@@ -100,6 +101,8 @@ class PaperRepository:
                 paper.error_message = error_message
             if blueprint_json is not None:
                 paper.blueprint_json = blueprint_json
+            if answer_key_json is not None:
+                paper.answer_key_json = answer_key_json
             self.db.commit()
             self.db.refresh(paper)
         return paper
@@ -111,15 +114,31 @@ class PaperRepository:
         document_id: Optional[UUID],
         processing_status: str,
         blueprint_json: Optional[Dict[str, Any]] = None,
+        answer_key_json: Optional[Dict[str, Any]] = None,
     ) -> Optional[GeneratedPaper]:
         paper = self.db.get(GeneratedPaper, paper_id)
         if paper and paper.deleted_at is None:
             paper.pdf_path = pdf_path
             paper.document_id = document_id
             paper.processing_status = processing_status
-            paper.blueprint_json = blueprint_json
+            if blueprint_json is not None:
+                paper.blueprint_json = blueprint_json
+            if answer_key_json is not None:
+                paper.answer_key_json = answer_key_json
             if blueprint_json and "total_marks" in blueprint_json and isinstance(blueprint_json["total_marks"], int):
                 paper.total_marks = blueprint_json["total_marks"]
+            self.db.commit()
+            self.db.refresh(paper)
+        return paper
+
+    def update_answer_key(
+        self,
+        paper_id: UUID,
+        answer_key_json: Dict[str, Any],
+    ) -> Optional[GeneratedPaper]:
+        paper = self.db.get(GeneratedPaper, paper_id)
+        if paper and paper.deleted_at is None:
+            paper.answer_key_json = answer_key_json
             self.db.commit()
             self.db.refresh(paper)
         return paper

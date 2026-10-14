@@ -292,3 +292,53 @@ def test_backward_compatibility_with_legacy_circuit_specs():
     assert "Legacy DC Circuit" in res.svg_raw
     assert "12 V" in res.svg_raw
     assert "6 Ω" in res.svg_raw
+
+
+def test_wheatstone_bridge_auto_layout_canonical_topology():
+    """
+    Verify that an AI-generated Wheatstone bridge spec without coordinates or with
+    a raw loop gets automatically laid out in the canonical diamond topology:
+    - Galvanometer across diagonal B-D
+    - Battery across diagonal A-C via lower loop
+    - 4 resistors on the 4 diamond arms
+    """
+    service = SVGGeneratorService()
+    spec = {
+        "required": True,
+        "type": "circuit",
+        "title": "Wheatstone Bridge Circuit",
+        "caption": "Balanced bridge network with four resistors and galvanometer.",
+        "spec": {
+            "components": [
+                {"id": "R1", "type": "resistor", "label": "R1"},
+                {"id": "R2", "type": "resistor", "label": "R2"},
+                {"id": "R3", "type": "resistor", "label": "R3"},
+                {"id": "R4", "type": "resistor", "label": "R4"},
+                {"id": "G1", "type": "ammeter", "label": "G"},
+                {"id": "V1", "type": "battery", "label": "E"}
+            ],
+            "connections": [
+                {"to": "R2", "from": "R1"},
+                {"to": "R4", "from": "R2"},
+                {"to": "R3", "from": "R4"},
+                {"to": "R1", "from": "R3"},
+                {"to": "G1", "from": "R1"},
+                {"to": "R4", "from": "G1"}
+            ]
+        }
+    }
+    res = service.generate(spec)
+    assert res.is_valid is True
+    assert is_valid_svg_xml(res.svg_raw)
+    assert "Wheatstone Bridge Circuit" in res.svg_raw
+    # Check that canonical junction labels A, B, C, D are present
+    assert ">A<" in res.svg_raw
+    assert ">B<" in res.svg_raw
+    assert ">C<" in res.svg_raw
+    assert ">D<" in res.svg_raw
+    # Check that Galvanometer 'G' is in the SVG
+    assert ">G<" in res.svg_raw
+    # Check that Battery 'E' is in the SVG
+    assert ">E<" in res.svg_raw
+    assert ">+<" in res.svg_raw
+

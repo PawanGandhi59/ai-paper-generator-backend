@@ -280,6 +280,7 @@ class PaperResponse(BaseModel):
     reference_eligible: bool = False
 
     questions: List[PaperQuestionResponse] = Field(default_factory=list)
+    answer_key: Optional["AnswerKeySchema"] = None
     created_at: datetime
     updated_at: datetime
 
@@ -319,4 +320,47 @@ class GeminiSectionQuestionsSchema(BaseModel):
 
 class GeminiCompletePaperSchema(BaseModel):
     sections: List[GeminiSectionQuestionsSchema] = Field(default_factory=list)
+
+
+class AnswerKeyItemSchema(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    question_order: int = Field(..., description="1-based index matching the question in the paper")
+    choice_group: Optional[str] = Field(None, description="Choice group identifier e.g. 'Q4' for internal choice")
+    alternative_label: Optional[str] = Field(None, description="Alternative label e.g. 'a', 'b'")
+    question_type: str = Field(..., description="Question type e.g. MCQ, VERY_SHORT_ANSWER, SHORT_ANSWER, LONG_ANSWER, NUMERICAL")
+    marks: int = Field(..., description="Marks assigned to this question")
+
+    # MCQ specific: ONLY correct_option and correct_text. No explanations or rationales!
+    correct_option: Optional[str] = Field(None, description="Only for MCQ: Correct option letter ('A', 'B', 'C', or 'D')")
+    correct_text: Optional[str] = Field(None, description="Only for MCQ: Exact text of the correct option")
+
+    # Non-MCQ answers (VERY_SHORT_ANSWER, SHORT_ANSWER, LONG_ANSWER)
+    answer: Optional[str] = Field(None, description="Concise model answer or solution statement. Required for non-MCQ questions.")
+    key_points: Optional[List[str]] = Field(None, description="Bulleted essential concepts or criteria required in the student's answer")
+    marking_scheme: Optional[List[str]] = Field(None, description="Step-by-step or criterion-based marks breakdown e.g. ['1 mark for definition', '1 mark for formula']")
+
+    # Numerical specific
+    final_answer: Optional[str] = Field(None, description="Only for NUMERICAL: Final calculated numerical value")
+    unit: Optional[str] = Field(None, description="Only for NUMERICAL: Standard unit of measurement (e.g. 'm/s²', 'N', 'J')")
+    steps: Optional[List[str]] = Field(None, description="Only for NUMERICAL: Step-by-step formula, substitution, and calculation steps")
+
+
+class AnswerKeySectionSchema(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    section_name: str = Field(..., description="Name of the section matching the question paper")
+    answers: List[AnswerKeyItemSchema] = Field(default_factory=list, description="List of answers for questions in this section")
+
+
+class AnswerKeySchema(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    total_marks: Optional[int] = Field(None, description="Total paper marks")
+    sections: List[AnswerKeySectionSchema] = Field(default_factory=list, description="Sections with answer keys")
+
+
+class AnswerKeyUpdateRequest(BaseModel):
+    answer_key: AnswerKeySchema
+
 

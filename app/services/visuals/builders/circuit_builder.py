@@ -1,5 +1,6 @@
 import html
 import math
+import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 from pydantic import BaseModel
 
@@ -41,9 +42,12 @@ class CircuitBuilder:
         connections = circuit_data.connections or []
         junctions = circuit_data.junctions or []
 
-        # Check if parallel resistor network topology is indicated
+        # Check if bridge network topology (e.g. Wheatstone bridge) is indicated
+        is_bridge = cls._is_bridge_topology(title, caption, components, connections, junctions)
         is_parallel = cls._is_parallel_topology(title, caption, components, connections)
-        if is_parallel:
+        if is_bridge:
+            cls._layout_bridge_network(components, connections, junctions)
+        elif is_parallel:
             cls._layout_parallel_network(components, connections, junctions)
         else:
             # Auto-synthesize default positions if missing
@@ -280,14 +284,16 @@ class CircuitBuilder:
                 f'  <text x="{cx:.1f}" y="{cy - 22.0:.1f}" font-size="12" font-weight="bold" fill="#B7791F" text-anchor="middle">{lbl_escaped}</text>'
             )
 
-        elif ctype in ["ammeter", "voltmeter"]:
-            letter = "A" if ctype == "ammeter" else "V"
-            color = "#805AD5" if ctype == "ammeter" else "#DD6B20"
+        elif ctype in ["ammeter", "voltmeter", "galvanometer"] or (ctype == "generic" and str(lbl_escaped).strip().upper() in ["G", "GALVANOMETER"]):
+            is_galv = (ctype == "galvanometer") or (str(lbl_escaped).strip().upper() in ["G", "GALVANOMETER"])
+            letter = "G" if is_galv else ("A" if ctype == "ammeter" else "V")
+            color = "#805AD5" if is_galv else ("#3182CE" if ctype == "ammeter" else "#DD6B20")
             parts.append(f'  <circle cx="{cx:.1f}" cy="{cy:.1f}" r="16.0" fill="#FFFFFF" stroke="{color}" stroke-width="2.5"/>')
             parts.append(f'  <text x="{cx:.1f}" y="{cy + 5.0:.1f}" font-size="14" font-weight="bold" fill="{color}" text-anchor="middle">{letter}</text>')
-            parts.append(
-                f'  <text x="{cx:.1f}" y="{cy - 22.0:.1f}" font-size="12" font-weight="bold" fill="#4A5568" text-anchor="middle">{lbl_escaped}</text>'
-            )
+            if lbl_escaped and lbl_escaped.strip().upper() not in [letter, "A", "V", "G"]:
+                parts.append(
+                    f'  <text x="{cx:.1f}" y="{cy - 22.0:.1f}" font-size="12" font-weight="bold" fill="#4A5568" text-anchor="middle">{lbl_escaped}</text>'
+                )
 
         elif ctype == "diode":
             parts.append(f'  <polygon points="{cx - 12.0:.1f},{cy - 12.0:.1f} {cx + 12.0:.1f},{cy:.1f} {cx - 12.0:.1f},{cy + 12.0:.1f}" fill="#4A5568"/>')
@@ -360,6 +366,192 @@ class CircuitBuilder:
                 pos = positions[i % len(positions)]
                 comp.x = pos[0]
                 comp.y = pos[1]
+
+    @classmethod
+    def _is_bridge_topology(
+        cls,
+        title: Optional[str],
+        caption: Optional[str],
+        components: List[CircuitComponent],
+        connections: List[CircuitConnection],
+        junctions: List[CircuitJunction],
+    ) -> bool:
+        t_str = f"{title or ''} {caption or ''}".lower()
+        resistors = [c for c in components if c.type in ["resistor", "lamp"]]
+        if len(resistors) < 4:
+            return False
+
+        # If caller already specified 4+ junctions and all components have explicit positions,
+        # and has connections using those junctions, keep the caller's explicit layout.
+        if len(junctions) >= 4 and all(c.x is not None and c.y is not None for c in components):
+            j_ids = {j.id for j in junctions}
+            conn_nodes = {conn.from_comp for conn in connections} | {conn.to_comp for conn in connections}
+            if len(j_ids & conn_nodes) >= 4:
+                return False
+
+        if "wheatstone" in t_str or "bridge" in t_str:
+            return True
+
+        has_meter = any(
+            c.type in ["galvanometer", "ammeter", "generic"]
+            or str(c.label or "").upper().startswith("G")
+            or c.id.upper().startswith("G")
+            for c in components
+        )
+        has_source = any(
+            c.type in ["battery", "dc_source", "cell", "ac_source"]
+            or str(c.label or "").upper().startswith("E")
+            or str(c.label or "").upper().startswith("V")
+            or c.id.upper().startswith("V")
+            for c in components
+        )
+        if len(resistors) == 4 and has_meter and has_source:
+            return True
+
+        return False
+
+    @classmethod
+    def _layout_bridge_network(
+        cls,
+        components: List[CircuitComponent],
+        connections: List[CircuitConnection],
+        junctions: List[CircuitJunction],
+    ) -> None:
+        """
+        Synthesizes an authentic canonical Wheatstone bridge circuit layout:
+        - Diamond network of 4 junction nodes: A (left), B (top), C (right), D (bottom)
+        - 4 Bridge arms:
+            Arm A-B (top-left): R1 (or P)
+            Arm B-C (top-right): R2 (or Q)
+            Arm A-D (bottom-left): R3 (or R)
+            Arm D-C (bottom-right): R4 (or S)
+        - Diagonal 1 (Galvanometer branch across B and D):
+            Vertical central branch from node B -> Galvanometer (G) -> node D
+        - Diagonal 2 (Battery / Source branch across A and C):
+            External lower loop from node A -> Battery (E) -> node C (with key if present)
+        """
+        resistors = [c for c in components if c.type in ["resistor", "lamp"]]
+
+        def _res_key(r: CircuitComponent) -> Tuple[int, str]:
+            val = str(r.label or r.id).strip().upper()
+            pqrs_map = {"P": 1, "Q": 2, "R": 3, "S": 4}
+            first_char = val[0] if val else ""
+            if first_char in pqrs_map:
+                return (pqrs_map[first_char], val)
+            digits = re.findall(r"\d+", val)
+            num = int(digits[0]) if digits else 999
+            return (num, val)
+
+        resistors.sort(key=_res_key)
+        r1, r2, r3, r4 = resistors[0], resistors[1], resistors[2], resistors[3]
+
+        # Identify galvanometer / meter
+        meter = next(
+            (c for c in components if c.type in ["galvanometer"] or str(c.label or "").upper().startswith("G") or c.id.upper().startswith("G")),
+            None,
+        )
+        if not meter:
+            meter = next(
+                (c for c in components if c.type in ["ammeter", "generic"] and c not in resistors),
+                None,
+            )
+        if not meter:
+            meter = CircuitComponent(id="G1", type="galvanometer", label="G")
+            components.append(meter)
+        else:
+            meter.type = "galvanometer"
+            if not meter.label or meter.label.strip().upper() in ["A", "AMMETER", "GENERIC", ""]:
+                meter.label = "G"
+
+        # Identify source
+        source = next(
+            (c for c in components if c.type in ["battery", "dc_source", "cell", "ac_source"] and c != meter and c not in resistors),
+            None,
+        )
+        if not source:
+            source = CircuitComponent(id="V1", type="battery", label="E")
+            components.append(source)
+
+        # Identify optional switch / key
+        switch = next(
+            (c for c in components if c.type in ["switch", "key"] and c != meter and c != source and c not in resistors),
+            None,
+        )
+
+        # Canonical coordinates for Wheatstone Diamond
+        r1.x = 145.0
+        r1.y = 115.0
+        r1.orientation = "horizontal"
+
+        r2.x = 295.0
+        r2.y = 115.0
+        r2.orientation = "horizontal"
+
+        r3.x = 145.0
+        r3.y = 225.0
+        r3.orientation = "horizontal"
+
+        r4.x = 295.0
+        r4.y = 225.0
+        r4.orientation = "horizontal"
+
+        meter.x = 220.0
+        meter.y = 170.0
+        meter.orientation = "vertical"
+
+        source.orientation = "horizontal"
+        if switch:
+            source.x = 180.0
+            source.y = 370.0
+            switch.x = 260.0
+            switch.y = 370.0
+            switch.orientation = "horizontal"
+        else:
+            source.x = 220.0
+            source.y = 370.0
+
+        # Clear and build canonical junctions
+        junctions.clear()
+        j_a = CircuitJunction(id="J_A", x=70.0, y=170.0, label="A")
+        j_b = CircuitJunction(id="J_B", x=220.0, y=60.0, label="B")
+        j_c = CircuitJunction(id="J_C", x=370.0, y=170.0, label="C")
+        j_d = CircuitJunction(id="J_D", x=220.0, y=280.0, label="D")
+        j_bl = CircuitJunction(id="J_BL", x=70.0, y=370.0)
+        j_br = CircuitJunction(id="J_BR", x=370.0, y=370.0)
+        junctions.extend([j_a, j_b, j_c, j_d, j_bl, j_br])
+
+        # Clear and build canonical connections
+        connections.clear()
+        # Arm 1: A -> R1 -> B
+        connections.append(CircuitConnection(from_comp="J_A", to_comp=r1.id, routing="direct"))
+        connections.append(CircuitConnection(from_comp=r1.id, to_comp="J_B", routing="direct"))
+
+        # Arm 2: B -> R2 -> C
+        connections.append(CircuitConnection(from_comp="J_B", to_comp=r2.id, routing="direct"))
+        connections.append(CircuitConnection(from_comp=r2.id, to_comp="J_C", routing="direct"))
+
+        # Arm 3: A -> R3 -> D
+        connections.append(CircuitConnection(from_comp="J_A", to_comp=r3.id, routing="direct"))
+        connections.append(CircuitConnection(from_comp=r3.id, to_comp="J_D", routing="direct"))
+
+        # Arm 4: D -> R4 -> C
+        connections.append(CircuitConnection(from_comp="J_D", to_comp=r4.id, routing="direct"))
+        connections.append(CircuitConnection(from_comp=r4.id, to_comp="J_C", routing="direct"))
+
+        # Diagonal 1: Galvanometer Branch B -> Galvanometer -> D
+        connections.append(CircuitConnection(from_comp="J_B", to_comp=meter.id, routing="direct"))
+        connections.append(CircuitConnection(from_comp=meter.id, to_comp="J_D", routing="direct"))
+
+        # Diagonal 2: Source Branch A -> BL -> Battery -> (Switch) -> BR -> C
+        connections.append(CircuitConnection(from_comp="J_A", to_comp="J_BL", routing="direct"))
+        if switch:
+            connections.append(CircuitConnection(from_comp="J_BL", to_comp=source.id, routing="direct"))
+            connections.append(CircuitConnection(from_comp=source.id, to_comp=switch.id, routing="direct"))
+            connections.append(CircuitConnection(from_comp=switch.id, to_comp="J_BR", routing="direct"))
+        else:
+            connections.append(CircuitConnection(from_comp="J_BL", to_comp=source.id, routing="direct"))
+            connections.append(CircuitConnection(from_comp=source.id, to_comp="J_BR", routing="direct"))
+        connections.append(CircuitConnection(from_comp="J_BR", to_comp="J_C", routing="direct"))
 
     @classmethod
     def _is_parallel_topology(

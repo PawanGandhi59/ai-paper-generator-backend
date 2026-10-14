@@ -35,6 +35,7 @@ class GeneratedPaper(Base):
     chapter_weightages = Column(JSONB, nullable=True)  # List[Dict[str, Any]] of chapter weightage configurations
     include_answers = Column(Boolean, nullable=False, default=True)
     blueprint_json = Column(JSONB, nullable=True)
+    answer_key_json = Column(JSONB, nullable=True)
     error_message = Column(Text, nullable=True)
     pdf_path = Column(String(1024), nullable=True)
     document_id = Column(UUID(as_uuid=True), ForeignKey("documents.id", ondelete="SET NULL"), nullable=True, index=True)

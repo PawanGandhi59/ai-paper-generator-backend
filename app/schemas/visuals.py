@@ -129,6 +129,7 @@ ComponentType = Literal[
     "diode",
     "ammeter",
     "voltmeter",
+    "galvanometer",
     "inductor",
     "ground",
     "generic",

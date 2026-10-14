@@ -1,14 +1,14 @@
-from typing import List
+from typing import List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.models.user import User
-from app.schemas.paper import PaperGenerateRequest, PaperResponse
+from app.schemas.paper import AnswerKeyUpdateRequest, PaperGenerateRequest, PaperResponse
 from app.services.paper.paper_generator_service import PaperGeneratorService
 
 router = APIRouter(tags=["Paper Generation"])
@@ -61,16 +61,45 @@ def list_papers_by_subject(
 def save_paper_pdf(
     paper_id: UUID,
     file: UploadFile = File(...),
+    answer_key: Optional[str] = Form(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> PaperResponse:
     """
     Upload and save the final edited PDF for a generated paper.
-    Validates PDF format (%PDF-), stores file locally, links document record, and triggers async PDF text extraction, chunking, and embeddings.
+    Validates PDF format (%PDF-), stores file locally, links document record, updates answer_key if provided,
+    and triggers async PDF text extraction, chunking, and embeddings.
     Rejects subsequent saves on the same paper with HTTP 409 Conflict.
     """
     service = PaperGeneratorService(db)
-    return service.save_pdf(paper_id=paper_id, current_user_id=current_user.id, file=file)
+    return service.save_pdf(paper_id=paper_id, current_user_id=current_user.id, file=file, answer_key=answer_key)
+
+
+@router.put("/papers/{paper_id}/answer-key", response_model=PaperResponse, status_code=status.HTTP_200_OK)
+def update_paper_answer_key(
+    paper_id: UUID,
+    data: AnswerKeyUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> PaperResponse:
+    """
+    Update the stored answer key for a generated paper with teacher/user edits from the frontend.
+    """
+    service = PaperGeneratorService(db)
+    return service.update_answer_key(paper_id=paper_id, current_user_id=current_user.id, answer_key=data.answer_key)
+
+
+@router.post("/papers/{paper_id}/regenerate-answer-key", response_model=PaperResponse, status_code=status.HTTP_200_OK)
+def regenerate_paper_answer_key(
+    paper_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> PaperResponse:
+    """
+    Regenerate the answer key for an existing generated paper on demand using syllabus context.
+    """
+    service = PaperGeneratorService(db)
+    return service.regenerate_answer_key(paper_id=paper_id, current_user_id=current_user.id)
 
 
 @router.get("/papers/{paper_id}/pdf")

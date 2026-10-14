@@ -5,7 +5,7 @@ import os
 import re
 import shutil
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException, UploadFile, status
@@ -18,6 +18,7 @@ from app.repositories.paper_repository import PaperRepository
 from app.repositories.reference_paper_repository import ReferencePaperRepository
 
 from app.schemas.paper import (
+    AnswerKeySchema,
     ChapterWeightageResponse,
     DifficultyLevel,
     GenerationMode,
@@ -36,6 +37,7 @@ from app.services.ai.gemini_service import (
     GeminiService,
 )
 from app.services.ai.prompts.paper_prompt import (
+    ANSWER_KEY_SYSTEM_INSTRUCTION,
     PAPER_GENERATION_SYSTEM_INSTRUCTION,
     PAPER_RECOVERY_SYSTEM_INSTRUCTION,
 )
@@ -244,9 +246,8 @@ class PaperGeneratorService:
             ch_lookup = {item["chapter_id"]: item for item in chapter_weightages_data}
             ch_ids = [item["chapter_id"] for item in chapter_weightages_data]
 
-            # Sort groups by marks descending so high-mark questions (e.g. 5m) go first,
-            # and low-mark questions (e.g. 1m MCQs) fine-tune the remaining mark deficits.
-            sorted_groups = sorted(primary_groups, key=lambda g: (-g["marks"], g["question_order"]))
+            # Sort groups by question_order so question slots progress naturally in syllabus sequence
+            sorted_groups = sorted(primary_groups, key=lambda g: g["question_order"])
 
             for g in sorted_groups:
                 best_ch_id = max(
@@ -621,7 +622,21 @@ class PaperGeneratorService:
                 generation_mode=request_data.generation_mode,
             )
 
-            # 6. Save Questions to DB
+            # 6. Generate Answer Key via LLM
+            answer_key_data = None
+            try:
+                answer_key_data = self._generate_answer_key(
+                    paper=paper,
+                    blueprint=blueprint,
+                    generated_questions=generated_questions,
+                    context_text=context_text,
+                    class_name=request_data.class_name,
+                    subject_name=subject.name if subject else None,
+                )
+            except Exception as ak_exc:
+                logger.warning(f"Answer key generation failed: {ak_exc}. Proceeding with questions only.")
+
+            # 7. Save Questions and Answer Key to DB
             token_usage = self.ai_service.get_session_usage() if hasattr(self.ai_service, "get_session_usage") else {}
 
             # Embed token usage in blueprint_json so it is accessible in API response
@@ -629,7 +644,12 @@ class PaperGeneratorService:
             bp_dict["token_usage"] = token_usage
 
             self.paper_repo.save_questions(paper.id, generated_questions)
-            self.paper_repo.update_status(paper.id, "COMPLETED", blueprint_json=bp_dict)
+            self.paper_repo.update_status(
+                paper.id,
+                "COMPLETED",
+                blueprint_json=bp_dict,
+                answer_key_json=answer_key_data,
+            )
 
             # Prominently log and print token usage to console
             token_banner = (
@@ -1354,8 +1374,6 @@ class PaperGeneratorService:
                             matched_item = None
                             if cand_ch_num and cand_ch_num in ch_num_to_item:
                                 matched_item = ch_num_to_item[cand_ch_num]
-                            elif default_ch_item:
-                                matched_item = default_ch_item
 
                             if matched_item:
                                 cand["chapter_id"] = matched_item.get("chapter_id")
@@ -1669,8 +1687,6 @@ Return ONLY valid JSON matching this schema:
                                 matched_item = None
                                 if cand_ch_num and cand_ch_num in ch_num_to_item:
                                     matched_item = ch_num_to_item[cand_ch_num]
-                                elif default_ch_item:
-                                    matched_item = default_ch_item
 
                                 if matched_item:
                                     cand["chapter_id"] = matched_item.get("chapter_id")
@@ -1741,9 +1757,9 @@ Return ONLY valid JSON matching this schema:
                         cand["reasoning_style"] = cand.get("reasoning_style") or sec.reasoning_style
                     if getattr(sec, "section_description", None):
                         cand["section_description"] = cand.get("section_description") or sec.section_description
-                    if g.get("chapter_id"):
+                    if not cand.get("chapter_id") and g.get("chapter_id"):
                         cand["chapter_id"] = g["chapter_id"]
-                    if g.get("chapter_number"):
+                    if not cand.get("chapter_number") and g.get("chapter_number"):
                         cand["chapter_number"] = g["chapter_number"]
                     if sec.question_type.value != "MCQ":
                         cand["mcq_options"] = None
@@ -2793,6 +2809,133 @@ SOURCE EDUCATIONAL MATERIAL:
             return {"questions": _unescape_unicode_sequences(res)}
         raise GeminiInvalidResponseError("Gemini output root is not a JSON object or array.")
 
+    def _generate_answer_key(
+        self,
+        paper: GeneratedPaper,
+        blueprint: Any,
+        generated_questions: List[Dict[str, Any]],
+        context_text: str,
+        class_name: Optional[str] = None,
+        subject_name: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Generate a comprehensive, syllabus-grounded answer key and evaluation rubric for the paper.
+        Adheres to:
+        - Target class_name and subject_name pedagogical depth.
+        - MCQ rule: Only correct_option ('A', 'B', 'C', 'D') and correct_text. No explanations.
+        - VERY_SHORT_ANSWER: Direct 1-2 line concise answer + essential key points.
+        - SHORT_ANSWER and LONG_ANSWER: Model answer + key points + step-wise marking scheme.
+        - NUMERICAL: Final answer with unit + step-by-step formula and substitution + marks per step.
+        - Internal choices: Distinct matching answer for every alternative label in choice groups.
+        - Grounded in context_text (educational exam digest).
+        """
+        if not generated_questions:
+            return None
+
+        target_class = class_name or getattr(paper, "class_name", None) or "Standard Curriculum Level"
+        target_subject = subject_name or "Academic Subject"
+
+        # Prepare stripped questions payload to minimize tokens and focus Gemini on solving
+        questions_payload = []
+        for q in generated_questions:
+            q_order = q.get("question_order")
+            q_sec = q.get("section_name")
+            q_type = q.get("question_type")
+            q_marks = q.get("marks")
+            q_text = q.get("question_text")
+            q_group = q.get("choice_group")
+            q_alt = q.get("alternative_label")
+            q_opts = q.get("mcq_options")
+
+            item: Dict[str, Any] = {
+                "question_order": q_order,
+                "section_name": q_sec,
+                "question_type": q_type,
+                "marks": q_marks,
+                "choice_group": q_group,
+                "alternative_label": q_alt,
+                "question_text": q_text,
+            }
+            if q_type == "MCQ" and q_opts and isinstance(q_opts, list):
+                item["mcq_options"] = [self._strip_mcq_option_prefix(opt) for opt in q_opts]
+            questions_payload.append(item)
+
+        # Truncate context to ~12000 chars of high-density digest if available
+        syllabus_snippet = (context_text[:12000] if context_text else "").strip()
+        context_block = f"\n<source_syllabus_material>\n{syllabus_snippet}\n</source_syllabus_material>\n" if syllabus_snippet else ""
+
+        user_prompt = f"""Generate the official Answer Key and Marking Scheme for the examination paper below.
+{context_block}
+<examination_questions>
+{json.dumps(questions_payload, indent=2, ensure_ascii=False)}
+</examination_questions>
+
+CRITICAL MANDATES:
+1. Target Academic Level: Strictly calibrated to {target_class} for {target_subject}.
+2. MCQ Rule: Provide ONLY "correct_option" ('A', 'B', 'C', or 'D') and "correct_text" (matching the option text). NEVER provide explanations, rationales, or justifications for MCQs.
+3. VERY_SHORT_ANSWER: Direct 1-2 line model answer + key conceptual keywords.
+4. SHORT_ANSWER & LONG_ANSWER: Complete model answer + key points + step-wise marking scheme totaling the question's marks.
+5. NUMERICAL: Final answer + unit + step-by-step formula and numerical calculation + marking scheme per step.
+6. Internal Choices: Ensure every choice (choice_group, alternative_label) has its own corresponding answer entry.
+7. Return strictly valid JSON conforming to AnswerKeySchema.
+"""
+
+        try:
+            logger.info(f"Generating answer key for paper_id={paper.id} (total_questions={len(questions_payload)})...")
+            try:
+                response_text = self.ai_service.generate_response(
+                    prompt=user_prompt,
+                    system_instruction=ANSWER_KEY_SYSTEM_INSTRUCTION,
+                    response_schema=AnswerKeySchema,
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                )
+            except TypeError:
+                response_text = self.ai_service.generate_response(
+                    prompt=user_prompt,
+                    system_instruction=ANSWER_KEY_SYSTEM_INSTRUCTION,
+                )
+
+            parsed = self._parse_json_safely(response_text)
+            validated = AnswerKeySchema(**parsed)
+            ak_dict = validated.model_dump()
+
+            # Fix 1: Authoritative synchronization of Answer Key marks and total_marks from question paper
+            q_lookup = {}
+            q_order_lookup = {}
+            for q in generated_questions:
+                order = q.get("question_order")
+                group = q.get("choice_group")
+                alt = q.get("alternative_label")
+                marks = q.get("marks")
+                if order is not None:
+                    q_lookup[(order, group, alt)] = marks
+                    if order not in q_order_lookup:
+                        q_order_lookup[order] = marks
+
+            for sec in ak_dict.get("sections", []):
+                for ans in sec.get("answers", []):
+                    ans_order = ans.get("question_order")
+                    ans_group = ans.get("choice_group")
+                    ans_alt = ans.get("alternative_label")
+                    matched_marks = q_lookup.get((ans_order, ans_group, ans_alt))
+                    if matched_marks is None and ans_order in q_order_lookup:
+                        matched_marks = q_order_lookup[ans_order]
+                    if matched_marks is not None:
+                        ans["marks"] = matched_marks
+
+            # Synchronize authoritative paper total_marks unconditionally
+            if hasattr(paper, "total_marks") and paper.total_marks is not None:
+                ak_dict["total_marks"] = paper.total_marks
+
+            logger.info(f"Answer key successfully generated for paper_id={paper.id} with {len(ak_dict.get('sections', []))} sections.")
+            return ak_dict
+
+        except Exception as exc:
+            logger.warning(f"Answer key generation failed for paper_id={paper.id}: {exc}. Proceeding with questions only.")
+            return None
+
+
     def _build_paper_response(
         self,
         paper: GeneratedPaper,
@@ -3032,6 +3175,17 @@ SOURCE EDUCATIONAL MATERIAL:
         raw_updated = getattr(paper, "updated_at", None)
         updated_val = datetime.now(timezone.utc) if (_is_mock(raw_updated) or not raw_updated) else raw_updated
 
+        raw_ak = getattr(paper, "answer_key_json", None)
+        ak_val = None
+        if include_answers and raw_ak and not _is_mock(raw_ak):
+            if isinstance(raw_ak, dict):
+                try:
+                    ak_val = AnswerKeySchema(**raw_ak)
+                except Exception:
+                    ak_val = raw_ak
+            else:
+                ak_val = raw_ak
+
         return PaperResponse(
             id=paper_id,
             workspace_id=ws_id,
@@ -3055,6 +3209,7 @@ SOURCE EDUCATIONAL MATERIAL:
             processing_status=proc_status,
             reference_eligible=reference_eligible,
             questions=question_responses,
+            answer_key=ak_val,
             created_at=created_val,
             updated_at=updated_val,
         )
@@ -3064,6 +3219,7 @@ SOURCE EDUCATIONAL MATERIAL:
         paper_id: UUID,
         current_user_id: UUID,
         file: UploadFile,
+        answer_key: Optional[Union[str, Dict[str, Any]]] = None,
     ) -> PaperResponse:
         """
         Accepts user's final edited PDF from Flutter, stores it securely, creates a Document record,
@@ -3177,12 +3333,31 @@ SOURCE EDUCATIONAL MATERIAL:
             processing_status="PROCESSING",
         )
 
-        # Update paper record with pdf_path, document_id, processing_status
+        # Process answer_key payload if user supplied an edited version from frontend
+        parsed_ak = None
+        if answer_key is not None:
+            if isinstance(answer_key, str) and answer_key.strip():
+                try:
+                    parsed_ak = self._parse_json_safely(answer_key)
+                except Exception as parse_err:
+                    logger.warning(f"Failed to parse user submitted answer_key JSON in save_pdf: {parse_err}")
+            elif isinstance(answer_key, dict):
+                parsed_ak = answer_key
+
+            if parsed_ak is not None:
+                try:
+                    validated_ak = AnswerKeySchema(**parsed_ak)
+                    parsed_ak = validated_ak.model_dump()
+                except Exception as val_err:
+                    logger.warning(f"User submitted answer_key did not strictly validate against AnswerKeySchema: {val_err}")
+
+        # Update paper record with pdf_path, document_id, processing_status, and optionally new answer_key_json
         paper = self.paper_repo.update_saved_pdf(
             paper_id=paper.id,
             pdf_path=stored_record_path,
             document_id=doc.id,
             processing_status="PROCESSING",
+            answer_key_json=parsed_ak,
         )
 
         # Dispatch background Celery task for PDF extraction & chunking (with OCR preserved)
@@ -3196,11 +3371,86 @@ SOURCE EDUCATIONAL MATERIAL:
                 pdf_path=stored_record_path,
                 document_id=doc.id,
                 processing_status="READY",
+                answer_key_json=parsed_ak,
             )
             self.doc_repo.mark_ready(doc.id)
 
         final_paper = self.paper_repo.get_paper(paper.id)
         return self._build_paper_response(final_paper, include_answers=final_paper.include_answers)
+
+    def update_answer_key(
+        self,
+        paper_id: UUID,
+        current_user_id: UUID,
+        answer_key: Union[Dict[str, Any], AnswerKeySchema],
+    ) -> PaperResponse:
+        """Update the paper's answer key with user edits from frontend."""
+        paper = self.paper_repo.get_paper(paper_id)
+        if not paper or paper.deleted_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Paper not found.",
+            )
+        self.workspace_service.get_subject(paper.subject_id, current_user_id)
+        ak_dict = answer_key.model_dump() if hasattr(answer_key, "model_dump") else answer_key
+        updated_paper = self.paper_repo.update_answer_key(paper_id=paper.id, answer_key_json=ak_dict)
+        return self._build_paper_response(updated_paper, include_answers=True)
+
+    def regenerate_answer_key(
+        self,
+        paper_id: UUID,
+        current_user_id: UUID,
+    ) -> PaperResponse:
+        """Regenerate the answer key on demand for an existing generated paper."""
+        paper = self.paper_repo.get_paper(paper_id)
+        if not paper or paper.deleted_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Paper not found.",
+            )
+        subject = self.workspace_service.get_subject(paper.subject_id, current_user_id)
+
+        # Build questions payload from existing paper questions
+        qs_list = []
+        for q in paper.questions:
+            qs_list.append({
+                "question_order": q.question_order,
+                "section_name": q.section_name,
+                "question_type": q.question_type,
+                "marks": q.marks,
+                "choice_group": q.choice_group,
+                "alternative_label": q.alternative_label,
+                "question_text": q.question_text,
+                "mcq_options": q.mcq_options,
+            })
+
+        selected_ch_ids = []
+        if paper.selected_chapter_ids:
+            for cid in paper.selected_chapter_ids:
+                try:
+                    selected_ch_ids.append(cid if isinstance(cid, UUID) else UUID(str(cid)))
+                except Exception:
+                    pass
+
+        context_text = self._retrieve_chapter_context(
+            user_id=current_user_id,
+            workspace_id=paper.workspace_id,
+            subject_id=paper.subject_id,
+            book_id=paper.book_id,
+            selected_chapter_ids=selected_ch_ids,
+        )
+
+        ak_dict = self._generate_answer_key(
+            paper=paper,
+            blueprint=None,
+            generated_questions=qs_list,
+            context_text=context_text,
+            class_name=paper.class_name,
+            subject_name=subject.name if subject else None,
+        )
+        if ak_dict:
+            paper = self.paper_repo.update_answer_key(paper_id=paper.id, answer_key_json=ak_dict)
+        return self._build_paper_response(paper, include_answers=True)
 
     def _process_saved_paper_pdf_without_embeddings(self, paper_id: UUID, doc_id: UUID, stored_path: str) -> None:
         """
