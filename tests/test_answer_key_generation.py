@@ -16,7 +16,6 @@ from app.services.paper.paper_generator_service import PaperGeneratorService
 
 def test_answer_key_schema_validation():
     sample_ak = {
-        "total_marks": 50,
         "sections": [
             {
                 "section_name": "Section A",
@@ -25,8 +24,6 @@ def test_answer_key_schema_validation():
                         "question_order": 1,
                         "choice_group": None,
                         "alternative_label": None,
-                        "question_type": "MCQ",
-                        "marks": 1,
                         "correct_answer": "B. Mitochondria",
                         "explanation": "Mitochondria are the powerhouse of the cell and produce ATP via cellular respiration.",
                     },
@@ -34,8 +31,6 @@ def test_answer_key_schema_validation():
                         "question_order": 2,
                         "choice_group": None,
                         "alternative_label": None,
-                        "question_type": "VERY_SHORT_ANSWER",
-                        "marks": 1,
                         "correct_answer": "Chlorophyll",
                         "explanation": "Chlorophyll is a green pigment that traps sunlight for photosynthesis.",
                     },
@@ -43,8 +38,6 @@ def test_answer_key_schema_validation():
                         "question_order": 3,
                         "choice_group": "Q3",
                         "alternative_label": "a",
-                        "question_type": "SHORT_ANSWER",
-                        "marks": 2,
                         "correct_answer": "V = I * R",
                         "explanation": "Ohm's Law states that current is directly proportional to potential difference across a conductor at constant temperature.",
                     },
@@ -52,8 +45,6 @@ def test_answer_key_schema_validation():
                         "question_order": 4,
                         "choice_group": None,
                         "alternative_label": None,
-                        "question_type": "NUMERICAL",
-                        "marks": 3,
                         "correct_answer": "4.5 m/s²",
                         "explanation": "Formula: a = (v - u)/t. Given u = 0, v = 18 m/s, t = 4 s. Substitution: a = (18 - 0)/4 = 4.5 m/s².",
                     },
@@ -63,14 +54,12 @@ def test_answer_key_schema_validation():
     }
 
     schema = AnswerKeySchema(**sample_ak)
-    assert schema.total_marks == 50
     assert len(schema.sections) == 1
     sec = schema.sections[0]
     assert sec.section_name == "Section A"
     assert len(sec.answers) == 4
     assert sec.answers[0].correct_answer == "B. Mitochondria"
     assert "Mitochondria are the powerhouse" in sec.answers[0].explanation
-    assert sec.answers[1].question_type == "VERY_SHORT_ANSWER"
     assert sec.answers[3].correct_answer == "4.5 m/s²"
     assert "a = (v - u)/t" in sec.answers[3].explanation
 
@@ -98,7 +87,6 @@ def test_generate_answer_key_success():
     ]
 
     mock_llm_response = """{
-        "total_marks": 10,
         "sections": [
             {
                 "section_name": "Section A",
@@ -107,8 +95,6 @@ def test_generate_answer_key_success():
                         "question_order": 1,
                         "choice_group": null,
                         "alternative_label": null,
-                        "question_type": "MCQ",
-                        "marks": 1,
                         "correct_answer": "B. Mitochondria",
                         "explanation": "Mitochondria produce ATP via oxidative phosphorylation."
                     }
@@ -130,10 +116,10 @@ def test_generate_answer_key_success():
     )
 
     assert result is not None
-    assert result["total_marks"] == 10
     assert len(result["sections"]) == 1
     assert result["sections"][0]["answers"][0]["correct_answer"] == "B. Mitochondria"
     assert "Mitochondria produce ATP" in result["sections"][0]["answers"][0]["explanation"]
+
 
 
 def test_generate_answer_key_graceful_failure():
@@ -193,15 +179,12 @@ def test_build_paper_response_includes_answer_key():
     paper.updated_at = None
     paper.include_answers = True
     paper.answer_key_json = {
-        "total_marks": 50,
         "sections": [
             {
                 "section_name": "Section A",
                 "answers": [
                     {
                         "question_order": 1,
-                        "question_type": "MCQ",
-                        "marks": 1,
                         "correct_answer": "A. Correct option",
                         "explanation": "Option A is correct according to basic principles.",
                     }
@@ -213,7 +196,6 @@ def test_build_paper_response_includes_answer_key():
     # When include_answers is True
     resp = service._build_paper_response(paper, include_answers=True)
     assert resp.answer_key is not None
-    assert resp.answer_key.total_marks == 50
     assert resp.answer_key.sections[0].answers[0].correct_answer == "A. Correct option"
 
 
@@ -263,15 +245,12 @@ def test_update_answer_key():
     service.workspace_service.get_subject.return_value = MagicMock()
 
     updated_ak = {
-        "total_marks": 50,
         "sections": [
             {
                 "section_name": "Section A",
                 "answers": [
                     {
                         "question_order": 1,
-                        "question_type": "MCQ",
-                        "marks": 1,
                         "correct_answer": "C. Updated option",
                         "explanation": "Updated explanation statement.",
                     }
@@ -299,10 +278,11 @@ def test_update_answer_key():
 
 
 
+
 def test_authoritative_marks_synchronization():
     """
-    Test Fix 1: LLM hallucinates total_marks: 36 and Q14 marks: 1.
-    Backend must authoritatively overwrite Q14 marks to 2 and total_marks to 30.
+    Test Answer key generation with minimal schema: only section_name, question_order,
+    choice_group, alternative_label, correct_answer, and explanation.
     """
     mock_db = MagicMock()
     service = PaperGeneratorService(mock_db)
@@ -326,16 +306,14 @@ def test_authoritative_marks_synchronization():
             "question_order": 14,
             "section_name": "Section C",
             "question_type": "SHORT_ANSWER",
-            "marks": 2,  # Authoritative marks is 2
+            "marks": 2,
             "choice_group": None,
             "alternative_label": None,
             "question_text": "State Kirchhoff's junction rule.",
         },
     ]
 
-    # LLM hallucinates total_marks: 36 and marks: 1 for Q14
     mock_llm_response = """{
-        "total_marks": 36,
         "sections": [
             {
                 "section_name": "Section C",
@@ -344,8 +322,6 @@ def test_authoritative_marks_synchronization():
                         "question_order": 13,
                         "choice_group": null,
                         "alternative_label": null,
-                        "question_type": "SHORT_ANSWER",
-                        "marks": 2,
                         "correct_answer": "Drift velocity is the average velocity acquired by electrons under an electric field.",
                         "explanation": "Free electrons undergo repeated scattering with positive metal ions. An external electric field exerts force causing net average motion opposite to field direction."
                     },
@@ -353,8 +329,6 @@ def test_authoritative_marks_synchronization():
                         "question_order": 14,
                         "choice_group": null,
                         "alternative_label": null,
-                        "question_type": "SHORT_ANSWER",
-                        "marks": 1,
                         "correct_answer": "Sum of entering currents equals sum of leaving currents.",
                         "explanation": "Founded on conservation of electric charge: charge cannot accumulate at an ideal circuit junction."
                     }
@@ -376,12 +350,12 @@ def test_authoritative_marks_synchronization():
     )
 
     assert result is not None
-    # Must be synced to authoritative paper total_marks (30)
-    assert result["total_marks"] == 30
+    assert len(result["sections"]) == 1
     ans_14 = result["sections"][0]["answers"][1]
     assert ans_14["question_order"] == 14
-    # Must be synced to authoritative question marks (2, not 1)
-    assert ans_14["marks"] == 2
+    assert ans_14["correct_answer"] == "Sum of entering currents equals sum of leaving currents."
+    assert "conservation of electric charge" in ans_14["explanation"]
+
 
 
 def test_preplan_blueprint_matrix_syllabus_order():

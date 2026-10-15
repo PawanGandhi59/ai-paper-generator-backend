@@ -2860,24 +2860,26 @@ SOURCE EDUCATIONAL MATERIAL:
                 item["mcq_options"] = [self._strip_mcq_option_prefix(opt) for opt in q_opts]
             questions_payload.append(item)
 
-        # Truncate context to ~12000 chars of high-density digest if available
-        syllabus_snippet = (context_text[:12000] if context_text else "").strip()
+        # Include all chapter exam digests and syllabus summary selected by user (no truncation)
+        syllabus_snippet = (context_text or "").strip()
         context_block = f"\n<source_syllabus_material>\n{syllabus_snippet}\n</source_syllabus_material>\n" if syllabus_snippet else ""
 
-        user_prompt = f"""Generate the official Answer Key and Marking Scheme for the examination paper below.
+        user_prompt = f"""Generate the official Answer Key for the examination paper below.
 {context_block}
 <examination_questions>
 {json.dumps(questions_payload, indent=2, ensure_ascii=False)}
 </examination_questions>
 
 CRITICAL MANDATES:
-1. Target Academic Level: Strictly calibrated to {target_class} for {target_subject}.
-2. Simplified Structure: For EVERY question provide ONLY:
+1. Simplified Structure: For EVERY question in every section, provide ONLY:
+   - "question_order": Integer matching question order.
+   - "choice_group": Choice group if internal choice (or null).
+   - "alternative_label": Alternative label if internal choice (or null).
    - "correct_answer": The direct, correct answer (for MCQs e.g. "B. 1.8 x 10^-4 N"; for numericals e.g. "1.0 x 10^4 N m^2 C^-1"; for subjective questions the direct statement).
    - "explanation": Complete step-by-step reasoning, mathematical working, or conceptual justification.
-3. No marking scheme, no rubric list, no fragmented steps/key_points. Keep everything unified in "correct_answer" and "explanation".
-4. Internal Choices: Ensure every choice (choice_group, alternative_label) has its own corresponding answer entry.
-5. Return strictly valid JSON conforming to AnswerKeySchema.
+2. Do NOT output marks, total_marks, question_type, or marking scheme. Keep everything concise in "correct_answer" and "explanation".
+3. Internal Choices: Ensure every choice (choice_group, alternative_label) has its own corresponding answer entry.
+4. Return strictly valid JSON conforming to AnswerKeySchema.
 """
 
         try:
@@ -2900,40 +2902,13 @@ CRITICAL MANDATES:
             validated = AnswerKeySchema(**parsed)
             ak_dict = validated.model_dump()
 
-            # Fix 1: Authoritative synchronization of Answer Key marks and total_marks from question paper
-            q_lookup = {}
-            q_order_lookup = {}
-            for q in generated_questions:
-                order = q.get("question_order")
-                group = q.get("choice_group")
-                alt = q.get("alternative_label")
-                marks = q.get("marks")
-                if order is not None:
-                    q_lookup[(order, group, alt)] = marks
-                    if order not in q_order_lookup:
-                        q_order_lookup[order] = marks
-
-            for sec in ak_dict.get("sections", []):
-                for ans in sec.get("answers", []):
-                    ans_order = ans.get("question_order")
-                    ans_group = ans.get("choice_group")
-                    ans_alt = ans.get("alternative_label")
-                    matched_marks = q_lookup.get((ans_order, ans_group, ans_alt))
-                    if matched_marks is None and ans_order in q_order_lookup:
-                        matched_marks = q_order_lookup[ans_order]
-                    if matched_marks is not None:
-                        ans["marks"] = matched_marks
-
-            # Synchronize authoritative paper total_marks unconditionally
-            if hasattr(paper, "total_marks") and paper.total_marks is not None:
-                ak_dict["total_marks"] = paper.total_marks
-
             logger.info(f"Answer key successfully generated for paper_id={paper.id} with {len(ak_dict.get('sections', []))} sections.")
             return ak_dict
 
         except Exception as exc:
             logger.warning(f"Answer key generation failed for paper_id={paper.id}: {exc}. Proceeding with questions only.")
             return None
+
 
 
     def _build_paper_response(

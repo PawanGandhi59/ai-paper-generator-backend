@@ -328,11 +328,9 @@ class AnswerKeyItemSchema(BaseModel):
     question_order: int = Field(..., description="1-based index matching the question in the paper")
     choice_group: Optional[str] = Field(None, description="Choice group identifier e.g. 'Q4' for internal choice")
     alternative_label: Optional[str] = Field(None, description="Alternative label e.g. 'a', 'b'")
-    question_type: str = Field(..., description="Question type e.g. MCQ, VERY_SHORT_ANSWER, SHORT_ANSWER, LONG_ANSWER, NUMERICAL")
-    marks: int = Field(..., description="Marks assigned to this question")
 
     # Correct answer for the question:
-    # - For MCQ: The option letter ('A', 'B', 'C', or 'D') and/or option text
+    # - For MCQ: The option letter ('A', 'B', 'C', or 'D') and option text (e.g. 'B. 1.8 x 10^-4 N')
     # - For numerical/subjective: The concise correct answer / numerical result
     correct_answer: Optional[str] = Field(None, description="The direct correct answer or correct option (e.g. 'B. 1.8 x 10^-4 N' or '1.0 x 10^4 N m^2 C^-1')")
 
@@ -350,7 +348,6 @@ class AnswerKeySectionSchema(BaseModel):
 class AnswerKeySchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    total_marks: Optional[int] = Field(None, description="Total paper marks")
     sections: List[AnswerKeySectionSchema] = Field(default_factory=list, description="Sections with answer keys")
 
 
