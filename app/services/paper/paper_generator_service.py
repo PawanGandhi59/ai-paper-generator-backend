@@ -2872,12 +2872,12 @@ SOURCE EDUCATIONAL MATERIAL:
 
 CRITICAL MANDATES:
 1. Target Academic Level: Strictly calibrated to {target_class} for {target_subject}.
-2. MCQ Rule: Provide ONLY "correct_option" ('A', 'B', 'C', or 'D') and "correct_text" (matching the option text). NEVER provide explanations, rationales, or justifications for MCQs.
-3. VERY_SHORT_ANSWER: Direct 1-2 line model answer + key conceptual keywords.
-4. SHORT_ANSWER & LONG_ANSWER: Complete model answer + key points + step-wise marking scheme totaling the question's marks.
-5. NUMERICAL: Final answer + unit + step-by-step formula and numerical calculation + marking scheme per step.
-6. Internal Choices: Ensure every choice (choice_group, alternative_label) has its own corresponding answer entry.
-7. Return strictly valid JSON conforming to AnswerKeySchema.
+2. Simplified Structure: For EVERY question provide ONLY:
+   - "correct_answer": The direct, correct answer (for MCQs e.g. "B. 1.8 x 10^-4 N"; for numericals e.g. "1.0 x 10^4 N m^2 C^-1"; for subjective questions the direct statement).
+   - "explanation": Complete step-by-step reasoning, mathematical working, or conceptual justification.
+3. No marking scheme, no rubric list, no fragmented steps/key_points. Keep everything unified in "correct_answer" and "explanation".
+4. Internal Choices: Ensure every choice (choice_group, alternative_label) has its own corresponding answer entry.
+5. Return strictly valid JSON conforming to AnswerKeySchema.
 """
 
         try:

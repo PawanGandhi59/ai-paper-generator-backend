@@ -27,8 +27,8 @@ def test_answer_key_schema_validation():
                         "alternative_label": None,
                         "question_type": "MCQ",
                         "marks": 1,
-                        "correct_option": "B",
-                        "correct_text": "Mitochondria",
+                        "correct_answer": "B. Mitochondria",
+                        "explanation": "Mitochondria are the powerhouse of the cell and produce ATP via cellular respiration.",
                     },
                     {
                         "question_order": 2,
@@ -36,8 +36,8 @@ def test_answer_key_schema_validation():
                         "alternative_label": None,
                         "question_type": "VERY_SHORT_ANSWER",
                         "marks": 1,
-                        "answer": "Chlorophyll is a green pigment that traps sunlight for photosynthesis.",
-                        "key_points": ["Green pigment", "Traps sunlight"],
+                        "correct_answer": "Chlorophyll",
+                        "explanation": "Chlorophyll is a green pigment that traps sunlight for photosynthesis.",
                     },
                     {
                         "question_order": 3,
@@ -45,9 +45,8 @@ def test_answer_key_schema_validation():
                         "alternative_label": "a",
                         "question_type": "SHORT_ANSWER",
                         "marks": 2,
-                        "answer": "Ohm's Law states current is proportional to voltage.",
-                        "key_points": ["V is proportional to I", "Constant temperature"],
-                        "marking_scheme": ["1 mark for statement", "1 mark for formula"],
+                        "correct_answer": "V = I * R",
+                        "explanation": "Ohm's Law states that current is directly proportional to potential difference across a conductor at constant temperature.",
                     },
                     {
                         "question_order": 4,
@@ -55,10 +54,8 @@ def test_answer_key_schema_validation():
                         "alternative_label": None,
                         "question_type": "NUMERICAL",
                         "marks": 3,
-                        "final_answer": "4.5",
-                        "unit": "m/s²",
-                        "steps": ["Formula: a = (v - u)/t", "Substitution: (18 - 0)/4", "Result: 4.5 m/s²"],
-                        "marking_scheme": ["1 mark for formula", "1 mark for substitution", "1 mark for unit"],
+                        "correct_answer": "4.5 m/s²",
+                        "explanation": "Formula: a = (v - u)/t. Given u = 0, v = 18 m/s, t = 4 s. Substitution: a = (18 - 0)/4 = 4.5 m/s².",
                     },
                 ],
             }
@@ -71,11 +68,11 @@ def test_answer_key_schema_validation():
     sec = schema.sections[0]
     assert sec.section_name == "Section A"
     assert len(sec.answers) == 4
-    assert sec.answers[0].correct_option == "B"
-    assert sec.answers[0].correct_text == "Mitochondria"
+    assert sec.answers[0].correct_answer == "B. Mitochondria"
+    assert "Mitochondria are the powerhouse" in sec.answers[0].explanation
     assert sec.answers[1].question_type == "VERY_SHORT_ANSWER"
-    assert sec.answers[3].final_answer == "4.5"
-    assert sec.answers[3].unit == "m/s²"
+    assert sec.answers[3].correct_answer == "4.5 m/s²"
+    assert "a = (v - u)/t" in sec.answers[3].explanation
 
 
 def test_generate_answer_key_success():
@@ -112,8 +109,8 @@ def test_generate_answer_key_success():
                         "alternative_label": null,
                         "question_type": "MCQ",
                         "marks": 1,
-                        "correct_option": "B",
-                        "correct_text": "Mitochondria"
+                        "correct_answer": "B. Mitochondria",
+                        "explanation": "Mitochondria produce ATP via oxidative phosphorylation."
                     }
                 ]
             }
@@ -135,8 +132,8 @@ def test_generate_answer_key_success():
     assert result is not None
     assert result["total_marks"] == 10
     assert len(result["sections"]) == 1
-    assert result["sections"][0]["answers"][0]["correct_option"] == "B"
-    assert result["sections"][0]["answers"][0]["correct_text"] == "Mitochondria"
+    assert result["sections"][0]["answers"][0]["correct_answer"] == "B. Mitochondria"
+    assert "Mitochondria produce ATP" in result["sections"][0]["answers"][0]["explanation"]
 
 
 def test_generate_answer_key_graceful_failure():
@@ -205,8 +202,8 @@ def test_build_paper_response_includes_answer_key():
                         "question_order": 1,
                         "question_type": "MCQ",
                         "marks": 1,
-                        "correct_option": "A",
-                        "correct_text": "Correct option",
+                        "correct_answer": "A. Correct option",
+                        "explanation": "Option A is correct according to basic principles.",
                     }
                 ],
             }
@@ -217,7 +214,8 @@ def test_build_paper_response_includes_answer_key():
     resp = service._build_paper_response(paper, include_answers=True)
     assert resp.answer_key is not None
     assert resp.answer_key.total_marks == 50
-    assert resp.answer_key.sections[0].answers[0].correct_option == "A"
+    assert resp.answer_key.sections[0].answers[0].correct_answer == "A. Correct option"
+
 
     # When include_answers is False, answer_key must be stripped
     resp_no_answers = service._build_paper_response(paper, include_answers=False)
@@ -274,8 +272,8 @@ def test_update_answer_key():
                         "question_order": 1,
                         "question_type": "MCQ",
                         "marks": 1,
-                        "correct_option": "C",
-                        "correct_text": "Updated text",
+                        "correct_answer": "C. Updated option",
+                        "explanation": "Updated explanation statement.",
                     }
                 ],
             }
@@ -296,7 +294,9 @@ def test_update_answer_key():
         answer_key_json=updated_ak,
     )
     assert resp.answer_key is not None
-    assert resp.answer_key.sections[0].answers[0].correct_option == "C"
+    assert resp.answer_key.sections[0].answers[0].correct_answer == "C. Updated option"
+    assert resp.answer_key.sections[0].answers[0].explanation == "Updated explanation statement."
+
 
 
 def test_authoritative_marks_synchronization():
@@ -346,9 +346,8 @@ def test_authoritative_marks_synchronization():
                         "alternative_label": null,
                         "question_type": "SHORT_ANSWER",
                         "marks": 2,
-                        "answer": "Drift velocity is the average velocity acquired by electrons.",
-                        "key_points": ["Average velocity", "Under electric field"],
-                        "marking_scheme": ["1 mark for definition", "1 mark for formula"]
+                        "correct_answer": "Drift velocity is the average velocity acquired by electrons under an electric field.",
+                        "explanation": "Free electrons undergo repeated scattering with positive metal ions. An external electric field exerts force causing net average motion opposite to field direction."
                     },
                     {
                         "question_order": 14,
@@ -356,9 +355,8 @@ def test_authoritative_marks_synchronization():
                         "alternative_label": null,
                         "question_type": "SHORT_ANSWER",
                         "marks": 1,
-                        "answer": "Sum of currents entering a junction equals sum of currents leaving.",
-                        "key_points": ["Conservation of charge", "Current sum zero"],
-                        "marking_scheme": ["1 mark for statement"]
+                        "correct_answer": "Sum of entering currents equals sum of leaving currents.",
+                        "explanation": "Founded on conservation of electric charge: charge cannot accumulate at an ideal circuit junction."
                     }
                 ]
             }

@@ -331,19 +331,13 @@ class AnswerKeyItemSchema(BaseModel):
     question_type: str = Field(..., description="Question type e.g. MCQ, VERY_SHORT_ANSWER, SHORT_ANSWER, LONG_ANSWER, NUMERICAL")
     marks: int = Field(..., description="Marks assigned to this question")
 
-    # MCQ specific: ONLY correct_option and correct_text. No explanations or rationales!
-    correct_option: Optional[str] = Field(None, description="Only for MCQ: Correct option letter ('A', 'B', 'C', or 'D')")
-    correct_text: Optional[str] = Field(None, description="Only for MCQ: Exact text of the correct option")
+    # Correct answer for the question:
+    # - For MCQ: The option letter ('A', 'B', 'C', or 'D') and/or option text
+    # - For numerical/subjective: The concise correct answer / numerical result
+    correct_answer: Optional[str] = Field(None, description="The direct correct answer or correct option (e.g. 'B. 1.8 x 10^-4 N' or '1.0 x 10^4 N m^2 C^-1')")
 
-    # Non-MCQ answers (VERY_SHORT_ANSWER, SHORT_ANSWER, LONG_ANSWER)
-    answer: Optional[str] = Field(None, description="Concise model answer or solution statement. Required for non-MCQ questions.")
-    key_points: Optional[List[str]] = Field(None, description="Bulleted essential concepts or criteria required in the student's answer")
-    marking_scheme: Optional[List[str]] = Field(None, description="Step-by-step or criterion-based marks breakdown e.g. ['1 mark for definition', '1 mark for formula']")
-
-    # Numerical specific
-    final_answer: Optional[str] = Field(None, description="Only for NUMERICAL: Final calculated numerical value")
-    unit: Optional[str] = Field(None, description="Only for NUMERICAL: Standard unit of measurement (e.g. 'm/s²', 'N', 'J')")
-    steps: Optional[List[str]] = Field(None, description="Only for NUMERICAL: Step-by-step formula, substitution, and calculation steps")
+    # Single comprehensive explanation for all question types
+    explanation: Optional[str] = Field(None, description="Clear, detailed step-by-step reasoning or conceptual explanation behind the correct answer")
 
 
 class AnswerKeySectionSchema(BaseModel):
